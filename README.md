@@ -1,45 +1,51 @@
 # copia
 
-**Pure Rust rsync-style file synchronization - up to 800x faster than rsync**
+**Pure Rust rsync-style file synchronization library**
 
 [![Crates.io](https://img.shields.io/crates/v/copia.svg)](https://crates.io/crates/copia)
 [![Documentation](https://docs.rs/copia/badge.svg)](https://docs.rs/copia)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://github.com/paiml/copia/workflows/CI/badge.svg)](https://github.com/paiml/copia/actions)
 
-```
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                      COPIA vs RSYNC BENCHMARK RESULTS                         ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  Pure Rust implementation beats C-based rsync across ALL file sizes          ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+## Why copia?
 
+- **Embeddable**: Use rsync's delta-transfer algorithm as a library, not a subprocess
+- **Pure Rust**: 100% safe Rust, no unsafe code, fully auditable
+- **Zero C Dependencies**: No OpenSSL, no librsync, no external binaries
+- **Async Support**: First-class tokio integration for non-blocking I/O
+- **Memory Safe**: No buffer overflows, no use-after-free, guaranteed by Rust
+
+## Performance
+
+```
 ┌────────────────────────────┬────────────┬────────────┬──────────────────┐
-│ Scenario                   │ rsync (ms) │ copia (ms) │ Speedup          │
+│ Scenario                   │ rsync (ms) │ copia (ms) │ Result           │
 ├────────────────────────────┼────────────┼────────────┼──────────────────┤
-│ 1KB identical              │      43.39 │       0.05 │   ⚡ 792x faster │
-│ 1KB modified               │      43.39 │       0.12 │   ⚡ 353x faster │
-│ 100KB identical            │      41.81 │       0.16 │   ⚡ 258x faster │
-│ 100KB modified             │      43.48 │       1.05 │    ⚡ 41x faster │
-│ 1MB identical              │      43.40 │       0.50 │    ⚡ 86x faster │
-│ 1MB modified               │      43.32 │       4.54 │     ⚡ 9x faster │
-│ 10MB identical             │      55.75 │       3.21 │    ⚡ 17x faster │
-│ 10MB modified              │      43.62 │      40.74 │     ✓ 1.1x faster│
-│ 10MB completely different  │      43.51 │      41.83 │     ✓ 1.0x parity│
+│ 1KB identical              │      43.55 │       0.05 │   Library wins   │
+│ 100KB identical            │      43.23 │       0.12 │   Library wins   │
+│ 1MB identical              │      43.40 │       0.33 │   Library wins   │
+│ 1MB 5% changed             │      44.72 │       4.54 │   Library wins   │
+│ 10MB identical             │      43.68 │       3.92 │   Library wins   │
+│ 10MB 1% changed            │      46.91 │      43.05 │   Comparable     │
+│ 10MB 100% different        │      52.84 │      43.88 │   Comparable     │
 └────────────────────────────┴────────────┴────────────┴──────────────────┘
 
-                    ★ Overall: copia is 4.3x FASTER than rsync ★
+⚠️  IMPORTANT: rsync times include ~40ms process spawn overhead.
+    This benchmark compares copia as a library vs rsync as a subprocess.
+    For embedded/library use cases, copia avoids this overhead entirely.
+    For CLI-to-CLI comparison, performance is comparable on large files.
 ```
 
-## Features
+**When copia shines:**
+- Embedded in applications (no process spawn overhead)
+- High-frequency sync operations (amortize startup cost)
+- Small file synchronization (overhead dominates)
+- When you need async I/O or Rust integration
 
-- **Blazing Fast**: Up to 800x faster than rsync for small files, parity or better for all sizes
-- **Pure Rust**: 100% safe Rust, no unsafe code, fully auditable
-- **Zero Dependencies on C**: No OpenSSL, no librsync, no external binaries
-- **Async Support**: First-class tokio integration for non-blocking I/O
-- **Delta Compression**: rsync-style rolling checksum algorithm for bandwidth-efficient transfers
-- **Cryptographic Verification**: BLAKE3 checksums for data integrity
-- **Parallel Processing**: Multi-core signature generation with rayon
+**When rsync is fine:**
+- One-off large file transfers (spawn overhead negligible)
+- Shell scripts and CLI workflows
+- When you need rsync's full feature set (permissions, links, etc.)
 
 ## Installation
 
@@ -139,41 +145,38 @@ Copia implements the rsync delta-transfer algorithm:
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 │  Basis File │────▶│  Signature  │     │ Source File │
 └─────────────┘     └──────┬──────┘     └──────┬──────┘
-                           │                   │
-                           ▼                   ▼
-                    ┌──────────────────────────┐
-                    │    Delta Computation     │
-                    └────────────┬─────────────┘
-                                 │
-                                 ▼
-                    ┌──────────────────────────┐
-                    │ Delta: [Copy, Literal..] │
-                    └────────────┬─────────────┘
-                                 │
-          ┌─────────────┐        │
-          │  Basis File │────────┤
-          └─────────────┘        ▼
-                    ┌──────────────────────────┐
-                    │    Patch Application     │
-                    └────────────┬─────────────┘
-                                 │
-                                 ▼
-                    ┌──────────────────────────┐
-                    │   Reconstructed Source   │
-                    └──────────────────────────┘
+                          │                   │
+                          ▼                   ▼
+                   ┌──────────────────────────┐
+                   │    Delta Computation     │
+                   └────────────┬─────────────┘
+                                │
+                                ▼
+                   ┌──────────────────────────┐
+                   │ Delta: [Copy, Literal..] │
+                   └────────────┬─────────────┘
+                                │
+         ┌─────────────┐        │
+         │  Basis File │────────┤
+         └─────────────┘        ▼
+                   ┌──────────────────────────┐
+                   │    Patch Application     │
+                   └────────────┬─────────────┘
+                                │
+                                ▼
+                   ┌──────────────────────────┐
+                   │   Reconstructed Source   │
+                   └──────────────────────────┘
 ```
 
-## Performance Optimizations
+## Implementation Details
 
-Copia achieves its performance through several key optimizations:
-
-| Optimization | Benefit |
-|-------------|---------|
-| **FastRollingChecksum** | Lazy modulo operations reduce per-byte overhead by 3x |
-| **FxHashMap** | 2x faster lookups for u32 weak hash keys |
-| **Parallel Signatures** | Multi-core BLAKE3 hashing via rayon |
-| **Identical Detection** | O(n) memcmp skips delta for unchanged files |
-| **Weak Match Filter** | Skip strong hash when no weak match exists |
+| Component | Implementation |
+|-----------|----------------|
+| **Rolling Checksum** | Adler-32 variant with lazy modulo (normalize every 5000 rolls) |
+| **Strong Hash** | BLAKE3 (32 bytes, cryptographic) |
+| **Hash Table** | FxHashMap for fast u32 key lookups |
+| **Parallelism** | Rayon for multi-core signature generation |
 
 ## API Reference
 
@@ -196,20 +199,16 @@ Copia achieves its performance through several key optimizations:
 |---------|-------------|
 | `async` | Enable tokio async support |
 | `cli` | Build command-line interface |
-| `simd` | SIMD acceleration via trueno (optional) |
-| `gpu` | GPU acceleration via wgpu (optional) |
-| `distributed` | Distributed execution via repartir (optional) |
-| `compression` | Compression via trueno-zram (optional) |
 
 ## Benchmarks
 
 Run benchmarks yourself:
 
 ```bash
-# Compare against rsync
+# Compare against rsync (note: includes process spawn overhead)
 cargo bench --bench rsync_comparison --features async
 
-# Run criterion benchmarks
+# Run criterion benchmarks (algorithm-only, no spawn overhead)
 cargo bench --bench benchmarks
 ```
 
@@ -219,11 +218,12 @@ cargo bench --bench benchmarks
 |---------|-------|-------|
 | Language | Pure Rust | C |
 | Memory Safety | Guaranteed | Manual |
+| Use as Library | Native | Subprocess only |
 | Async I/O | Native | No |
-| Small Files | 800x faster | Baseline |
-| Large Files | 1-17x faster | Baseline |
-| Dependencies | Minimal | OpenSSL, zlib |
-| Binary Size | ~2MB | ~1MB |
+| Process Overhead | None | ~40ms spawn |
+| Permissions/ACLs | Not yet | Yes |
+| Symbolic Links | Not yet | Yes |
+| Compression | Not yet | Yes (zlib) |
 
 ## License
 
