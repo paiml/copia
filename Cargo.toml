@@ -1,10 +1,10 @@
 [package]
 name = "copia"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Pragmatic AI Labs <info@paiml.com>"]
-description = "Pure Rust rsync-style synchronization - up to 800x faster than rsync"
+description = "Pure Rust rsync-style delta synchronization library"
 license = "MIT"
 repository = "https://github.com/paiml/copia"
 homepage = "https://github.com/paiml/copia"
