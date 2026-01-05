@@ -1,6 +1,6 @@
 //! Benchmark comparing copia vs rsync performance.
 //!
-//! Run with: cargo bench --bench rsync_comparison --features async
+//! Run with: cargo bench --bench `rsync_comparison` --features async
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -49,7 +49,7 @@ fn create_modified_copy(src: &PathBuf, dest: &PathBuf, change_percent: u8) {
 
     if change_percent >= 100 {
         // Completely different
-        for byte in data.iter_mut() {
+        for byte in &mut data {
             *byte = byte.wrapping_add(128);
         }
         fs::write(dest, &data).expect("Failed to write");
@@ -167,7 +167,7 @@ async fn main() {
 
         let speedup = rsync_avg.as_secs_f64() / copia_avg.as_secs_f64();
         let speedup_str = if speedup >= 1.0 {
-            format!("\x1b[32m{:.1}x faster\x1b[0m", speedup)
+            format!("\x1b[32m{speedup:.1}x faster\x1b[0m")
         } else {
             format!("\x1b[31m{:.1}x slower\x1b[0m", 1.0 / speedup)
         };
@@ -204,7 +204,7 @@ async fn main() {
     println!();
 
     if overall_speedup >= 1.0 {
-        println!("  \x1b[32;1m★ Overall: copia is {:.2}x FASTER than rsync\x1b[0m", overall_speedup);
+        println!("  \x1b[32;1m★ Overall: copia is {overall_speedup:.2}x FASTER than rsync\x1b[0m");
     } else {
         println!("  Overall: copia is {:.2}x slower than rsync", 1.0 / overall_speedup);
     }
@@ -218,7 +218,7 @@ async fn main() {
     for result in &results {
         let speedup = result.rsync_time.as_secs_f64() / result.copia_time.as_secs_f64();
         let speedup_str = if speedup >= 1.0 {
-            format!("{:.1}x faster", speedup)
+            format!("{speedup:.1}x faster")
         } else {
             format!("{:.1}x slower", 1.0 / speedup)
         };
@@ -277,6 +277,6 @@ fn format_bytes(bytes: u64) -> String {
     } else if bytes >= 1024 {
         format!("{:.1}KB", bytes as f64 / 1024.0)
     } else {
-        format!("{}B", bytes)
+        format!("{bytes}B")
     }
 }

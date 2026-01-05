@@ -15,7 +15,7 @@ enum FileLocation {
 }
 
 impl FileLocation {
-    /// Parse a path string into a FileLocation
+    /// Parse a path string into a `FileLocation`
     /// Supports formats: `/local/path`, `host:path`, `host:~/path`
     fn parse(s: &str) -> Self {
         // Check for host:path format (but not Windows drive letters like C:)
@@ -24,13 +24,13 @@ impl FileLocation {
             // If it's a single letter, it might be a Windows drive
             if before_colon.len() > 1 && !before_colon.contains('/') && !before_colon.contains('\\')
             {
-                return FileLocation::Remote {
+                return Self::Remote {
                     host: before_colon.to_string(),
                     path: s[colon_pos + 1..].to_string(),
                 };
             }
         }
-        FileLocation::Local(PathBuf::from(s))
+        Self::Local(PathBuf::from(s))
     }
 
 }
@@ -166,14 +166,14 @@ async fn run_sync(
     validate_block_size(block_size)?;
 
     match (&source, &dest) {
-        (FileLocation::Local(src), FileLocation::Local(dst)) => {
-            run_sync_local_to_local(src, dst, block_size, verbose).await
+        (FileLocation::Local(local_src), FileLocation::Local(local_dest)) => {
+            run_sync_local_to_local(local_src, local_dest, block_size, verbose).await
         }
-        (FileLocation::Local(src), FileLocation::Remote { host, path }) => {
-            run_sync_local_to_remote(src, host, path, block_size, verbose).await
+        (FileLocation::Local(local_src), FileLocation::Remote { host, path }) => {
+            run_sync_local_to_remote(local_src, host, path, block_size, verbose).await
         }
-        (FileLocation::Remote { host, path }, FileLocation::Local(dst)) => {
-            run_sync_remote_to_local(host, path, dst, block_size, verbose).await
+        (FileLocation::Remote { host, path }, FileLocation::Local(local_dest)) => {
+            run_sync_remote_to_local(host, path, local_dest, block_size, verbose).await
         }
         (
             FileLocation::Remote {
@@ -187,8 +187,7 @@ async fn run_sync(
         ) => {
             // Remote-to-remote: pull to temp, then push
             Err(format!(
-                "Remote-to-remote sync not yet supported: {}:{} -> {}:{}",
-                src_host, src_path, dst_host, dst_path
+                "Remote-to-remote sync not yet supported: {src_host}:{src_path} -> {dst_host}:{dst_path}"
             )
             .into())
         }
@@ -274,17 +273,16 @@ async fn run_sync_local_to_remote(
     let result = child.wait_with_output().await?;
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(format!("SSH transfer failed: {}", stderr).into());
+        return Err(format!("SSH transfer failed: {stderr}").into());
     }
 
     if verbose {
-        eprintln!("Source size: {} bytes", source_size);
-        eprintln!("Transferred: {} bytes (full file)", source_size);
+        eprintln!("Source size: {source_size} bytes");
+        eprintln!("Transferred: {source_size} bytes (full file)");
     }
 
     println!(
-        "Synced {}:{} ({} bytes transferred)",
-        host, remote_path, source_size
+        "Synced {host}:{remote_path} ({source_size} bytes transferred)"
     );
 
     Ok(())
@@ -317,7 +315,7 @@ async fn run_sync_remote_to_local(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("SSH transfer failed: {}", stderr).into());
+        return Err(format!("SSH transfer failed: {stderr}").into());
     }
 
     let remote_data = output.stdout;
@@ -327,8 +325,8 @@ async fn run_sync_remote_to_local(
     tokio::fs::write(dest, &remote_data).await?;
 
     if verbose {
-        eprintln!("Remote size: {} bytes", remote_size);
-        eprintln!("Transferred: {} bytes (full file)", remote_size);
+        eprintln!("Remote size: {remote_size} bytes");
+        eprintln!("Transferred: {remote_size} bytes (full file)");
     }
 
     println!(

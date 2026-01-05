@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn clone_equals_original() {
         let original = StrongHash::compute(b"test");
-        let cloned = original.clone();
+        let cloned = original;
         assert_eq!(original, cloned);
     }
 
