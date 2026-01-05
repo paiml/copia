@@ -242,7 +242,7 @@ fn protocol_full_sync_flow() {
 
     // 1. Receiver generates and sends signature
     let sig = sync.signature(Cursor::new(basis.as_slice())).unwrap();
-    let sig_msg = FrameBuilder::new().file_id(1).signature_response(sig.clone());
+    let sig_msg = FrameBuilder::new().file_id(1).signature_response(sig);
 
     let mut sig_buf = Vec::new();
     codec.write_message(&mut sig_buf, &sig_msg).unwrap();

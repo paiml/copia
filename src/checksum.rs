@@ -632,7 +632,7 @@ mod proptests {
         ) {
             let mut checksum = RollingChecksum::new(&data);
             for (is_roll, byte1, byte2) in operations {
-                if is_roll && checksum.len() > 0 {
+                if is_roll && !checksum.is_empty() {
                     checksum.roll(byte1, byte2);
                 } else {
                     checksum.push(byte1);

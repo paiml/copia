@@ -733,7 +733,7 @@ mod proptests {
             block_size in prop::sample::select(vec![512usize, 1024, 2048])
         ) {
             let sig = Signature::generate(&mut Cursor::new(&data), block_size).unwrap();
-            let expected = (data.len() + block_size - 1) / block_size;
+            let expected = data.len().div_ceil(block_size);
             prop_assert_eq!(sig.block_count(), expected);
         }
 

@@ -824,7 +824,7 @@ mod proptests {
             let sync = CopiaSync::with_block_size(block_size);
             let sig = sync.signature(Cursor::new(&data)).unwrap();
 
-            let expected = (data.len() + block_size - 1) / block_size;
+            let expected = data.len().div_ceil(block_size);
             prop_assert_eq!(sig.block_count(), expected);
         }
     }

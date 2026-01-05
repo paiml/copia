@@ -8,7 +8,7 @@ use copia::{CopiaSync, RollingChecksum, StrongHash, Sync, SyncBuilder};
 fn bench_rolling_checksum(c: &mut Criterion) {
     let mut group = c.benchmark_group("rolling_checksum");
 
-    for size in [64, 512, 2048, 8192].iter() {
+    for size in &[64, 512, 2048, 8192] {
         let data = vec![42u8; *size];
 
         group.throughput(Throughput::Bytes(*size as u64));
@@ -38,7 +38,7 @@ fn bench_rolling_checksum_roll(c: &mut Criterion) {
 fn bench_strong_hash(c: &mut Criterion) {
     let mut group = c.benchmark_group("strong_hash");
 
-    for size in [64, 512, 2048, 8192, 65536].iter() {
+    for size in &[64, 512, 2048, 8192, 65536] {
         let data = vec![42u8; *size];
 
         group.throughput(Throughput::Bytes(*size as u64));
@@ -54,7 +54,7 @@ fn bench_signature(c: &mut Criterion) {
     let mut group = c.benchmark_group("signature");
     let sync = CopiaSync::with_block_size(2048);
 
-    for size in [1024, 10240, 102400, 1024000].iter() {
+    for size in &[1024, 10240, 102400, 1024000] {
         let data = vec![42u8; *size];
 
         group.throughput(Throughput::Bytes(*size as u64));
@@ -70,7 +70,7 @@ fn bench_delta(c: &mut Criterion) {
     let mut group = c.benchmark_group("delta");
     let sync = CopiaSync::with_block_size(2048);
 
-    for size in [1024, 10240, 102400].iter() {
+    for size in &[1024, 10240, 102400] {
         let basis = vec![42u8; *size];
         let source = vec![42u8; *size]; // Identical for best case
 
@@ -83,7 +83,7 @@ fn bench_delta(c: &mut Criterion) {
     }
 
     // Also benchmark worst case (completely different)
-    for size in [1024, 10240].iter() {
+    for size in &[1024, 10240] {
         let basis = vec![0u8; *size];
         let source = vec![1u8; *size];
 
@@ -105,7 +105,7 @@ fn bench_patch(c: &mut Criterion) {
         .verify_checksum(false) // Skip verification for raw speed
         .build();
 
-    for size in [1024, 10240, 102400].iter() {
+    for size in &[1024, 10240, 102400] {
         let basis = vec![42u8; *size];
         let source = vec![42u8; *size];
 
@@ -132,7 +132,7 @@ fn bench_roundtrip(c: &mut Criterion) {
         .verify_checksum(true)
         .build();
 
-    for size in [1024, 10240, 102400].iter() {
+    for size in &[1024, 10240, 102400] {
         let basis = vec![42u8; *size];
 
         // Source with 10% modification
