@@ -7,6 +7,34 @@ use clap::{Parser, Subcommand};
 
 use copia::async_sync::AsyncCopiaSync;
 
+/// Represents a file location - either local or remote via SSH
+#[derive(Debug, Clone)]
+enum FileLocation {
+    Local(PathBuf),
+    Remote { host: String, path: String },
+}
+
+impl FileLocation {
+    /// Parse a path string into a FileLocation
+    /// Supports formats: `/local/path`, `host:path`, `host:~/path`
+    fn parse(s: &str) -> Self {
+        // Check for host:path format (but not Windows drive letters like C:)
+        if let Some(colon_pos) = s.find(':') {
+            let before_colon = &s[..colon_pos];
+            // If it's a single letter, it might be a Windows drive
+            if before_colon.len() > 1 && !before_colon.contains('/') && !before_colon.contains('\\')
+            {
+                return FileLocation::Remote {
+                    host: before_colon.to_string(),
+                    path: s[colon_pos + 1..].to_string(),
+                };
+            }
+        }
+        FileLocation::Local(PathBuf::from(s))
+    }
+
+}
+
 /// Copia - Pure Rust rsync-style synchronization for Sovereign AI
 #[derive(Parser)]
 #[command(name = "copia")]
@@ -21,15 +49,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Synchronize source file to destination
+    /// Synchronize source file to destination (supports host:path for SSH)
     Sync {
-        /// Source file path
+        /// Source file path (local path or host:path for SSH)
         #[arg(required = true)]
-        source: PathBuf,
+        source: String,
 
-        /// Destination file path
+        /// Destination file path (local path or host:path for SSH)
         #[arg(required = true)]
-        dest: PathBuf,
+        dest: String,
 
         /// Block size for signature generation (512-65536, power of 2)
         #[arg(short, long, default_value = "2048")]
@@ -106,7 +134,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             dest,
             block_size,
             verbose,
-        } => run_sync(&source, &dest, block_size, verbose).await,
+        } => {
+            let src_loc = FileLocation::parse(&source);
+            let dest_loc = FileLocation::parse(&dest);
+            run_sync(src_loc, dest_loc, block_size, verbose).await
+        }
         Commands::Signature {
             file,
             output,
@@ -126,13 +158,49 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_sync(
-    source: &PathBuf,
-    dest: &PathBuf,
+    source: FileLocation,
+    dest: FileLocation,
     block_size: usize,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_block_size(block_size)?;
 
+    match (&source, &dest) {
+        (FileLocation::Local(src), FileLocation::Local(dst)) => {
+            run_sync_local_to_local(src, dst, block_size, verbose).await
+        }
+        (FileLocation::Local(src), FileLocation::Remote { host, path }) => {
+            run_sync_local_to_remote(src, host, path, block_size, verbose).await
+        }
+        (FileLocation::Remote { host, path }, FileLocation::Local(dst)) => {
+            run_sync_remote_to_local(host, path, dst, block_size, verbose).await
+        }
+        (
+            FileLocation::Remote {
+                host: src_host,
+                path: src_path,
+            },
+            FileLocation::Remote {
+                host: dst_host,
+                path: dst_path,
+            },
+        ) => {
+            // Remote-to-remote: pull to temp, then push
+            Err(format!(
+                "Remote-to-remote sync not yet supported: {}:{} -> {}:{}",
+                src_host, src_path, dst_host, dst_path
+            )
+            .into())
+        }
+    }
+}
+
+async fn run_sync_local_to_local(
+    source: &PathBuf,
+    dest: &PathBuf,
+    block_size: usize,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let sync = AsyncCopiaSync::with_block_size(block_size);
 
     if verbose {
@@ -162,6 +230,111 @@ async fn run_sync(
         dest.display(),
         result.bytes_matched,
         result.bytes_literal
+    );
+
+    Ok(())
+}
+
+async fn run_sync_local_to_remote(
+    source: &PathBuf,
+    host: &str,
+    remote_path: &str,
+    _block_size: usize, // TODO: Use for delta transfer optimization
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::process::Command;
+
+    if verbose {
+        eprintln!(
+            "Syncing {} -> {}:{}",
+            source.display(),
+            host,
+            remote_path
+        );
+    }
+
+    // Read source file
+    let source_data = tokio::fs::read(source).await?;
+    let source_size = source_data.len();
+
+    // For now, use a simple scp-style approach: transfer whole file via SSH
+    // Future optimization: implement delta transfer over SSH
+    let mut child = Command::new("ssh")
+        .arg(host)
+        .arg(format!("cat > '{}'", remote_path.replace('\'', "'\\''")))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let mut stdin = child.stdin.take().ok_or("Failed to open stdin")?;
+    tokio::io::AsyncWriteExt::write_all(&mut stdin, &source_data).await?;
+    drop(stdin);
+
+    let result = child.wait_with_output().await?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("SSH transfer failed: {}", stderr).into());
+    }
+
+    if verbose {
+        eprintln!("Source size: {} bytes", source_size);
+        eprintln!("Transferred: {} bytes (full file)", source_size);
+    }
+
+    println!(
+        "Synced {}:{} ({} bytes transferred)",
+        host, remote_path, source_size
+    );
+
+    Ok(())
+}
+
+async fn run_sync_remote_to_local(
+    host: &str,
+    remote_path: &str,
+    dest: &PathBuf,
+    _block_size: usize, // TODO: Use for delta transfer optimization
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::process::Command;
+
+    if verbose {
+        eprintln!(
+            "Syncing {}:{} -> {}",
+            host,
+            remote_path,
+            dest.display()
+        );
+    }
+
+    // Fetch remote file via SSH
+    let output = Command::new("ssh")
+        .arg(host)
+        .arg(format!("cat '{}'", remote_path.replace('\'', "'\\''")))
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("SSH transfer failed: {}", stderr).into());
+    }
+
+    let remote_data = output.stdout;
+    let remote_size = remote_data.len();
+
+    // Write to destination
+    tokio::fs::write(dest, &remote_data).await?;
+
+    if verbose {
+        eprintln!("Remote size: {} bytes", remote_size);
+        eprintln!("Transferred: {} bytes (full file)", remote_size);
+    }
+
+    println!(
+        "Synced {} ({} bytes transferred)",
+        dest.display(),
+        remote_size
     );
 
     Ok(())

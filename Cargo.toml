@@ -51,7 +51,7 @@ tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "io-util", 
 [features]
 default = []
 async = ["tokio"]
-cli = ["clap", "async", "tokio/rt-multi-thread", "tokio/macros"]
+cli = ["clap", "async", "tokio/rt-multi-thread", "tokio/macros", "tokio/process"]
 
 [[bin]]
 name = "copia"
