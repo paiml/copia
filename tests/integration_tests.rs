@@ -116,7 +116,8 @@ fn sync_large_file() {
     let delta = sync.delta(Cursor::new(&source), &sig).unwrap();
 
     let mut output = Vec::new();
-    sync.patch(Cursor::new(&basis), &delta, &mut output).unwrap();
+    sync.patch(Cursor::new(&basis), &delta, &mut output)
+        .unwrap();
 
     assert_eq!(output, source);
 }
@@ -175,7 +176,8 @@ fn sync_binary_data() {
     let delta = sync.delta(Cursor::new(&source), &sig).unwrap();
 
     let mut output = Vec::new();
-    sync.patch(Cursor::new(&basis), &delta, &mut output).unwrap();
+    sync.patch(Cursor::new(&basis), &delta, &mut output)
+        .unwrap();
 
     assert_eq!(output, source);
 }
@@ -202,7 +204,11 @@ fn protocol_signature_request_response_flow() {
     let mut codec2 = Codec::new();
     let received = codec2.read_message(&mut Cursor::new(&buf)).unwrap();
 
-    if let Message::SignatureRequest { file_id, block_size } = received {
+    if let Message::SignatureRequest {
+        file_id,
+        block_size,
+    } = received
+    {
         assert_eq!(file_id, 1);
         assert_eq!(block_size, 1024);
 
@@ -288,7 +294,10 @@ fn protocol_full_sync_flow() {
     let mut codec4 = Codec::new();
     let received_ack = codec4.read_message(&mut Cursor::new(&ack_buf)).unwrap();
 
-    if let Message::Ack { success, message, .. } = received_ack {
+    if let Message::Ack {
+        success, message, ..
+    } = received_ack
+    {
         assert!(success);
         assert_eq!(message, Some("Sync complete".to_string()));
     } else {
@@ -359,8 +368,14 @@ fn sync_multiple_files() {
 
     let files = vec![
         (b"File 1 content".to_vec(), b"File 1 modified".to_vec()),
-        (b"File 2 original".to_vec(), b"File 2 updated version".to_vec()),
-        (b"Third file here".to_vec(), b"Third file with changes".to_vec()),
+        (
+            b"File 2 original".to_vec(),
+            b"File 2 updated version".to_vec(),
+        ),
+        (
+            b"Third file here".to_vec(),
+            b"Third file with changes".to_vec(),
+        ),
     ];
 
     for (basis, source) in &files {
@@ -443,7 +458,8 @@ fn various_block_sizes() {
         let delta = sync.delta(Cursor::new(&source), &sig).unwrap();
 
         let mut output = Vec::new();
-        sync.patch(Cursor::new(&basis), &delta, &mut output).unwrap();
+        sync.patch(Cursor::new(&basis), &delta, &mut output)
+            .unwrap();
 
         assert_eq!(output, source, "Failed for block_size={block_size}");
     }

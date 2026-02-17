@@ -84,22 +84,74 @@ async fn main() {
 
     let scenarios = vec![
         // Small files
-        Scenario { name: "1KB identical", size: 1024, change_percent: 0 },
-        Scenario { name: "1KB 10% changed", size: 1024, change_percent: 10 },
-        Scenario { name: "1KB 50% changed", size: 1024, change_percent: 50 },
+        Scenario {
+            name: "1KB identical",
+            size: 1024,
+            change_percent: 0,
+        },
+        Scenario {
+            name: "1KB 10% changed",
+            size: 1024,
+            change_percent: 10,
+        },
+        Scenario {
+            name: "1KB 50% changed",
+            size: 1024,
+            change_percent: 50,
+        },
         // Medium files
-        Scenario { name: "100KB identical", size: 100 * 1024, change_percent: 0 },
-        Scenario { name: "100KB 10% changed", size: 100 * 1024, change_percent: 10 },
-        Scenario { name: "100KB 50% changed", size: 100 * 1024, change_percent: 50 },
+        Scenario {
+            name: "100KB identical",
+            size: 100 * 1024,
+            change_percent: 0,
+        },
+        Scenario {
+            name: "100KB 10% changed",
+            size: 100 * 1024,
+            change_percent: 10,
+        },
+        Scenario {
+            name: "100KB 50% changed",
+            size: 100 * 1024,
+            change_percent: 50,
+        },
         // Large files
-        Scenario { name: "1MB identical", size: 1024 * 1024, change_percent: 0 },
-        Scenario { name: "1MB 5% changed", size: 1024 * 1024, change_percent: 5 },
-        Scenario { name: "1MB 10% changed", size: 1024 * 1024, change_percent: 10 },
+        Scenario {
+            name: "1MB identical",
+            size: 1024 * 1024,
+            change_percent: 0,
+        },
+        Scenario {
+            name: "1MB 5% changed",
+            size: 1024 * 1024,
+            change_percent: 5,
+        },
+        Scenario {
+            name: "1MB 10% changed",
+            size: 1024 * 1024,
+            change_percent: 10,
+        },
         // Very large files
-        Scenario { name: "10MB identical", size: 10 * 1024 * 1024, change_percent: 0 },
-        Scenario { name: "10MB 1% changed", size: 10 * 1024 * 1024, change_percent: 1 },
-        Scenario { name: "10MB 5% changed", size: 10 * 1024 * 1024, change_percent: 5 },
-        Scenario { name: "10MB 100% different", size: 10 * 1024 * 1024, change_percent: 100 },
+        Scenario {
+            name: "10MB identical",
+            size: 10 * 1024 * 1024,
+            change_percent: 0,
+        },
+        Scenario {
+            name: "10MB 1% changed",
+            size: 10 * 1024 * 1024,
+            change_percent: 1,
+        },
+        Scenario {
+            name: "10MB 5% changed",
+            size: 10 * 1024 * 1024,
+            change_percent: 5,
+        },
+        Scenario {
+            name: "10MB 100% different",
+            size: 10 * 1024 * 1024,
+            change_percent: 100,
+        },
     ];
 
     let mut results = Vec::new();
@@ -122,7 +174,13 @@ async fn main() {
         let copia_dest = base_path.join("copia_dest.dat");
 
         // Determine iterations based on file size
-        let iterations = if scenario.size < 100_000 { 20 } else if scenario.size < 1_000_000 { 10 } else { 5 };
+        let iterations = if scenario.size < 100_000 {
+            20
+        } else if scenario.size < 1_000_000 {
+            10
+        } else {
+            5
+        };
 
         // Benchmark rsync (using delta algorithm)
         let mut rsync_total = Duration::ZERO;
@@ -153,7 +211,10 @@ async fn main() {
             fs::copy(&original_path, &copia_dest).expect("Failed to copy");
 
             let start = Instant::now();
-            let result = sync.sync_files(&modified_path, &copia_dest).await.expect("Sync failed");
+            let result = sync
+                .sync_files(&modified_path, &copia_dest)
+                .await
+                .expect("Sync failed");
             copia_total += start.elapsed();
             copia_bytes_literal = result.bytes_literal;
             copia_bytes_matched = result.bytes_matched;
@@ -163,7 +224,11 @@ async fn main() {
         // Verify copia produced correct output
         let modified_content = fs::read(&modified_path).expect("Failed to read modified");
         let copia_content = fs::read(&copia_dest).expect("Failed to read copia result");
-        assert_eq!(copia_content, modified_content, "copia output mismatch for {}", scenario.name);
+        assert_eq!(
+            copia_content, modified_content,
+            "copia output mismatch for {}",
+            scenario.name
+        );
 
         let speedup = rsync_avg.as_secs_f64() / copia_avg.as_secs_f64();
         let speedup_str = if speedup >= 1.0 {
@@ -172,7 +237,8 @@ async fn main() {
             format!("\x1b[31m{:.1}x slower\x1b[0m", 1.0 / speedup)
         };
 
-        println!(" rsync: {:>8.2}ms  copia: {:>8.2}ms  {}",
+        println!(
+            " rsync: {:>8.2}ms  copia: {:>8.2}ms  {}",
             rsync_avg.as_secs_f64() * 1000.0,
             copia_avg.as_secs_f64() * 1000.0,
             speedup_str
@@ -199,21 +265,36 @@ async fn main() {
     let total_copia: Duration = results.iter().map(|r| r.copia_time).sum();
     let overall_speedup = total_rsync.as_secs_f64() / total_copia.as_secs_f64();
 
-    println!("  Total rsync time:  {:>10.2}ms", total_rsync.as_secs_f64() * 1000.0);
-    println!("  Total copia time:  {:>10.2}ms", total_copia.as_secs_f64() * 1000.0);
+    println!(
+        "  Total rsync time:  {:>10.2}ms",
+        total_rsync.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  Total copia time:  {:>10.2}ms",
+        total_copia.as_secs_f64() * 1000.0
+    );
     println!();
 
     if overall_speedup >= 1.0 {
         println!("  \x1b[32;1m★ Overall: copia is {overall_speedup:.2}x FASTER than rsync\x1b[0m");
     } else {
-        println!("  Overall: copia is {:.2}x slower than rsync", 1.0 / overall_speedup);
+        println!(
+            "  Overall: copia is {:.2}x slower than rsync",
+            1.0 / overall_speedup
+        );
     }
     println!();
 
     // Detailed table
-    println!("┌────────────────────────────┬──────────┬────────────┬────────────┬──────────────────┐");
-    println!("│ Scenario                   │ Size     │ rsync (ms) │ copia (ms) │ Speedup          │");
-    println!("├────────────────────────────┼──────────┼────────────┼────────────┼──────────────────┤");
+    println!(
+        "┌────────────────────────────┬──────────┬────────────┬────────────┬──────────────────┐"
+    );
+    println!(
+        "│ Scenario                   │ Size     │ rsync (ms) │ copia (ms) │ Speedup          │"
+    );
+    println!(
+        "├────────────────────────────┼──────────┼────────────┼────────────┼──────────────────┤"
+    );
 
     for result in &results {
         let speedup = result.rsync_time.as_secs_f64() / result.copia_time.as_secs_f64();
@@ -229,7 +310,8 @@ async fn main() {
             format!("{}KB", result.size / 1024)
         };
 
-        println!("│ {:<26} │ {:>8} │ {:>10.2} │ {:>10.2} │ {:>16} │",
+        println!(
+            "│ {:<26} │ {:>8} │ {:>10.2} │ {:>10.2} │ {:>16} │",
             result.scenario,
             size_str,
             result.rsync_time.as_secs_f64() * 1000.0,
@@ -238,7 +320,9 @@ async fn main() {
         );
     }
 
-    println!("└────────────────────────────┴──────────┴────────────┴────────────┴──────────────────┘");
+    println!(
+        "└────────────────────────────┴──────────┴────────────┴────────────┴──────────────────┘"
+    );
     println!();
 
     // Delta efficiency
@@ -254,7 +338,8 @@ async fn main() {
             0.0
         };
 
-        println!("│ {:<26} │ {:>12} │ {:>12} │ {:>10.1}% │",
+        println!(
+            "│ {:<26} │ {:>12} │ {:>12} │ {:>10.1}% │",
             result.scenario,
             format_bytes(result.copia_bytes_matched),
             format_bytes(result.copia_bytes_literal),
@@ -267,7 +352,9 @@ async fn main() {
 
     // Note about rsync
     println!("Note: rsync times include process spawn overhead (~40ms on this system).");
-    println!("      For a more fair comparison of the algorithm itself, see the criterion benches.");
+    println!(
+        "      For a more fair comparison of the algorithm itself, see the criterion benches."
+    );
     println!();
 }
 

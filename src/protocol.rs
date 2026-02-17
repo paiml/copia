@@ -145,20 +145,24 @@ impl FrameHeader {
     ///
     /// Returns `ProtocolError` if decoding fails.
     pub fn decode(buf: &[u8; Self::SIZE]) -> Result<Self> {
-        let magic: [u8; 4] = buf[0..4].try_into().map_err(|_| {
-            CopiaError::ProtocolError("Failed to decode magic".to_string())
-        })?;
+        let magic: [u8; 4] = buf[0..4]
+            .try_into()
+            .map_err(|_| CopiaError::ProtocolError("Failed to decode magic".to_string()))?;
 
-        let length = u32::from_le_bytes(buf[4..8].try_into().map_err(|_| {
-            CopiaError::ProtocolError("Failed to decode length".to_string())
-        })?);
+        let length = u32::from_le_bytes(
+            buf[4..8]
+                .try_into()
+                .map_err(|_| CopiaError::ProtocolError("Failed to decode length".to_string()))?,
+        );
 
         let msg_type = MessageType::from_u8(buf[8])?;
         let version = buf[9];
 
-        let flags = u16::from_le_bytes(buf[10..12].try_into().map_err(|_| {
-            CopiaError::ProtocolError("Failed to decode flags".to_string())
-        })?);
+        let flags = u16::from_le_bytes(
+            buf[10..12]
+                .try_into()
+                .map_err(|_| CopiaError::ProtocolError("Failed to decode flags".to_string()))?,
+        );
 
         let header = Self {
             magic,
@@ -267,9 +271,8 @@ impl Message {
     ///
     /// Returns an error if serialization fails.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).map_err(|e| {
-            CopiaError::ProtocolError(format!("Failed to encode message: {e}"))
-        })
+        bincode::serialize(self)
+            .map_err(|e| CopiaError::ProtocolError(format!("Failed to encode message: {e}")))
     }
 
     /// Decode message from bytes.
@@ -278,9 +281,8 @@ impl Message {
     ///
     /// Returns an error if deserialization fails.
     pub fn decode(data: &[u8]) -> Result<Self> {
-        bincode::deserialize(data).map_err(|e| {
-            CopiaError::ProtocolError(format!("Failed to decode message: {e}"))
-        })
+        bincode::deserialize(data)
+            .map_err(|e| CopiaError::ProtocolError(format!("Failed to decode message: {e}")))
     }
 }
 
@@ -307,9 +309,8 @@ impl Codec {
     /// Returns an error if writing fails.
     pub fn write_message<W: Write>(&self, writer: &mut W, message: &Message) -> Result<()> {
         let payload = message.encode()?;
-        let payload_len = u32::try_from(payload.len()).map_err(|_| {
-            CopiaError::ProtocolError("Payload too large for u32".to_string())
-        })?;
+        let payload_len = u32::try_from(payload.len())
+            .map_err(|_| CopiaError::ProtocolError("Payload too large for u32".to_string()))?;
 
         if payload_len > MAX_PAYLOAD_SIZE {
             return Err(CopiaError::ProtocolError(format!(
@@ -442,8 +443,14 @@ mod tests {
 
     #[test]
     fn message_type_from_u8_valid() {
-        assert_eq!(MessageType::from_u8(0x01).unwrap(), MessageType::SignatureRequest);
-        assert_eq!(MessageType::from_u8(0x02).unwrap(), MessageType::SignatureResponse);
+        assert_eq!(
+            MessageType::from_u8(0x01).unwrap(),
+            MessageType::SignatureRequest
+        );
+        assert_eq!(
+            MessageType::from_u8(0x02).unwrap(),
+            MessageType::SignatureResponse
+        );
         assert_eq!(MessageType::from_u8(0x03).unwrap(), MessageType::DeltaData);
         assert_eq!(MessageType::from_u8(0x04).unwrap(), MessageType::Ack);
         assert_eq!(MessageType::from_u8(0x05).unwrap(), MessageType::Error);
@@ -545,10 +552,7 @@ mod tests {
     #[test]
     fn message_delta_data() {
         let delta = Delta::new(1024, 1000, 1000);
-        let msg = Message::DeltaData {
-            file_id: 1,
-            delta,
-        };
+        let msg = Message::DeltaData { file_id: 1, delta };
         assert_eq!(msg.msg_type(), MessageType::DeltaData);
     }
 
@@ -619,10 +623,7 @@ mod tests {
         delta.push_copy(0, 200);
         delta.push_literal(b"new data");
 
-        let msg = Message::DeltaData {
-            file_id: 1,
-            delta,
-        };
+        let msg = Message::DeltaData { file_id: 1, delta };
         let encoded = msg.encode().unwrap();
         let decoded = Message::decode(&encoded).unwrap();
         assert_eq!(msg, decoded);
@@ -738,7 +739,11 @@ mod tests {
         let builder = FrameBuilder::new();
         let msg = builder.signature_request();
 
-        if let Message::SignatureRequest { file_id, block_size } = msg {
+        if let Message::SignatureRequest {
+            file_id,
+            block_size,
+        } = msg
+        {
             assert_eq!(file_id, 0);
             assert_eq!(block_size, 2048);
         } else {
@@ -802,7 +807,12 @@ mod tests {
         let builder = FrameBuilder::new().file_id(5);
         let msg = builder.ack(true, Some("Done".to_string()));
 
-        if let Message::Ack { file_id, success, message } = msg {
+        if let Message::Ack {
+            file_id,
+            success,
+            message,
+        } = msg
+        {
             assert_eq!(file_id, 5);
             assert!(success);
             assert_eq!(message, Some("Done".to_string()));

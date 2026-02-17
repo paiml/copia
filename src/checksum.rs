@@ -92,7 +92,11 @@ impl RollingChecksum {
     /// ```
     #[must_use]
     pub const fn empty() -> Self {
-        Self { a: 0, b: 0, count: 0 }
+        Self {
+            a: 0,
+            b: 0,
+            count: 0,
+        }
     }
 
     /// Roll the window by one byte: remove `old_byte` from start, add `new_byte` at end.

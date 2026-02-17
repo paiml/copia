@@ -149,7 +149,11 @@ impl StrongHash {
 
 impl std::fmt::Debug for StrongHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StrongHash({:016x}...)", u64::from_be_bytes(self.0[..8].try_into().unwrap_or([0u8; 8])))
+        write!(
+            f,
+            "StrongHash({:016x}...)",
+            u64::from_be_bytes(self.0[..8].try_into().unwrap_or([0u8; 8]))
+        )
     }
 }
 

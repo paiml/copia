@@ -197,9 +197,7 @@ impl AsyncCopiaSync {
         for op in &delta.ops {
             match op {
                 DeltaOp::Copy { offset, len } => {
-                    basis
-                        .seek(std::io::SeekFrom::Start(*offset))
-                        .await?;
+                    basis.seek(std::io::SeekFrom::Start(*offset)).await?;
                     let mut buffer = vec![0u8; *len as usize];
                     basis.read_exact(&mut buffer).await?;
                     output.write_all(&buffer).await?;
@@ -276,7 +274,8 @@ impl AsyncCopiaSync {
         }
 
         // Generate signature from basis data (using sync version for speed)
-        let signature = crate::Signature::generate(&mut Cursor::new(&basis_data), self.config.block_size)?;
+        let signature =
+            crate::Signature::generate(&mut Cursor::new(&basis_data), self.config.block_size)?;
 
         // Compute delta from source - use sync version with optimizations
         let sync = crate::CopiaSync::with_block_size(self.config.block_size);
@@ -399,7 +398,10 @@ mod tests {
         let source = b"new content";
 
         let sig = sync.signature(Cursor::new(basis)).await.unwrap();
-        let delta = sync.delta(Cursor::new(source.as_slice()), &sig).await.unwrap();
+        let delta = sync
+            .delta(Cursor::new(source.as_slice()), &sig)
+            .await
+            .unwrap();
 
         assert_eq!(delta.bytes_matched(), 0);
         assert_eq!(delta.bytes_literal(), source.len() as u64);
@@ -450,6 +452,64 @@ mod tests {
 
         assert!((result.compression_ratio() - 0.8).abs() < f64::EPSILON);
         assert!((result.bandwidth_savings() - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn sync_files_new_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        let data = b"hello copia sync_files";
+        tokio::fs::write(&src, data).await.unwrap();
+
+        let sync = AsyncCopiaSync::new();
+        let result = sync.sync_files(&src, &dst).await.unwrap();
+
+        assert_eq!(result.bytes_matched, 0);
+        assert_eq!(result.bytes_literal, data.len() as u64);
+        assert_eq!(result.source_size, data.len() as u64);
+        assert_eq!(result.basis_size, 0);
+
+        let output = tokio::fs::read(&dst).await.unwrap();
+        assert_eq!(output, data);
+    }
+
+    #[tokio::test]
+    async fn sync_files_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        let data = b"identical content here";
+        tokio::fs::write(&src, data).await.unwrap();
+        tokio::fs::write(&dst, data).await.unwrap();
+
+        let sync = AsyncCopiaSync::new();
+        let result = sync.sync_files(&src, &dst).await.unwrap();
+
+        assert_eq!(result.bytes_matched, data.len() as u64);
+        assert_eq!(result.bytes_literal, 0);
+    }
+
+    #[tokio::test]
+    async fn sync_files_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        let basis = vec![0xAAu8; 4096];
+        let mut source = basis.clone();
+        source[100..110].fill(0xBB);
+        tokio::fs::write(&dst, &basis).await.unwrap();
+        tokio::fs::write(&src, &source).await.unwrap();
+
+        let sync = AsyncCopiaSync::with_block_size(2048);
+        let result = sync.sync_files(&src, &dst).await.unwrap();
+
+        assert!(result.bytes_matched > 0);
+        assert_eq!(result.source_size, 4096);
+        assert_eq!(result.basis_size, 4096);
+
+        let output = tokio::fs::read(&dst).await.unwrap();
+        assert_eq!(output, source);
     }
 
     #[tokio::test]

@@ -491,7 +491,10 @@ mod tests {
 
         let result = delta.validate();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), CopiaError::InvalidCopyBounds { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            CopiaError::InvalidCopyBounds { .. }
+        ));
     }
 
     #[test]

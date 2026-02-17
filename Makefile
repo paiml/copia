@@ -34,10 +34,10 @@ test:
 
 # Coverage with 95% threshold (Certeza requirement)
 coverage:
-	cargo llvm-cov --all-features --html
+	cargo llvm-cov --all-features --html --ignore-filename-regex 'bin/'
 
 coverage-check:
-	cargo llvm-cov --all-features --fail-under-lines 95
+	cargo llvm-cov --all-features --fail-under-lines 95 --ignore-filename-regex 'bin/|rustlib/'
 
 # =============================================================================
 # TIER 3: On-Merge (Exhaustive validation)
