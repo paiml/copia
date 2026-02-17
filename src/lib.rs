@@ -5,6 +5,19 @@
 //! Copia implements the rsync delta-transfer algorithm in 100% safe Rust,
 //! providing memory-safe, auditable, high-performance file synchronization.
 //!
+//! ## Safety
+//!
+//! This crate uses `#![forbid(unsafe_code)]` — all code is safe Rust.
+//! No undefined behavior is possible.
+//!
+//! ## Invariants
+//!
+//! - Rolling checksum components `a` and `b` are always `< MOD (65521)`
+//! - Delta bytes matched + bytes literal always equals source size
+//! - Patch output size always equals `delta.source_size`
+//! - Signature block count equals `ceil(file_size / block_size)`
+//! - Protocol headers always contain valid `PROTOCOL_MAGIC`
+//!
 //! ## Features
 //!
 //! - **Rolling Checksum**: Adler-32 variant for O(1) window sliding

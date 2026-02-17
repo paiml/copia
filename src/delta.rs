@@ -127,6 +127,8 @@ impl Delta {
 
     /// Add a copy operation.
     pub fn push_copy(&mut self, offset: u64, len: u32) {
+        debug_assert!(len > 0, "copy operation must have non-zero length");
+
         // Try to merge with previous copy if contiguous
         if let Some(DeltaOp::Copy {
             offset: prev_offset,

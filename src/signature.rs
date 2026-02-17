@@ -154,6 +154,14 @@ impl Signature {
             tracing::Span::current().record("parallel", data.len() > 64 * 1024);
         }
 
+        // Invariant: block count matches expected from file size and block size
+        let expected_blocks = data.len().div_ceil(block_size);
+        debug_assert_eq!(
+            blocks.len(),
+            expected_blocks,
+            "block count must match ceil(file_size / block_size)"
+        );
+
         Ok(Self {
             block_size,
             file_size,

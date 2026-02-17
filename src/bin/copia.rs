@@ -361,25 +361,59 @@ async fn transfer_file_to_remote(
     Ok(file_size)
 }
 
+/// Compute the total size of files relative to a root directory.
+fn compute_total_size(root: &Path, files: &[PathBuf]) -> u64 {
+    let mut total: u64 = 0;
+    for f in files {
+        if let Ok(m) = std::fs::metadata(root.join(f)) {
+            total += m.len();
+        }
+    }
+    total
+}
+
+/// Calculate transfer speed in bytes per second.
+#[allow(clippy::cast_precision_loss)]
+fn transfer_speed(bytes: u64, elapsed: std::time::Duration) -> u64 {
+    let secs = elapsed.as_secs_f64();
+    if secs > 0.0 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let speed = (bytes as f64 / secs).max(0.0) as u64;
+        speed
+    } else {
+        0
+    }
+}
+
+/// Wait for all spawned task handles, logging errors.
+async fn join_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
+    for handle in handles {
+        if let Err(e) = handle.await {
+            eprintln!("Task error: {e}");
+        }
+    }
+}
+
 /// Format bytes into a human-readable string.
 #[allow(clippy::cast_precision_loss)]
 fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const TIB: u64 = 1024 * 1024 * 1024 * 1024;
+    const UNITS: &[(u64, &str, usize)] = &[
+        (1024 * 1024 * 1024 * 1024, "TiB", 2),
+        (1024 * 1024 * 1024, "GiB", 2),
+        (1024 * 1024, "MiB", 1),
+        (1024, "KiB", 1),
+    ];
 
-    if bytes >= TIB {
-        format!("{:.2} TiB", bytes as f64 / TIB as f64)
-    } else if bytes >= GIB {
-        format!("{:.2} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
+    for &(threshold, unit, precision) in UNITS {
+        if bytes >= threshold {
+            return format!(
+                "{:.prec$} {unit}",
+                bytes as f64 / threshold as f64,
+                prec = precision
+            );
+        }
     }
+    format!("{bytes} B")
 }
 
 #[instrument(skip(source, dest, _block_size))]
@@ -401,11 +435,7 @@ async fn run_sync_recursive(
     }
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
+#[allow(clippy::cast_possible_truncation)]
 #[instrument(skip(local_root), fields(host, remote_root))]
 async fn run_sync_dir_local_to_remote(
     local_root: &Path,
@@ -416,7 +446,6 @@ async fn run_sync_dir_local_to_remote(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
 
-    // 1. Discover files
     eprintln!("Discovering files in {}...", local_root.display());
     let files = discover_local_files(local_root)?;
     if files.is_empty() {
@@ -424,95 +453,43 @@ async fn run_sync_dir_local_to_remote(
         return Ok(());
     }
 
-    // Compute total size
-    let mut total_size: u64 = 0;
-    for f in &files {
-        let full = local_root.join(f);
-        if let Ok(m) = std::fs::metadata(&full) {
-            total_size += m.len();
-        }
-    }
-
+    let total_size = compute_total_size(local_root, &files);
+    let dirs = collect_dirs(&files);
     eprintln!(
         "Found {} files ({}) across {} directories",
         files.len(),
         format_bytes(total_size),
-        collect_dirs(&files).len()
+        dirs.len()
     );
 
-    // 2. Create directory structure on remote
     eprintln!("Creating remote directory structure...");
-    let dirs = collect_dirs(&files);
     create_remote_dirs(host, remote_root, &dirs).await?;
 
-    // 3. Transfer files with bounded concurrency
     eprintln!("Transferring with {jobs} parallel jobs...");
-
     let semaphore = Arc::new(Semaphore::new(jobs));
-    let bytes_transferred = Arc::new(AtomicU64::new(0));
-    let files_done = Arc::new(AtomicU64::new(0));
-    let files_failed = Arc::new(AtomicU64::new(0));
-    let total_files = files.len() as u64;
+    let progress = TransferProgress {
+        bytes_transferred: Arc::new(AtomicU64::new(0)),
+        files_done: Arc::new(AtomicU64::new(0)),
+        files_failed: Arc::new(AtomicU64::new(0)),
+        total_files: files.len() as u64,
+    };
 
-    let mut handles = Vec::with_capacity(files.len());
+    let handles =
+        spawn_remote_transfers(&files, local_root, host, remote_root, &semaphore, &progress);
 
-    for rel_path in files {
-        let local_file = local_root.join(&rel_path);
-        let remote_file = format!("{}/{}", remote_root, rel_path.display());
-        let host = host.to_string();
-        let sem = Arc::clone(&semaphore);
-        let bytes_tx = Arc::clone(&bytes_transferred);
-        let done = Arc::clone(&files_done);
-        let failed = Arc::clone(&files_failed);
-
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await;
-            match transfer_file_to_remote(&local_file, &host, &remote_file).await {
-                Ok(size) => {
-                    bytes_tx.fetch_add(size, Ordering::Relaxed);
-                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n % 50 == 0 || n == total_files {
-                        let transferred = bytes_tx.load(Ordering::Relaxed);
-                        eprintln!(
-                            "  [{}/{}] {} transferred",
-                            n,
-                            total_files,
-                            format_bytes(transferred)
-                        );
-                    }
-                }
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("  FAILED {}: {e}", rel_path.display());
-                }
-            }
-        });
-        handles.push(handle);
-    }
-
-    // Wait for all transfers
-    for handle in handles {
-        if let Err(e) = handle.await {
-            eprintln!("Task error: {e}");
-        }
-    }
+    join_handles(handles).await;
 
     let elapsed = start.elapsed();
-    let total_tx = bytes_transferred.load(Ordering::Relaxed);
-    let done_count = files_done.load(Ordering::Relaxed);
-    let fail_count = files_failed.load(Ordering::Relaxed);
-    let speed = if elapsed.as_secs_f64() > 0.0 {
-        total_tx as f64 / elapsed.as_secs_f64()
-    } else {
-        0.0
-    };
+    let total_tx = progress.bytes_transferred.load(Ordering::Relaxed);
+    let done_count = progress.files_done.load(Ordering::Relaxed);
+    let fail_count = progress.files_failed.load(Ordering::Relaxed);
 
     println!("\nComplete: {done_count} files synced, {fail_count} failed");
     println!(
         "Transferred {} in {:.1}s ({}/s)",
         format_bytes(total_tx),
         elapsed.as_secs_f64(),
-        format_bytes(speed.max(0.0) as u64)
+        format_bytes(transfer_speed(total_tx, elapsed))
     );
 
     if verbose {
@@ -528,11 +505,63 @@ async fn run_sync_dir_local_to_remote(
     }
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
+/// Shared progress counters for parallel transfer operations.
+struct TransferProgress {
+    bytes_transferred: Arc<AtomicU64>,
+    files_done: Arc<AtomicU64>,
+    files_failed: Arc<AtomicU64>,
+    total_files: u64,
+}
+
+/// Spawn parallel SSH transfer tasks for each file.
+fn spawn_remote_transfers(
+    files: &[PathBuf],
+    local_root: &Path,
+    host: &str,
+    remote_root: &str,
+    semaphore: &Arc<Semaphore>,
+    progress: &TransferProgress,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut handles = Vec::with_capacity(files.len());
+    let total_files = progress.total_files;
+
+    for rel_path in files {
+        let local_file = local_root.join(rel_path);
+        let remote_file = format!("{}/{}", remote_root, rel_path.display());
+        let host = host.to_string();
+        let sem = Arc::clone(semaphore);
+        let bytes_tx = Arc::clone(&progress.bytes_transferred);
+        let done = Arc::clone(&progress.files_done);
+        let failed = Arc::clone(&progress.files_failed);
+        let rel_display = rel_path.display().to_string();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            match transfer_file_to_remote(&local_file, &host, &remote_file).await {
+                Ok(size) => {
+                    bytes_tx.fetch_add(size, Ordering::Relaxed);
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 50 == 0 || n == total_files {
+                        let transferred = bytes_tx.load(Ordering::Relaxed);
+                        eprintln!(
+                            "  [{n}/{total_files}] {} transferred",
+                            format_bytes(transferred)
+                        );
+                    }
+                }
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("  FAILED {rel_display}: {e}");
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    handles
+}
+
+#[allow(clippy::cast_possible_truncation)]
 #[instrument(skip(local_src, local_dest))]
 async fn run_sync_dir_local_to_local(
     local_src: &Path,
@@ -549,40 +578,71 @@ async fn run_sync_dir_local_to_local(
         return Ok(());
     }
 
-    let mut total_size: u64 = 0;
-    for f in &files {
-        let full = local_src.join(f);
-        if let Ok(m) = std::fs::metadata(&full) {
-            total_size += m.len();
-        }
-    }
-
+    let total_size = compute_total_size(local_src, &files);
     eprintln!("Found {} files ({})", files.len(), format_bytes(total_size));
 
     // Create directory structure
-    let dirs = collect_dirs(&files);
-    for dir in &dirs {
-        let dest_dir = local_dest.join(dir);
-        std::fs::create_dir_all(&dest_dir)?;
-    }
     std::fs::create_dir_all(local_dest)?;
+    for dir in collect_dirs(&files) {
+        std::fs::create_dir_all(local_dest.join(dir))?;
+    }
 
-    let sync = AsyncCopiaSync::with_block_size(2048);
+    let sync = Arc::new(AsyncCopiaSync::with_block_size(2048));
     let semaphore = Arc::new(Semaphore::new(jobs));
-    let bytes_transferred = Arc::new(AtomicU64::new(0));
-    let files_done = Arc::new(AtomicU64::new(0));
-    let total_files = files.len() as u64;
+    let progress = TransferProgress {
+        bytes_transferred: Arc::new(AtomicU64::new(0)),
+        files_done: Arc::new(AtomicU64::new(0)),
+        files_failed: Arc::new(AtomicU64::new(0)),
+        total_files: files.len() as u64,
+    };
 
+    let handles =
+        spawn_local_transfers(&files, local_src, local_dest, &sync, &semaphore, &progress);
+
+    join_handles(handles).await;
+
+    let elapsed = start.elapsed();
+    let total_tx = progress.bytes_transferred.load(Ordering::Relaxed);
+
+    println!(
+        "\nComplete: {} files synced",
+        progress.files_done.load(Ordering::Relaxed)
+    );
+    println!(
+        "Transferred {} in {:.1}s ({}/s)",
+        format_bytes(total_tx),
+        elapsed.as_secs_f64(),
+        format_bytes(transfer_speed(total_tx, elapsed))
+    );
+
+    if verbose {
+        eprintln!("Source: {}", local_src.display());
+        eprintln!("Destination: {}", local_dest.display());
+    }
+
+    Ok(())
+}
+
+/// Spawn parallel local sync tasks for each file.
+fn spawn_local_transfers(
+    files: &[PathBuf],
+    local_src: &Path,
+    local_dest: &Path,
+    sync: &Arc<AsyncCopiaSync>,
+    semaphore: &Arc<Semaphore>,
+    progress: &TransferProgress,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::with_capacity(files.len());
-    let sync = Arc::new(sync);
+    let total_files = progress.total_files;
 
     for rel_path in files {
-        let src_file = local_src.join(&rel_path);
-        let dst_file = local_dest.join(&rel_path);
-        let sem = Arc::clone(&semaphore);
-        let bytes_tx = Arc::clone(&bytes_transferred);
-        let done = Arc::clone(&files_done);
-        let sync = Arc::clone(&sync);
+        let src_file = local_src.join(rel_path);
+        let dst_file = local_dest.join(rel_path);
+        let sem = Arc::clone(semaphore);
+        let bytes_tx = Arc::clone(&progress.bytes_transferred);
+        let done = Arc::clone(&progress.files_done);
+        let sync = Arc::clone(sync);
+        let rel_display = rel_path.display().to_string();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await;
@@ -595,44 +655,14 @@ async fn run_sync_dir_local_to_local(
                     }
                 }
                 Err(e) => {
-                    eprintln!("  FAILED {}: {e}", rel_path.display());
+                    eprintln!("  FAILED {rel_display}: {e}");
                 }
             }
         });
         handles.push(handle);
     }
 
-    for handle in handles {
-        if let Err(e) = handle.await {
-            eprintln!("Task error: {e}");
-        }
-    }
-
-    let elapsed = start.elapsed();
-    let total_tx = bytes_transferred.load(Ordering::Relaxed);
-    let speed = if elapsed.as_secs_f64() > 0.0 {
-        total_tx as f64 / elapsed.as_secs_f64()
-    } else {
-        0.0
-    };
-
-    println!(
-        "\nComplete: {} files synced",
-        files_done.load(Ordering::Relaxed)
-    );
-    println!(
-        "Transferred {} in {:.1}s ({}/s)",
-        format_bytes(total_tx),
-        elapsed.as_secs_f64(),
-        format_bytes(speed.max(0.0) as u64)
-    );
-
-    if verbose {
-        eprintln!("Source: {}", local_src.display());
-        eprintln!("Destination: {}", local_dest.display());
-    }
-
-    Ok(())
+    handles
 }
 
 // ── Single-file sync ──────────────────────────────────────────────────

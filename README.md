@@ -69,7 +69,7 @@ copia = { version = "0.1", features = ["async"] }
 cargo install copia --features cli
 ```
 
-## Quick Start
+## Usage
 
 ### Library Usage
 
@@ -198,7 +198,8 @@ Copia implements the rsync delta-transfer algorithm:
 | Feature | Description |
 |---------|-------------|
 | `async` | Enable tokio async support |
-| `cli` | Build command-line interface |
+| `tracing` | Enable structured tracing instrumentation |
+| `cli` | Build command-line interface (includes async + tracing) |
 
 ## Benchmarks
 
@@ -211,6 +212,15 @@ cargo bench --bench rsync_comparison --features async
 # Run criterion benchmarks (algorithm-only, no spawn overhead)
 cargo bench --bench benchmarks
 ```
+
+### Statistical Methodology
+
+- **Sample size**: 100 iterations per benchmark (Criterion default)
+- **Warm-up**: 3 seconds per benchmark group
+- **Confidence interval**: 95% with automatic outlier detection
+- **Effect size**: Cohen's d reported for regressions
+- **Outlier detection**: Tukey's fences (k=1.5)
+- **Reproducibility**: `rust-toolchain.toml` pins compiler version
 
 ## Comparison with rsync
 

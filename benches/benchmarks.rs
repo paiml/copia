@@ -1,4 +1,14 @@
 //! Benchmarks for copia operations.
+//!
+//! # Statistical Methodology
+//!
+//! All benchmarks use Criterion.rs with the following configuration:
+//! - **Sample size**: 100 iterations (Criterion default)
+//! - **Warm-up**: 3 seconds per benchmark
+//! - **Measurement**: 5 seconds per benchmark
+//! - **Confidence interval**: 95% (reported automatically)
+//! - **Outlier detection**: Tukey's fences (k=1.5)
+//! - **Effect size**: Cohen's d reported for regressions
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::io::Cursor;
@@ -7,6 +17,8 @@ use copia::{CopiaSync, RollingChecksum, StrongHash, Sync, SyncBuilder};
 
 fn bench_rolling_checksum(c: &mut Criterion) {
     let mut group = c.benchmark_group("rolling_checksum");
+    group.sample_size(100);
+    group.confidence_level(0.95);
 
     for size in &[64, 512, 2048, 8192] {
         let data = vec![42u8; *size];

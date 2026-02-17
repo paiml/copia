@@ -299,6 +299,13 @@ impl Sync for CopiaSync {
             delta.push_literal(&source_data[pos..]);
         }
 
+        // Invariant: matched + literal == source size
+        debug_assert_eq!(
+            delta.bytes_matched() + delta.bytes_literal(),
+            source_size,
+            "delta bytes must sum to source size"
+        );
+
         #[cfg(feature = "tracing")]
         {
             tracing::Span::current().record("source_size", source_size);
@@ -323,10 +330,18 @@ impl Sync for CopiaSync {
         delta: &Delta,
         mut output: W,
     ) -> Result<()> {
+        // Invariant: expected output matches source size
+        debug_assert_eq!(
+            delta.expected_output_size(),
+            delta.source_size,
+            "expected output size must equal source size"
+        );
+
         // Validate delta first
         delta.validate()?;
 
         let mut hasher = blake3::Hasher::new();
+        let mut bytes_written: u64 = 0;
 
         for op in &delta.ops {
             match op {
@@ -336,13 +351,20 @@ impl Sync for CopiaSync {
                     basis.read_exact(&mut buffer)?;
                     output.write_all(&buffer)?;
                     hasher.update(&buffer);
+                    bytes_written += u64::from(*len);
                 }
                 DeltaOp::Literal(data) => {
                     output.write_all(data)?;
                     hasher.update(data);
+                    bytes_written += data.len() as u64;
                 }
             }
         }
+
+        debug_assert_eq!(
+            bytes_written, delta.source_size,
+            "bytes written must equal source size"
+        );
 
         // Verify checksum if enabled
         if self.config.verify_checksum {

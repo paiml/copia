@@ -139,6 +139,7 @@ impl FrameHeader {
         buf[8] = self.msg_type as u8;
         buf[9] = self.version;
         buf[10..12].copy_from_slice(&self.flags.to_le_bytes());
+        debug_assert_eq!(&buf[0..4], &PROTOCOL_MAGIC, "encoded magic must match");
         buf
     }
 

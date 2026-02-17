@@ -137,7 +137,10 @@ impl StrongHash {
         for (a, b) in self.0.iter().zip(other.0.iter()) {
             result |= a ^ b;
         }
-        result == 0
+        let equal = result == 0;
+        // Invariant: constant-time result matches standard equality
+        debug_assert_eq!(equal, self == other, "ct_eq must match PartialEq");
+        equal
     }
 
     /// Create a zero hash (for testing/initialization).

@@ -1,6 +1,15 @@
 //! Benchmark comparing copia vs rsync performance.
 //!
 //! Run with: cargo bench --bench `rsync_comparison` --features async
+//!
+//! # Statistical Methodology
+//!
+//! - **Sample size**: 10 iterations per scenario (process-spawning
+//!   benchmarks have higher variance, fewer samples needed)
+//! - **Warm-up**: 1 iteration discarded per scenario
+//! - **Confidence interval**: Mean +/- standard deviation reported
+//! - **Effect size**: Percentage difference relative to rsync baseline
+//! - **Outlier handling**: Min/max/mean all reported for transparency
 
 use std::fs::{self, File};
 use std::io::Write;

@@ -73,11 +73,14 @@ impl RollingChecksum {
             b = b.wrapping_add((len - i) as u32 * u32::from(byte));
         }
 
-        Self {
+        let result = Self {
             a: a % Self::MOD,
             b: b % Self::MOD,
             count: len,
-        }
+        };
+        debug_assert!(result.a < Self::MOD, "a must be < MOD after init");
+        debug_assert!(result.b < Self::MOD, "b must be < MOD after init");
+        result
     }
 
     /// Create an empty rolling checksum.
@@ -132,6 +135,9 @@ impl RollingChecksum {
             .wrapping_sub(self.count as u32 * old)
             .wrapping_add(self.a))
             % Self::MOD;
+
+        debug_assert!(self.a < Self::MOD, "a must be < MOD after roll");
+        debug_assert!(self.b < Self::MOD, "b must be < MOD after roll");
     }
 
     /// Add a single byte to the window (increasing window size).
@@ -145,6 +151,8 @@ impl RollingChecksum {
         self.a = (self.a.wrapping_add(val)) % Self::MOD;
         self.b = (self.b.wrapping_add(self.a)) % Self::MOD;
         self.count += 1;
+        debug_assert!(self.a < Self::MOD, "a must be < MOD after push");
+        debug_assert!(self.b < Self::MOD, "b must be < MOD after push");
     }
 
     /// Get the combined 32-bit digest.

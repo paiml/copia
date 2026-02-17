@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - run: cargo fmt --check
+      - run: cargo clippy --all-features -- -D warnings
+      - run: cargo test --all-features
+      - name: Coverage
+        run: |
+          cargo install cargo-llvm-cov
+          cargo llvm-cov --all-features --fail-under-lines 95
+
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75
+      - run: cargo bench --bench benchmarks
