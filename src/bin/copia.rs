@@ -138,8 +138,8 @@ enum Commands {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("copia=info"));
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_invalid_env| EnvFilter::new("copia=info"));
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)

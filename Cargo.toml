@@ -20,6 +20,12 @@ exclude = [
     "mutants.out/*",
     "mutants.out.old/*",
     "proptest-regressions/*",
+    "target/*",
+    "*.profraw",
+    "*.profdata",
+    ".vscode/*",
+    ".idea/*",
+    ".pmat/*",
     "Makefile",
 ]
 

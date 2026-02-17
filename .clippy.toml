@@ -1,0 +1,20 @@
+# Clippy configuration for copia
+# See: https://doc.rust-lang.org/clippy/lint_configuration.html
+
+# MSRV — match Cargo.toml rust-version
+msrv = "1.75"
+
+# Cognitive complexity threshold (matches .pmat-metrics.toml)
+cognitive-complexity-threshold = 20
+
+# Allow common type names in function signatures
+too-many-arguments-threshold = 7
+
+# Large types moved by value threshold
+too-large-for-stack = 200
+
+# Disallowed methods for safety
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "not thread-safe; use a mutex or test harness" },
+    { path = "std::env::remove_var", reason = "not thread-safe; use a mutex or test harness" },
+]

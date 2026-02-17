@@ -135,11 +135,18 @@ copia patch oldfile.txt file.delta -o newfile.txt
 
 Copia implements the rsync delta-transfer algorithm:
 
-1. **Signature Generation**: The basis file is divided into fixed-size blocks. For each block, a rolling checksum (Adler-32 variant) and strong hash (BLAKE3) are computed.
+1. **Signature Generation**: The basis file is divided into fixed-size
+   blocks. For each block, a rolling checksum (Adler-32 variant) and
+   strong hash (BLAKE3) are computed.
 
-2. **Delta Computation**: The source file is scanned with a sliding window. When the rolling checksum matches a known block, the strong hash verifies the match. Matching blocks become "copy" operations; non-matching data becomes "literal" operations.
+2. **Delta Computation**: The source file is scanned with a sliding
+   window. When the rolling checksum matches a known block, the strong
+   hash verifies the match. Matching blocks become "copy" operations;
+   non-matching data becomes "literal" operations.
 
-3. **Patch Application**: The delta is applied to the basis file, copying matched blocks and inserting literal data to reconstruct the source.
+3. **Patch Application**: The delta is applied to the basis file,
+   copying matched blocks and inserting literal data to reconstruct
+   the source.
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐

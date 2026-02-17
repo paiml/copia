@@ -30,7 +30,7 @@ tier2: tier1 test coverage-check
 	@echo "✅ Tier 2 passed"
 
 test:
-	cargo test --all-features
+	PROPTEST_CASES=256 QUICKCHECK_TESTS=256 cargo test --all-features
 
 # Coverage with 95% threshold (Certeza requirement)
 coverage:

@@ -141,13 +141,23 @@ impl FrameHeader {
     #[cfg_attr(feature = "contracts", ensures(ret[0] == b'C' && ret[1] == b'O' && ret[2] == b'P' && ret[3] == b'A', "encoded header starts with COPA magic"))]
     #[must_use]
     pub fn encode(&self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.magic);
-        buf[4..8].copy_from_slice(&self.length.to_le_bytes());
-        buf[8] = self.msg_type as u8;
-        buf[9] = self.version;
-        buf[10..12].copy_from_slice(&self.flags.to_le_bytes());
-        debug_assert_eq!(&buf[0..4], &PROTOCOL_MAGIC, "encoded magic must match");
+        let len = self.length.to_le_bytes();
+        let flg = self.flags.to_le_bytes();
+        let buf = [
+            self.magic[0],
+            self.magic[1],
+            self.magic[2],
+            self.magic[3],
+            len[0],
+            len[1],
+            len[2],
+            len[3],
+            self.msg_type as u8,
+            self.version,
+            flg[0],
+            flg[1],
+        ];
+        debug_assert_eq!(buf[0], b'C', "encoded magic must match");
         buf
     }
 
@@ -157,24 +167,12 @@ impl FrameHeader {
     ///
     /// Returns `ProtocolError` if decoding fails.
     pub fn decode(buf: &[u8; Self::SIZE]) -> Result<Self> {
-        let magic: [u8; 4] = buf[0..4]
-            .try_into()
-            .map_err(|_| CopiaError::ProtocolError("Failed to decode magic".to_string()))?;
-
-        let length = u32::from_le_bytes(
-            buf[4..8]
-                .try_into()
-                .map_err(|_| CopiaError::ProtocolError("Failed to decode length".to_string()))?,
-        );
-
+        // Fixed-size array indexing — cannot fail since buf is [u8; 12]
+        let magic: [u8; 4] = [buf[0], buf[1], buf[2], buf[3]];
+        let length = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let msg_type = MessageType::from_u8(buf[8])?;
         let version = buf[9];
-
-        let flags = u16::from_le_bytes(
-            buf[10..12]
-                .try_into()
-                .map_err(|_| CopiaError::ProtocolError("Failed to decode flags".to_string()))?,
-        );
+        let flags = u16::from_le_bytes([buf[10], buf[11]]);
 
         let header = Self {
             magic,
@@ -196,6 +194,13 @@ impl FrameHeader {
     pub fn read_from<R: Read>(reader: &mut R) -> Result<Self> {
         let mut buf = [0u8; Self::SIZE];
         reader.read_exact(&mut buf)?;
+        // Validate magic header before full decode
+        let magic = [buf[0], buf[1], buf[2], buf[3]];
+        if magic != PROTOCOL_MAGIC {
+            return Err(CopiaError::ProtocolError(format!(
+                "Invalid magic: expected {PROTOCOL_MAGIC:?}, got {magic:?}"
+            )));
+        }
         Self::decode(&buf)
     }
 
@@ -330,7 +335,7 @@ impl Codec {
     pub fn write_message<W: Write>(&self, writer: &mut W, message: &Message) -> Result<()> {
         let payload = message.encode()?;
         let payload_len = u32::try_from(payload.len())
-            .map_err(|_| CopiaError::ProtocolError("Payload too large for u32".to_string()))?;
+            .map_err(|e| CopiaError::ProtocolError(format!("Payload too large for u32: {e}")))?;
 
         #[cfg(feature = "tracing")]
         tracing::Span::current().record("payload_len", payload_len);
@@ -360,7 +365,10 @@ impl Codec {
         )
     ))]
     pub fn read_message<R: Read>(&mut self, reader: &mut R) -> Result<Message> {
+        // read_from validates PROTOCOL_MAGIC header bytes before decode
         let header = FrameHeader::read_from(reader)?;
+        // Explicit validation: verify magic and version after read
+        header.validate()?;
 
         #[cfg(feature = "tracing")]
         {
@@ -368,6 +376,8 @@ impl Codec {
             tracing::Span::current().record("payload_len", header.length);
         }
 
+        // CB-521: magic validated above by header.validate()
+        debug_assert_eq!(header.magic, PROTOCOL_MAGIC);
         self.read_buf.resize(header.length as usize, 0);
         reader.read_exact(&mut self.read_buf)?;
 

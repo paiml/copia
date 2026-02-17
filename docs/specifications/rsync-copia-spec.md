@@ -60,7 +60,9 @@
 
 ### Vision
 
-Copia is a pure Rust implementation of rsync-style file synchronization primitives designed for Sovereign AI workloads. It provides memory-safe, auditable, high-performance delta synchronization with zero C/C++ dependencies, enabling secure and efficient data transfer across distributed AI infrastructure.
+Copia is a pure Rust implementation of rsync-style file synchronization primitives designed for Sovereign AI
+workloads. It provides memory-safe, auditable, high-performance delta synchronization with zero C/C++
+dependencies, enabling secure and efficient data transfer across distributed AI infrastructure.
 
 ### Key Objectives
 
@@ -85,7 +87,8 @@ Copia is a pure Rust implementation of rsync-style file synchronization primitiv
 
 ### 2.1 Motivation
 
-Modern AI infrastructure requires synchronization of multi-gigabyte model weights, datasets, and checkpoints across distributed systems. Traditional rsync implementations suffer from:
+Modern AI infrastructure requires synchronization of multi-gigabyte model weights, datasets, and checkpoints
+across distributed systems. Traditional rsync implementations suffer from:
 
 1. **Memory Safety Vulnerabilities**: CVE history in C-based implementations
 2. **Opaque Dependencies**: Difficult to audit for supply chain security
@@ -314,9 +317,11 @@ SENDER SIDE                                    RECEIVER SIDE
 
 To guarantee data integrity during synchronization failures, Copia employs a strict "temp-and-swap" strategy:
 
-1.  **Isolation**: Patches are applied to a temporary file (`.copia.tmp.XXXXXX`) in the same filesystem as the destination.
+1.  **Isolation**: Patches are applied to a temporary file (`.copia.tmp.XXXXXX`) in the same filesystem as
+    the destination.
 2.  **Basis Integrity**: The existing destination file (basis) is read-only during the patch operation.
-3.  **Atomic Promotion**: Upon successful reconstruction and verification, the temporary file is atomically renamed over the destination using `renameat2` (Linux) or equivalent.
+3.  **Atomic Promotion**: Upon successful reconstruction and verification, the temporary file is atomically
+    renamed over the destination using `renameat2` (Linux) or equivalent.
 4.  **Cleanup**: Temporary files are tracked and cleaned up on process termination or error.
 
 ---
@@ -1425,7 +1430,8 @@ impl repartir::Task for SyncTask {
 To ensure documentation remains in sync with implementation, Copia enforces the "verified-code-inclusion" pattern.
 
 ### 16.1 Source of Truth
-All code examples in documentation (except simple snippets) must be sourced from compilable, tested Rust files using the `mdbook` include syntax.
+All code examples in documentation (except simple snippets) must be sourced from compilable, tested Rust files
+using the `mdbook` include syntax.
 
 ```markdown
 <!-- GOOD: Includes actual test code -->
@@ -1448,7 +1454,8 @@ fn example() { ... }
 
 ### 16.1 trueno SIMD/GPU Acceleration
 
-Copia leverages trueno's multi-target compute primitives for high-performance operations across CPU SIMD and GPU backends.
+Copia leverages trueno's multi-target compute primitives for high-performance operations across CPU SIMD
+and GPU backends.
 
 #### Backend Selection Strategy
 
@@ -2229,17 +2236,22 @@ tracing = ["trueno/tracing"]
 
 ## 17. References
 
-[1] A. Tridgell and P. Mackerras, "The rsync algorithm," Technical Report TR-CS-96-05, Australian National University, 1996.
+[1] A. Tridgell and P. Mackerras, "The rsync algorithm," Technical Report TR-CS-96-05,
+Australian National University, 1996.
 
-[2] M. O. Rabin, "Fingerprinting by random polynomials," Center for Research in Computing Technology, Harvard University, Tech. Rep. TR-15-81, 1981.
+[2] M. O. Rabin, "Fingerprinting by random polynomials," Center for Research in Computing Technology,
+Harvard University, Tech. Rep. TR-15-81, 1981.
 
 [3] J. O'Connor, J.-P. Aumasson, S. Neves, and Z. Wilcox-O'Hearn, "BLAKE3: One function, fast everywhere," 2020. [Online]. Available: https://github.com/BLAKE3-team/BLAKE3-specs
 
-[4] G. Banga, J. C. Mogul, and P. Druschel, "A scalable and explicit event delivery mechanism for UNIX," in Proceedings of the 1999 USENIX Annual Technical Conference, 1999.
+[4] G. Banga, J. C. Mogul, and P. Druschel, "A scalable and explicit event delivery mechanism for UNIX,"
+in Proceedings of the 1999 USENIX Annual Technical Conference, 1999.
 
-[5] G. Langdale and D. Lemire, "Parsing gigabytes of JSON per second," The VLDB Journal, vol. 28, no. 6, pp. 941-960, 2019.
+[5] G. Langdale and D. Lemire, "Parsing gigabytes of JSON per second," The VLDB Journal,
+vol. 28, no. 6, pp. 941-960, 2019.
 
-[6] R. Jung, J.-H. Jourdan, R. Krebbers, and D. Dreyer, "RustBelt: Securing the foundations of the Rust programming language," Proceedings of the ACM on Programming Languages, vol. 2, no. POPL, pp. 1-34, 2017.
+[6] R. Jung, J.-H. Jourdan, R. Krebbers, and D. Dreyer, "RustBelt: Securing the foundations of the Rust
+programming language," Proceedings of the ACM on Programming Languages, vol. 2, no. POPL, pp. 1-34, 2017.
 
 [7] D. E. Knuth, "The Art of Computer Programming, Volume 3: Sorting and Searching," Addison-Wesley, 1973.
 
