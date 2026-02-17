@@ -215,52 +215,47 @@ fn collect_dirs(files: &[PathBuf]) -> Vec<PathBuf> {
     dirs.into_iter().collect()
 }
 
-/// Create directories on a remote host via batched SSH calls.
-/// Batches into chunks of 200 to avoid "Argument list too long" errors.
+/// Create directories on a remote host via SSH.
+/// Pipes directory list through stdin to avoid shell quoting issues with
+/// special characters (apostrophes, angle brackets, etc.) in directory names.
 async fn create_remote_dirs(
     host: &str,
     remote_root: &str,
     dirs: &[PathBuf],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::fmt::Write;
+    use tokio::io::AsyncWriteExt;
 
-    // Always ensure root exists
-    let output = tokio::process::Command::new("ssh")
+    // Build a newline-delimited list of full paths
+    let mut dir_list = format!("{remote_root}\n");
+    for dir in dirs {
+        let _ = writeln!(dir_list, "{}/{}", remote_root, dir.display());
+    }
+
+    // Pipe directory list via stdin, read line-by-line and mkdir each
+    let mut child = tokio::process::Command::new("ssh")
         .arg(host)
-        .arg(format!("mkdir -p '{remote_root}'"))
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to create remote root: {stderr}").into());
+        .arg("xargs -d '\\n' mkdir -p")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed to open SSH stdin".to_string())?;
+
+    // Write directory list in chunks to avoid buffering issues
+    for chunk in dir_list.as_bytes().chunks(64 * 1024) {
+        stdin.write_all(chunk).await?;
     }
+    drop(stdin);
 
-    if dirs.is_empty() {
-        return Ok(());
-    }
-
-    // Batch directories into chunks to avoid exceeding arg length limits
-    for (i, chunk) in dirs.chunks(200).enumerate() {
-        let mut mkdir_cmd = String::from("mkdir -p");
-        for dir in chunk {
-            let full = format!("{}/{}", remote_root, dir.display());
-            let _ = write!(mkdir_cmd, " '{full}'");
-        }
-
-        let output = tokio::process::Command::new("ssh")
-            .arg(host)
-            .arg(&mkdir_cmd)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "Failed to create remote directories (batch {}): {stderr}",
-                i + 1
-            )
-            .into());
-        }
+    let result = child.wait_with_output().await?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("Failed to create remote directories: {stderr}").into());
     }
 
     Ok(())
@@ -280,9 +275,11 @@ async fn transfer_file_to_remote(
         .map_err(|e| format!("{}: {e}", local_path.display()))?;
     let file_size = metadata.len();
 
+    // Use $'...' quoting with backslash escapes for paths with special chars
+    let escaped = remote_path.replace('\\', "\\\\").replace('\'', "\\'");
     let mut child = tokio::process::Command::new("ssh")
         .arg(host)
-        .arg(format!("cat > '{}'", remote_path.replace('\'', "'\\''")))
+        .arg(format!("cat > $'{escaped}'"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -716,7 +713,10 @@ async fn run_sync_remote_to_local(
 
     let output = Command::new("ssh")
         .arg(host)
-        .arg(format!("cat '{}'", remote_path.replace('\'', "'\\''")))
+        .arg(format!(
+            "cat $'{}'",
+            remote_path.replace('\\', "\\\\").replace('\'', "\\'")
+        ))
         .output()
         .await?;
 
