@@ -5,6 +5,9 @@
 
 use std::io::{Read, Write};
 
+#[cfg(feature = "contracts")]
+use contracts::ensures;
+
 use serde::{Deserialize, Serialize};
 
 use crate::delta::Delta;
@@ -108,6 +111,10 @@ impl FrameHeader {
     /// # Errors
     ///
     /// Returns `ProtocolError` if validation fails.
+    #[cfg_attr(feature = "contracts", ensures(
+        ret.is_ok() == (self.magic == PROTOCOL_MAGIC && self.version == PROTOCOL_VERSION && self.length <= MAX_PAYLOAD_SIZE),
+        "validation result matches constraints"
+    ))]
     pub fn validate(&self) -> Result<()> {
         if self.magic != PROTOCOL_MAGIC {
             return Err(CopiaError::ProtocolError(format!(
@@ -131,6 +138,7 @@ impl FrameHeader {
     }
 
     /// Encode header to bytes.
+    #[cfg_attr(feature = "contracts", ensures(ret[0] == b'C' && ret[1] == b'O' && ret[2] == b'P' && ret[3] == b'A', "encoded header starts with COPA magic"))]
     #[must_use]
     pub fn encode(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
@@ -311,6 +319,7 @@ impl Codec {
     /// # Errors
     ///
     /// Returns an error if writing fails.
+    #[cfg_attr(feature = "contracts", ensures(ret.is_ok(), "write succeeds or returns error"))]
     #[cfg_attr(feature = "tracing", instrument(
         skip(self, writer, message),
         fields(

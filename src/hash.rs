@@ -5,6 +5,9 @@
 
 use std::io::Read;
 
+#[cfg(feature = "contracts")]
+use contracts::ensures;
+
 use serde::{Deserialize, Serialize};
 
 /// Strong cryptographic hash for block verification.
@@ -42,6 +45,7 @@ impl StrongHash {
     ///
     /// let hash = StrongHash::compute(b"test data");
     /// ```
+    #[cfg_attr(feature = "contracts", ensures(*ret.as_bytes() == *blake3::hash(data).as_bytes(), "hash matches blake3"))]
     #[must_use]
     pub fn compute(data: &[u8]) -> Self {
         let hash = blake3::hash(data);
@@ -110,6 +114,7 @@ impl StrongHash {
     /// # Arguments
     ///
     /// * `len` - Number of bytes to return (clamped to 32)
+    #[cfg_attr(feature = "contracts", ensures(ret.len() == len.min(32), "truncation length correct"))]
     #[must_use]
     pub fn truncated(&self, len: usize) -> &[u8] {
         &self.0[..len.min(32)]
@@ -129,6 +134,7 @@ impl StrongHash {
     /// Constant-time equality comparison.
     ///
     /// Prevents timing attacks when comparing hashes in security-sensitive contexts.
+    #[cfg_attr(feature = "contracts", ensures(ret == (*self == *other), "ct_eq matches PartialEq"))]
     #[must_use]
     pub fn ct_eq(&self, other: &Self) -> bool {
         // XOR all bytes and OR results together

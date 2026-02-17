@@ -2,6 +2,15 @@
 //!
 //! This module implements an Adler-32 variant rolling checksum that enables
 //! O(1) window sliding for efficient block boundary detection.
+//!
+//! # Invariants
+//!
+//! - `a < MOD (65521)` after every operation
+//! - `b < MOD (65521)` after every operation
+//! - `count` accurately tracks window size
+
+#[cfg(feature = "contracts")]
+use contracts::ensures;
 
 /// Rolling checksum state for incremental computation.
 ///
@@ -61,6 +70,9 @@ impl RollingChecksum {
     /// ```
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
+    #[cfg_attr(feature = "contracts", ensures(ret.a < Self::MOD, "a < MOD"))]
+    #[cfg_attr(feature = "contracts", ensures(ret.b < Self::MOD, "b < MOD"))]
+    #[cfg_attr(feature = "contracts", ensures(ret.count == data.len(), "count == input len"))]
     pub fn new(data: &[u8]) -> Self {
         let mut a: u32 = 0;
         let mut b: u32 = 0;
@@ -121,6 +133,8 @@ impl RollingChecksum {
     /// ```
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
+    #[cfg_attr(feature = "contracts", ensures(self.a < Self::MOD, "a < MOD after roll"))]
+    #[cfg_attr(feature = "contracts", ensures(self.b < Self::MOD, "b < MOD after roll"))]
     pub fn roll(&mut self, old_byte: u8, new_byte: u8) {
         let old = u32::from(old_byte);
         let new = u32::from(new_byte);
@@ -146,6 +160,9 @@ impl RollingChecksum {
     ///
     /// * `byte` - Byte to add to the end of the window
     #[inline]
+    #[cfg_attr(feature = "contracts", ensures(self.a < Self::MOD, "a < MOD after push"))]
+    #[cfg_attr(feature = "contracts", ensures(self.b < Self::MOD, "b < MOD after push"))]
+    #[cfg_attr(feature = "contracts", ensures(self.count == old(self.count) + 1, "count increments"))]
     pub fn push(&mut self, byte: u8) {
         let val = u32::from(byte);
         self.a = (self.a.wrapping_add(val)) % Self::MOD;

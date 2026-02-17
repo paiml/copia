@@ -9,6 +9,9 @@ use std::path::Path;
 #[cfg(feature = "async")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
+#[cfg(feature = "contracts")]
+use contracts::{ensures, requires};
+
 use crate::checksum::FastRollingChecksum;
 use crate::delta::{Delta, DeltaOp};
 use crate::error::{CopiaError, Result};
@@ -43,6 +46,10 @@ impl AsyncCopiaSync {
     ///
     /// Panics if block size is invalid.
     #[must_use]
+    #[cfg_attr(feature = "contracts", requires(
+        block_size.is_power_of_two() && (512..=65536).contains(&block_size),
+        "block size must be power of 2, 512-65536"
+    ))]
     pub fn with_block_size(block_size: usize) -> Self {
         assert!(
             block_size.is_power_of_two() && (512..=65536).contains(&block_size),
@@ -396,6 +403,7 @@ pub struct SyncResult {
 
 impl SyncResult {
     /// Calculate compression ratio.
+    #[cfg_attr(feature = "contracts", ensures((0.0..=1.0).contains(&ret), "ratio in [0,1]"))]
     #[must_use]
     #[allow(clippy::cast_precision_loss)] // acceptable for ratio calculation
     pub fn compression_ratio(&self) -> f64 {
@@ -406,6 +414,7 @@ impl SyncResult {
     }
 
     /// Calculate bandwidth savings.
+    #[cfg_attr(feature = "contracts", ensures((0.0..=1.0).contains(&ret), "savings in [0,1]"))]
     #[must_use]
     #[allow(clippy::cast_precision_loss)] // acceptable for ratio calculation
     pub fn bandwidth_savings(&self) -> f64 {
@@ -617,7 +626,7 @@ mod sync_tests {
     }
 
     #[test]
-    #[should_panic(expected = "Block size must be power of 2")]
+    #[should_panic(expected = "512-65536")]
     fn async_sync_invalid_block_size() {
         let _ = AsyncCopiaSync::with_block_size(1000);
     }

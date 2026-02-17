@@ -2,6 +2,15 @@
 //!
 //! A delta represents the difference between a source file and a basis file,
 //! expressed as a sequence of copy and literal operations.
+//!
+//! # Invariants
+//!
+//! - `bytes_matched() + bytes_literal() == source_size` after full delta
+//! - Copy operations never exceed `basis_size`
+//! - Contiguous copy operations are merged automatically
+
+#[cfg(feature = "contracts")]
+use contracts::{ensures, requires};
 
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +135,8 @@ impl Delta {
     }
 
     /// Add a copy operation.
+    #[cfg_attr(feature = "contracts", requires(len > 0, "copy length must be nonzero"))]
+    #[cfg_attr(feature = "contracts", ensures(self.op_count() >= old(self.op_count()), "ops never shrink"))]
     pub fn push_copy(&mut self, offset: u64, len: u32) {
         debug_assert!(len > 0, "copy operation must have non-zero length");
 
@@ -147,6 +158,7 @@ impl Delta {
     }
 
     /// Add a literal operation.
+    #[cfg_attr(feature = "contracts", ensures(self.op_count() >= old(self.op_count()), "ops never shrink"))]
     pub fn push_literal(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -161,6 +173,7 @@ impl Delta {
     }
 
     /// Add a single literal byte.
+    #[cfg_attr(feature = "contracts", ensures(self.op_count() >= old(self.op_count()), "ops never shrink"))]
     pub fn push_literal_byte(&mut self, byte: u8) {
         if let Some(DeltaOp::Literal(prev_data)) = self.ops.last_mut() {
             prev_data.push(byte);

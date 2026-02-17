@@ -41,6 +41,9 @@ tokio = { version = "1.43", features = ["rt", "io-util", "fs", "sync"], optional
 # Optional CLI
 clap = { version = "4.5", features = ["derive"], optional = true }
 
+# Optional formal verification contracts
+contracts = { version = "0.6", optional = true }
+
 # Optional tracing
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "registry"], optional = true }
@@ -56,6 +59,7 @@ tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "io-util", 
 [features]
 default = []
 async = ["tokio"]
+contracts = ["dep:contracts"]
 tracing = ["dep:tracing", "dep:serde_json"]
 cli = ["clap", "async", "tracing", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/macros", "tokio/process"]
 

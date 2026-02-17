@@ -5,6 +5,9 @@
 
 use std::io::Read;
 
+#[cfg(feature = "contracts")]
+use contracts::{ensures, requires};
+
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -97,6 +100,11 @@ impl Signature {
     /// # Errors
     ///
     /// Returns an I/O error if reading fails.
+    #[cfg_attr(feature = "contracts", requires(block_size > 0, "block size must be positive"))]
+    #[cfg_attr(feature = "contracts", ensures(
+        ret.as_ref().map_or(true, |s| s.block_size == block_size),
+        "returned signature has correct block size"
+    ))]
     #[cfg_attr(feature = "tracing", instrument(
         skip(reader),
         fields(
@@ -382,6 +390,10 @@ impl SignatureTable {
     /// # Errors
     ///
     /// Returns `InvalidBlockSize` if block size is invalid.
+    #[cfg_attr(feature = "contracts", ensures(
+        ret.is_ok() == (block_size.is_power_of_two() && (512..=65536).contains(&block_size)),
+        "validation result matches constraints"
+    ))]
     pub fn validate_block_size(block_size: usize) -> Result<()> {
         if !(512..=65536).contains(&block_size) || !block_size.is_power_of_two() {
             return Err(CopiaError::InvalidBlockSize(block_size));

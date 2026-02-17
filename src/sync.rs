@@ -5,6 +5,9 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+#[cfg(feature = "contracts")]
+use contracts::{ensures, requires};
+
 use crate::checksum::FastRollingChecksum;
 use crate::delta::{Delta, DeltaOp};
 use crate::error::{CopiaError, Result};
@@ -101,6 +104,11 @@ impl SyncBuilder {
     ///
     /// Panics if block size is invalid.
     #[must_use]
+    #[cfg_attr(feature = "contracts", requires(
+        size.is_power_of_two() && (512..=65536).contains(&size),
+        "block size must be power of 2, 512-65536"
+    ))]
+    #[cfg_attr(feature = "contracts", ensures(ret.config.block_size == size, "block size is set"))]
     pub fn block_size(mut self, size: usize) -> Self {
         assert!(
             size.is_power_of_two() && (512..=65536).contains(&size),
@@ -199,6 +207,7 @@ impl Default for CopiaSync {
 }
 
 impl Sync for CopiaSync {
+    #[cfg_attr(feature = "contracts", ensures(ret.is_ok(), "signature generation succeeds or returns error"))]
     #[cfg_attr(feature = "tracing", instrument(
         skip(self, basis),
         fields(
@@ -217,6 +226,10 @@ impl Sync for CopiaSync {
         Ok(sig)
     }
 
+    #[cfg_attr(feature = "contracts", ensures(
+        ret.as_ref().map_or(true, |d| d.bytes_matched() + d.bytes_literal() == d.source_size),
+        "delta bytes must sum to source size"
+    ))]
     #[cfg_attr(feature = "tracing", instrument(
         skip(self, source, signature),
         fields(
@@ -316,6 +329,7 @@ impl Sync for CopiaSync {
         Ok(delta)
     }
 
+    #[cfg_attr(feature = "contracts", requires(!delta.ops.is_empty() || delta.source_size == 0, "non-empty delta or zero source"))]
     #[cfg_attr(feature = "tracing", instrument(
         skip(self, basis, delta, output),
         fields(
@@ -441,19 +455,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Block size must be power of 2")]
+    #[should_panic(expected = "512-65536")]
     fn builder_invalid_block_size_not_power_of_2() {
         let _ = SyncBuilder::new().block_size(1000);
     }
 
     #[test]
-    #[should_panic(expected = "Block size must be power of 2")]
+    #[should_panic(expected = "512-65536")]
     fn builder_invalid_block_size_too_small() {
         let _ = SyncBuilder::new().block_size(256);
     }
 
     #[test]
-    #[should_panic(expected = "Block size must be power of 2")]
+    #[should_panic(expected = "512-65536")]
     fn builder_invalid_block_size_too_large() {
         let _ = SyncBuilder::new().block_size(131072);
     }
