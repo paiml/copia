@@ -11,6 +11,9 @@ use crate::error::{CopiaError, Result};
 use crate::hash::StrongHash;
 use crate::signature::{Signature, SignatureTable};
 
+#[cfg(feature = "tracing")]
+use tracing::instrument;
+
 /// Core synchronization operations trait.
 ///
 /// This trait defines the three fundamental rsync operations:
@@ -196,10 +199,33 @@ impl Default for CopiaSync {
 }
 
 impl Sync for CopiaSync {
+    #[cfg_attr(feature = "tracing", instrument(
+        skip(self, basis),
+        fields(
+            block_size = self.config.block_size,
+            file_size = tracing::field::Empty,
+            block_count = tracing::field::Empty,
+        )
+    ))]
     fn signature<R: Read>(&self, mut basis: R) -> Result<Signature> {
-        Signature::generate(&mut basis, self.config.block_size)
+        let sig = Signature::generate(&mut basis, self.config.block_size)?;
+        #[cfg(feature = "tracing")]
+        {
+            tracing::Span::current().record("file_size", sig.file_size);
+            tracing::Span::current().record("block_count", sig.blocks.len());
+        }
+        Ok(sig)
     }
 
+    #[cfg_attr(feature = "tracing", instrument(
+        skip(self, source, signature),
+        fields(
+            block_size = signature.block_size,
+            source_size = tracing::field::Empty,
+            bytes_matched = tracing::field::Empty,
+            bytes_literal = tracing::field::Empty,
+        )
+    ))]
     fn delta<R: Read>(&self, mut source: R, signature: &Signature) -> Result<Delta> {
         let table = SignatureTable::from_signature(signature.clone());
         let block_size = signature.block_size;
@@ -273,9 +299,24 @@ impl Sync for CopiaSync {
             delta.push_literal(&source_data[pos..]);
         }
 
+        #[cfg(feature = "tracing")]
+        {
+            tracing::Span::current().record("source_size", source_size);
+            tracing::Span::current().record("bytes_matched", delta.bytes_matched());
+            tracing::Span::current().record("bytes_literal", delta.bytes_literal());
+        }
+
         Ok(delta)
     }
 
+    #[cfg_attr(feature = "tracing", instrument(
+        skip(self, basis, delta, output),
+        fields(
+            block_size = delta.block_size,
+            op_count = delta.ops.len(),
+            verify_checksum = self.config.verify_checksum,
+        )
+    ))]
     fn patch<R: Read + Seek, W: Write>(
         &self,
         mut basis: R,

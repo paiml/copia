@@ -49,6 +49,8 @@ mod hash;
 mod protocol;
 mod signature;
 mod sync;
+#[cfg(feature = "cli")]
+pub mod trace_output;
 
 pub use checksum::{FastRollingChecksum, RollingChecksum};
 pub use delta::{Delta, DeltaOp, DeltaStats};

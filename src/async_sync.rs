@@ -16,6 +16,9 @@ use crate::hash::StrongHash;
 use crate::signature::{BlockSignature, Signature, SignatureTable};
 use crate::sync::SyncConfig;
 
+#[cfg(all(feature = "tracing", feature = "async"))]
+use tracing::instrument;
+
 /// Async synchronization engine.
 ///
 /// Provides async versions of signature, delta, and patch operations
@@ -65,6 +68,14 @@ impl AsyncCopiaSync {
     ///
     /// Returns an error if reading fails.
     #[cfg(feature = "async")]
+    #[cfg_attr(feature = "tracing", instrument(
+        skip(self, reader),
+        fields(
+            block_size = self.config.block_size,
+            file_size = tracing::field::Empty,
+            block_count = tracing::field::Empty,
+        )
+    ))]
     pub async fn signature<R>(&self, mut reader: R) -> Result<Signature>
     where
         R: AsyncRead + Unpin,
@@ -94,6 +105,12 @@ impl AsyncCopiaSync {
             index = index.saturating_add(1);
         }
 
+        #[cfg(feature = "tracing")]
+        {
+            tracing::Span::current().record("file_size", file_size);
+            tracing::Span::current().record("block_count", blocks.len());
+        }
+
         Ok(Signature {
             block_size,
             file_size,
@@ -108,6 +125,15 @@ impl AsyncCopiaSync {
     /// Returns an error if reading fails.
     #[cfg(feature = "async")]
     #[allow(clippy::cast_possible_truncation)] // block_size validated to be <= 65536
+    #[cfg_attr(feature = "tracing", instrument(
+        skip(self, source, signature),
+        fields(
+            block_size = signature.block_size,
+            source_size = tracing::field::Empty,
+            bytes_matched = tracing::field::Empty,
+            bytes_literal = tracing::field::Empty,
+        )
+    ))]
     pub async fn delta<R>(&self, mut source: R, signature: &Signature) -> Result<Delta>
     where
         R: AsyncRead + Unpin,
@@ -176,6 +202,13 @@ impl AsyncCopiaSync {
             delta.push_literal(&source_data[pos..]);
         }
 
+        #[cfg(feature = "tracing")]
+        {
+            tracing::Span::current().record("source_size", source_size);
+            tracing::Span::current().record("bytes_matched", delta.bytes_matched());
+            tracing::Span::current().record("bytes_literal", delta.bytes_literal());
+        }
+
         Ok(delta)
     }
 
@@ -185,6 +218,14 @@ impl AsyncCopiaSync {
     ///
     /// Returns an error if reading/writing fails or delta is invalid.
     #[cfg(feature = "async")]
+    #[cfg_attr(feature = "tracing", instrument(
+        skip(self, basis, delta, output),
+        fields(
+            block_size = delta.block_size,
+            op_count = delta.ops.len(),
+            verify_checksum = self.config.verify_checksum,
+        )
+    ))]
     pub async fn patch<R, W>(&self, mut basis: R, delta: &Delta, mut output: W) -> Result<()>
     where
         R: AsyncRead + AsyncSeek + Unpin,
@@ -229,6 +270,15 @@ impl AsyncCopiaSync {
     ///
     /// Returns an error if any I/O operation fails.
     #[cfg(feature = "async")]
+    #[cfg_attr(feature = "tracing", instrument(
+        skip(self, source_path, dest_path),
+        fields(
+            source_size = tracing::field::Empty,
+            basis_size = tracing::field::Empty,
+            bytes_matched = tracing::field::Empty,
+            bytes_literal = tracing::field::Empty,
+        )
+    ))]
     pub async fn sync_files<P1, P2>(&self, source_path: P1, dest_path: P2) -> Result<SyncResult>
     where
         P1: AsRef<Path>,
@@ -249,6 +299,14 @@ impl AsyncCopiaSync {
             let source_size = source_data.len() as u64;
             tokio::fs::write(dest_path, &source_data).await?;
 
+            #[cfg(feature = "tracing")]
+            {
+                tracing::Span::current().record("source_size", source_size);
+                tracing::Span::current().record("basis_size", 0_u64);
+                tracing::Span::current().record("bytes_matched", 0_u64);
+                tracing::Span::current().record("bytes_literal", source_size);
+            }
+
             return Ok(SyncResult {
                 bytes_matched: 0,
                 bytes_literal: source_size,
@@ -265,6 +323,14 @@ impl AsyncCopiaSync {
 
         // Fast path: if files are identical, no sync needed
         if source_data == basis_data {
+            #[cfg(feature = "tracing")]
+            {
+                tracing::Span::current().record("source_size", source_size);
+                tracing::Span::current().record("basis_size", basis_size);
+                tracing::Span::current().record("bytes_matched", source_size);
+                tracing::Span::current().record("bytes_literal", 0_u64);
+            }
+
             return Ok(SyncResult {
                 bytes_matched: source_size,
                 bytes_literal: 0,
@@ -291,6 +357,14 @@ impl AsyncCopiaSync {
         let temp_path = dest_path.with_extension("copia.tmp");
         tokio::fs::write(&temp_path, &output).await?;
         tokio::fs::rename(&temp_path, dest_path).await?;
+
+        #[cfg(feature = "tracing")]
+        {
+            tracing::Span::current().record("source_size", source_size);
+            tracing::Span::current().record("basis_size", basis_size);
+            tracing::Span::current().record("bytes_matched", bytes_matched);
+            tracing::Span::current().record("bytes_literal", bytes_literal);
+        }
 
         Ok(SyncResult {
             bytes_matched,

@@ -8,8 +8,13 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use tokio::sync::Semaphore;
+use tracing::instrument;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 use copia::async_sync::AsyncCopiaSync;
+use copia::trace_output::CopiaTraceLayer;
 
 /// Represents a file location - either local or remote via SSH
 #[derive(Debug, Clone)]
@@ -46,6 +51,10 @@ impl FileLocation {
 #[command(about = "rsync-style file synchronization in pure Rust")]
 #[command(long_about = None)]
 struct Cli {
+    /// Write renacer-compatible NDJSON trace output to file
+    #[arg(long, global = true)]
+    trace_output: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -129,6 +138,34 @@ enum Commands {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("copia=info"));
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_timer(tracing_subscriber::fmt::time::uptime());
+
+    if let Some(ref path) = cli.trace_output {
+        match std::fs::File::create(path) {
+            Ok(file) => {
+                tracing_subscriber::registry()
+                    .with(fmt_layer)
+                    .with(env_filter)
+                    .with(CopiaTraceLayer::new(file))
+                    .init();
+            }
+            Err(e) => {
+                eprintln!("Error: cannot create trace output file: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(env_filter)
+            .init();
+    }
+
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -138,6 +175,7 @@ async fn main() -> ExitCode {
     }
 }
 
+#[instrument(skip(cli))]
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Sync {
@@ -263,6 +301,7 @@ async fn create_remote_dirs(
 
 /// Transfer a single file from local to remote via SSH streaming.
 /// Uses streaming I/O — does not read entire file into memory.
+#[instrument(skip(local_path), fields(host, remote_path))]
 async fn transfer_file_to_remote(
     local_path: &Path,
     host: &str,
@@ -343,6 +382,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+#[instrument(skip(source, dest, _block_size))]
 async fn run_sync_recursive(
     source: FileLocation,
     dest: FileLocation,
@@ -366,6 +406,7 @@ async fn run_sync_recursive(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+#[instrument(skip(local_root), fields(host, remote_root))]
 async fn run_sync_dir_local_to_remote(
     local_root: &Path,
     host: &str,
@@ -492,6 +533,7 @@ async fn run_sync_dir_local_to_remote(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+#[instrument(skip(local_src, local_dest))]
 async fn run_sync_dir_local_to_local(
     local_src: &Path,
     local_dest: &Path,
@@ -595,6 +637,7 @@ async fn run_sync_dir_local_to_local(
 
 // ── Single-file sync ──────────────────────────────────────────────────
 
+#[instrument(skip(source, dest))]
 async fn run_sync(
     source: FileLocation,
     dest: FileLocation,
@@ -631,6 +674,7 @@ async fn run_sync(
     }
 }
 
+#[instrument(skip(source, dest))]
 async fn run_sync_local_to_local(
     source: &PathBuf,
     dest: &PathBuf,
@@ -671,6 +715,7 @@ async fn run_sync_local_to_local(
     Ok(())
 }
 
+#[instrument(skip(source, _block_size), fields(host, remote_path))]
 async fn run_sync_local_to_remote(
     source: &Path,
     host: &str,
@@ -698,6 +743,7 @@ async fn run_sync_local_to_remote(
     Ok(())
 }
 
+#[instrument(skip(dest, _block_size), fields(host, remote_path))]
 async fn run_sync_remote_to_local(
     host: &str,
     remote_path: &str,
@@ -745,6 +791,7 @@ async fn run_sync_remote_to_local(
 
 // ── Signature / Delta / Patch ─────────────────────────────────────────
 
+#[instrument(skip(file, output))]
 async fn run_signature(
     file: &PathBuf,
     output: Option<PathBuf>,
@@ -777,6 +824,7 @@ async fn run_signature(
     Ok(())
 }
 
+#[instrument(skip(source, signature, output))]
 async fn run_delta(
     source: &PathBuf,
     signature: &PathBuf,
@@ -810,6 +858,7 @@ async fn run_delta(
     Ok(())
 }
 
+#[instrument(skip(basis, delta, output))]
 async fn run_patch(
     basis: &PathBuf,
     delta: &PathBuf,

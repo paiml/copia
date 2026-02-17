@@ -11,6 +11,9 @@ use crate::delta::Delta;
 use crate::error::{CopiaError, Result};
 use crate::signature::Signature;
 
+#[cfg(feature = "tracing")]
+use tracing::instrument;
+
 /// Protocol magic bytes: "COPA"
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"COPA";
 
@@ -307,10 +310,20 @@ impl Codec {
     /// # Errors
     ///
     /// Returns an error if writing fails.
+    #[cfg_attr(feature = "tracing", instrument(
+        skip(self, writer, message),
+        fields(
+            msg_type = ?message.msg_type(),
+            payload_len = tracing::field::Empty,
+        )
+    ))]
     pub fn write_message<W: Write>(&self, writer: &mut W, message: &Message) -> Result<()> {
         let payload = message.encode()?;
         let payload_len = u32::try_from(payload.len())
             .map_err(|_| CopiaError::ProtocolError("Payload too large for u32".to_string()))?;
+
+        #[cfg(feature = "tracing")]
+        tracing::Span::current().record("payload_len", payload_len);
 
         if payload_len > MAX_PAYLOAD_SIZE {
             return Err(CopiaError::ProtocolError(format!(
@@ -329,8 +342,21 @@ impl Codec {
     /// # Errors
     ///
     /// Returns an error if reading or decoding fails.
+    #[cfg_attr(feature = "tracing", instrument(
+        skip(self, reader),
+        fields(
+            msg_type = tracing::field::Empty,
+            payload_len = tracing::field::Empty,
+        )
+    ))]
     pub fn read_message<R: Read>(&mut self, reader: &mut R) -> Result<Message> {
         let header = FrameHeader::read_from(reader)?;
+
+        #[cfg(feature = "tracing")]
+        {
+            tracing::Span::current().record("msg_type", tracing::field::debug(header.msg_type));
+            tracing::Span::current().record("payload_len", header.length);
+        }
 
         self.read_buf.resize(header.length as usize, 0);
         reader.read_exact(&mut self.read_buf)?;

@@ -13,6 +13,9 @@ use crate::checksum::RollingChecksum;
 use crate::error::{CopiaError, Result};
 use crate::hash::StrongHash;
 
+#[cfg(feature = "tracing")]
+use tracing::instrument;
+
 /// Signature for a single block in the basis file.
 ///
 /// Contains both the weak (rolling) checksum for fast filtering
@@ -94,6 +97,14 @@ impl Signature {
     /// # Errors
     ///
     /// Returns an I/O error if reading fails.
+    #[cfg_attr(feature = "tracing", instrument(
+        skip(reader),
+        fields(
+            file_size = tracing::field::Empty,
+            block_count = tracing::field::Empty,
+            parallel = tracing::field::Empty,
+        )
+    ))]
     pub fn generate<R: Read>(reader: &mut R, block_size: usize) -> Result<Self> {
         // Read all data first for parallel processing
         let mut data = Vec::new();
@@ -102,6 +113,12 @@ impl Signature {
         let file_size = data.len() as u64;
 
         if data.is_empty() {
+            #[cfg(feature = "tracing")]
+            {
+                tracing::Span::current().record("file_size", 0_u64);
+                tracing::Span::current().record("block_count", 0_usize);
+                tracing::Span::current().record("parallel", false);
+            }
             return Ok(Self {
                 block_size,
                 file_size: 0,
@@ -129,6 +146,13 @@ impl Signature {
                 })
                 .collect()
         };
+
+        #[cfg(feature = "tracing")]
+        {
+            tracing::Span::current().record("file_size", file_size);
+            tracing::Span::current().record("block_count", blocks.len());
+            tracing::Span::current().record("parallel", data.len() > 64 * 1024);
+        }
 
         Ok(Self {
             block_size,
