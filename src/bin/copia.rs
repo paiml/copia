@@ -215,7 +215,8 @@ fn collect_dirs(files: &[PathBuf]) -> Vec<PathBuf> {
     dirs.into_iter().collect()
 }
 
-/// Create directories on a remote host via a single SSH call.
+/// Create directories on a remote host via batched SSH calls.
+/// Batches into chunks of 200 to avoid "Argument list too long" errors.
 async fn create_remote_dirs(
     host: &str,
     remote_root: &str,
@@ -223,36 +224,43 @@ async fn create_remote_dirs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::fmt::Write;
 
+    // Always ensure root exists
+    let output = tokio::process::Command::new("ssh")
+        .arg(host)
+        .arg(format!("mkdir -p '{remote_root}'"))
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to create remote root: {stderr}").into());
+    }
+
     if dirs.is_empty() {
-        // Still ensure the root exists
-        let output = tokio::process::Command::new("ssh")
-            .arg(host)
-            .arg(format!("mkdir -p '{remote_root}'"))
-            .output()
-            .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Failed to create remote root: {stderr}").into());
-        }
         return Ok(());
     }
 
-    // Build a single mkdir -p command for all directories
-    let mut mkdir_cmd = format!("mkdir -p '{remote_root}'");
-    for dir in dirs {
-        let full = format!("{}/{}", remote_root, dir.display());
-        let _ = write!(mkdir_cmd, " '{full}'");
-    }
+    // Batch directories into chunks to avoid exceeding arg length limits
+    for (i, chunk) in dirs.chunks(200).enumerate() {
+        let mut mkdir_cmd = String::from("mkdir -p");
+        for dir in chunk {
+            let full = format!("{}/{}", remote_root, dir.display());
+            let _ = write!(mkdir_cmd, " '{full}'");
+        }
 
-    let output = tokio::process::Command::new("ssh")
-        .arg(host)
-        .arg(&mkdir_cmd)
-        .output()
-        .await?;
+        let output = tokio::process::Command::new("ssh")
+            .arg(host)
+            .arg(&mkdir_cmd)
+            .output()
+            .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to create remote directories: {stderr}").into());
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Failed to create remote directories (batch {}): {stderr}",
+                i + 1
+            )
+            .into());
+        }
     }
 
     Ok(())
