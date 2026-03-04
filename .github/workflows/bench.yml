@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.75
+      - uses: dtolnay/rust-toolchain@1.100
       - name: Run benchmarks with confidence intervals
         run: |
           cargo bench --bench benchmarks -- --output-format bencher
