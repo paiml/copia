@@ -14,6 +14,12 @@ use contracts::{ensures, requires};
 
 use crate::sync::SyncConfig;
 
+#[cfg(feature = "async")]
+use crate::{
+    BlockSignature, CopiaError, Delta, DeltaOp, FastRollingChecksum, Result, Signature,
+    SignatureTable, StrongHash,
+};
+
 #[cfg(all(feature = "tracing", feature = "async"))]
 use tracing::instrument;
 
