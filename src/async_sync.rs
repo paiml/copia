@@ -12,11 +12,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, As
 #[cfg(feature = "contracts")]
 use contracts::{ensures, requires};
 
-use crate::checksum::FastRollingChecksum;
-use crate::delta::{Delta, DeltaOp};
-use crate::error::{CopiaError, Result};
-use crate::hash::StrongHash;
-use crate::signature::{BlockSignature, Signature, SignatureTable};
 use crate::sync::SyncConfig;
 
 #[cfg(all(feature = "tracing", feature = "async"))]
