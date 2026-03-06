@@ -98,6 +98,16 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
+[profile.release-lto]
+inherits = "release"
+opt-level = 3
+debug = "none"
+strip = "symbols"
+debug-assertions = false
+overflow-checks = false
+lto = "fat"
+incremental = false
+
 [profile.dev]
 panic = "abort"
 
