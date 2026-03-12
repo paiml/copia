@@ -5,7 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/copia.svg)](https://crates.io/crates/copia)
 [![Documentation](https://docs.rs/copia/badge.svg)](https://docs.rs/copia)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Build Status](https://github.com/paiml/copia/workflows/CI/badge.svg)](https://github.com/paiml/copia/actions)
+[![Build Status](https://github.com/paiml/copia/actions/workflows/ci.yml/badge.svg)](https://github.com/paiml/copia/actions/workflows/ci.yml)
 
 ## Why copia?
 
