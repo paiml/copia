@@ -224,7 +224,7 @@ fn discover_local_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error:
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            if path.is_dir() && !path.is_symlink() {
                 dirs.push(path);
             } else if path.is_file() {
                 let rel = path.strip_prefix(root)?.to_path_buf();
