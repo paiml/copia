@@ -416,20 +416,24 @@ fn format_bytes(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-#[instrument(skip(source, dest, _block_size))]
+#[instrument(skip(source, dest, block_size))]
 async fn run_sync_recursive(
     source: FileLocation,
     dest: FileLocation,
-    _block_size: usize,
+    block_size: usize,
     jobs: usize,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match (&source, &dest) {
         (FileLocation::Local(local_src), FileLocation::Remote { host, path }) => {
+            // GH-17: Warn that --block-size is not yet used for remote recursive sync
+            if block_size != 4096 {
+                eprintln!("Warning: --block-size is not yet implemented for remote recursive sync. Using default.");
+            }
             run_sync_dir_local_to_remote(local_src, host, path, jobs, verbose).await
         }
         (FileLocation::Local(local_src), FileLocation::Local(local_dest)) => {
-            run_sync_dir_local_to_local(local_src, local_dest, jobs, verbose).await
+            run_sync_dir_local_to_local(local_src, local_dest, block_size, jobs, verbose).await
         }
         _ => Err("Recursive sync currently supports local->remote and local->local".into()),
     }
@@ -566,6 +570,7 @@ fn spawn_remote_transfers(
 async fn run_sync_dir_local_to_local(
     local_src: &Path,
     local_dest: &Path,
+    block_size: usize,
     jobs: usize,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -587,7 +592,8 @@ async fn run_sync_dir_local_to_local(
         std::fs::create_dir_all(local_dest.join(dir))?;
     }
 
-    let sync = Arc::new(AsyncCopiaSync::with_block_size(2048));
+    // GH-17: Use user-provided block_size instead of hardcoded 2048
+    let sync = Arc::new(AsyncCopiaSync::with_block_size(block_size));
     let semaphore = Arc::new(Semaphore::new(jobs));
     let progress = TransferProgress {
         bytes_transferred: Arc::new(AtomicU64::new(0)),
@@ -745,14 +751,18 @@ async fn run_sync_local_to_local(
     Ok(())
 }
 
-#[instrument(skip(source, _block_size), fields(host, remote_path))]
+#[instrument(skip(source, block_size), fields(host, remote_path))]
 async fn run_sync_local_to_remote(
     source: &Path,
     host: &str,
     remote_path: &str,
-    _block_size: usize,
+    block_size: usize,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // GH-17: Warn that --block-size is not yet used for SSH transfers
+    if block_size != 4096 {
+        eprintln!("Warning: --block-size is not yet implemented for remote transfers. Using SSH streaming.");
+    }
     if verbose {
         eprintln!("Syncing {} -> {}:{}", source.display(), host, remote_path);
     }
@@ -773,14 +783,18 @@ async fn run_sync_local_to_remote(
     Ok(())
 }
 
-#[instrument(skip(dest, _block_size), fields(host, remote_path))]
+#[instrument(skip(dest, block_size), fields(host, remote_path))]
 async fn run_sync_remote_to_local(
     host: &str,
     remote_path: &str,
     dest: &PathBuf,
-    _block_size: usize,
+    block_size: usize,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // GH-17: Warn that --block-size is not yet used for SSH transfers
+    if block_size != 4096 {
+        eprintln!("Warning: --block-size is not yet implemented for remote transfers. Using SSH streaming.");
+    }
     use tokio::process::Command;
 
     if verbose {
