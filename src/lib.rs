@@ -53,6 +53,19 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
+// copia#18: Allow common test patterns in test/bench targets
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreadable_literal,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::similar_names,
+        clippy::unnecessary_literal_unwrap
+    )
+)]
 
 pub mod async_sync;
 mod checksum;

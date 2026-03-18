@@ -2,7 +2,7 @@
 //!
 //! Verifies that sync operations emit expected spans with correct fields
 //! and that NDJSON output deserializes to CopiaSpanRecord.
-
+#![allow(clippy::unwrap_used, clippy::doc_markdown)]
 #![cfg(feature = "cli")]
 
 use std::io::{Cursor, Write};

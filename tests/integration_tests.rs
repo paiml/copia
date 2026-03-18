@@ -1,4 +1,13 @@
 //! Integration tests for copia.
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::unreadable_literal,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    clippy::unnecessary_literal_unwrap
+)]
 
 use std::io::Cursor;
 

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::unreadable_literal,
+    clippy::cast_possible_truncation
+)]
 //! Benchmarks for copia operations.
 //!
 //! # Statistical Methodology
