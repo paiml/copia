@@ -267,7 +267,13 @@ async fn create_remote_dirs(
     // Build a newline-delimited list of full paths
     let mut dir_list = format!("{remote_root}\n");
     for dir in dirs {
-        let _ = writeln!(dir_list, "{}/{}", remote_root, dir.display());
+        // GH-23: writeln! to String is infallible in practice, but log if it fails
+        if writeln!(dir_list, "{}/{}", remote_root, dir.display()).is_err() {
+            eprintln!(
+                "Warning: failed to format directory path: {}",
+                dir.display()
+            );
+        }
     }
 
     // Pipe directory list via stdin, read line-by-line and mkdir each
@@ -364,10 +370,18 @@ async fn transfer_file_to_remote(
 /// Compute the total size of files relative to a root directory.
 fn compute_total_size(root: &Path, files: &[PathBuf]) -> u64 {
     let mut total: u64 = 0;
+    let mut skipped = 0usize;
     for f in files {
-        if let Ok(m) = std::fs::metadata(root.join(f)) {
-            total += m.len();
+        match std::fs::metadata(root.join(f)) {
+            Ok(m) => total += m.len(),
+            Err(_) => skipped += 1,
         }
+    }
+    // GH-23: Warn if metadata errors caused files to be excluded from total
+    if skipped > 0 {
+        eprintln!(
+            "Warning: {skipped} file(s) excluded from size calculation (metadata unavailable)"
+        );
     }
     total
 }

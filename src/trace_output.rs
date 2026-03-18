@@ -154,9 +154,17 @@ where
             thread_id: thread_id(),
         };
 
-        if let Ok(json) = serde_json::to_string(&record) {
-            if let Ok(mut w) = self.writer.lock() {
-                let _ = writeln!(w, "{json}");
+        match serde_json::to_string(&record) {
+            Ok(json) => {
+                if let Ok(mut w) = self.writer.lock() {
+                    // GH-23: Log trace write failures instead of silently discarding
+                    if writeln!(w, "{json}").is_err() {
+                        eprintln!("Warning: failed to write trace record");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to serialize trace record: {e}");
             }
         }
     }
