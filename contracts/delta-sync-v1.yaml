@@ -1,0 +1,63 @@
+metadata:
+  version: "1.0.0"
+  created: "2026-03-19"
+  author: "PAIML Engineering"
+  description: "Delta compression and sync transfer correctness"
+  references:
+    - "Tridgell (1999) Efficient Algorithms for Sorting and Synchronization (rsync)"
+
+equations:
+  delta_roundtrip:
+    formula: "apply(basis, delta(source, basis)) = source"
+    domain: "source, basis ∈ [u8]"
+    invariants:
+      - "Delta application reconstructs source exactly"
+  transmission_savings:
+    formula: "savings = 1 - transmission_size(delta) / source_size"
+    domain: "delta ∈ DeltaScript"
+    codomain: "savings ∈ [0, 1]"
+    invariants:
+      - "savings ≥ 0 (delta never larger than source for similar files)"
+  compression_ratio:
+    formula: "ratio = compressed_size / original_size"
+    domain: "compressed, original > 0"
+    codomain: "ratio ∈ (0, ∞)"
+    invariants:
+      - "ratio > 0"
+
+proof_obligations:
+  - type: roundtrip
+    property: "Delta roundtrip fidelity"
+    formal: "apply(basis, delta(source, basis)) == source byte-for-byte"
+    applies_to: all
+  - type: bound
+    property: "Transmission savings non-negative"
+    formal: "transmission_size(delta) ≤ source_size for similar files"
+    applies_to: all
+  - type: bound
+    property: "Compression ratio positive"
+    formal: "compression_ratio > 0"
+    applies_to: all
+
+falsification_tests:
+  - id: FALSIFY-DELTA-001
+    rule: "Roundtrip"
+    prediction: "Source recovered exactly after delta apply"
+    test: "Random files with 90% overlap, apply delta, compare"
+    if_fails: "Copy/literal instruction encoding error"
+  - id: FALSIFY-DELTA-002
+    rule: "Savings non-negative"
+    prediction: "Delta smaller than source for identical files"
+    test: "Delta of file against itself"
+    if_fails: "Block matching not finding exact matches"
+  - id: FALSIFY-DELTA-003
+    rule: "Compression positive"
+    prediction: "Ratio > 0 for all inputs"
+    test: "Empty, 1-byte, and large files"
+    if_fails: "Division by zero or negative size"
+
+kani_harnesses:
+  - id: delta-kani-001
+    obligation: "Compression ratio positive"
+    bound: 4
+    strategy: bounded_int

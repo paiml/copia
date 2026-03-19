@@ -1,0 +1,76 @@
+metadata:
+  version: "1.0.0"
+  created: "2026-03-19"
+  author: "PAIML Engineering"
+  description: "BLAKE3 hash computation and integrity verification for file sync"
+  references:
+    - "O'Connor et al. (2020) BLAKE3: one function, fast everywhere"
+
+equations:
+  hash_determinism:
+    formula: "H(data) = H(data) for all data"
+    domain: "data ∈ [u8]"
+    codomain: "H ∈ [u8; 32]"
+    invariants:
+      - "Same input always produces same hash"
+  hash_streaming_eq:
+    formula: "H_streaming(data) = H_oneshot(data)"
+    domain: "data ∈ [u8]"
+    invariants:
+      - "Streaming and oneshot produce identical results"
+  truncated_prefix:
+    formula: "truncated(H, n) = H[0..n]"
+    domain: "H ∈ [u8; 32], n ≤ 32"
+    invariants:
+      - "Truncation is a prefix of the full hash"
+  ct_eq_correctness:
+    formula: "ct_eq(a, b) = (a == b) in constant time"
+    domain: "a, b ∈ [u8; 32]"
+    invariants:
+      - "Same result as byte equality but constant-time"
+
+proof_obligations:
+  - type: determinism
+    property: "Hash determinism"
+    formal: "compute(data) == compute(data) for all data"
+    applies_to: all
+  - type: equivalence
+    property: "Streaming equals oneshot"
+    formal: "compute_streaming(data) == compute(data)"
+    applies_to: all
+  - type: invariant
+    property: "Truncation is prefix"
+    formal: "truncated(H, n) == H.as_bytes()[..n]"
+    applies_to: all
+  - type: equivalence
+    property: "Constant-time equality"
+    formal: "ct_eq(a, b) == (a == b)"
+    applies_to: all
+
+falsification_tests:
+  - id: FALSIFY-HASH-001
+    rule: "Determinism"
+    prediction: "Same data hashes identically across 1000 runs"
+    test: "Hash random 1MB data 1000 times"
+    if_fails: "Non-deterministic hash state initialization"
+  - id: FALSIFY-HASH-002
+    rule: "Streaming parity"
+    prediction: "Streaming hash matches oneshot for chunked input"
+    test: "Feed same data in 1-byte, 512-byte, and full chunks"
+    if_fails: "State accumulation error in streaming"
+  - id: FALSIFY-HASH-003
+    rule: "Truncation prefix"
+    prediction: "truncated(H, n) == H.as_bytes()[..n]"
+    test: "All lengths 1..32"
+    if_fails: "Byte ordering or slice bug"
+  - id: FALSIFY-HASH-004
+    rule: "CT equality"
+    prediction: "ct_eq agrees with == for all test vectors"
+    test: "Equal, near-equal, and completely different hashes"
+    if_fails: "Constant-time comparison logic error"
+
+kani_harnesses:
+  - id: hash-kani-001
+    obligation: "Truncation is prefix"
+    bound: 32
+    strategy: bounded_int
