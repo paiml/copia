@@ -7,6 +7,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://github.com/paiml/copia/actions/workflows/ci.yml/badge.svg)](https://github.com/paiml/copia/actions/workflows/ci.yml)
 
+## Table of Contents
+
+- [Why copia?](#why-copia)
+- [Performance](#performance)
+- [Installation](#installation)
+- [Usage](#usage)
+- [How It Works](#how-it-works)
+- [API Reference](#api-reference)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Why copia?
 
 - **Embeddable**: Use rsync's delta-transfer algorithm as a library, not a subprocess

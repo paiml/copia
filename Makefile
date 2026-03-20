@@ -1,7 +1,7 @@
 # Copia Makefile - Iron Lotus + Certeza Quality Framework
 # Three-Tier Testing Methodology
 
-.PHONY: all build test lint fmt clean tier1 tier2 tier3 coverage bench doc
+.PHONY: all build test test-fast lint fmt clean tier1 tier2 tier3 coverage bench doc
 
 # Default target
 all: tier2
@@ -12,6 +12,11 @@ all: tier2
 
 tier1: fmt-check check clippy
 	@echo "✅ Tier 1 passed"
+
+test-fast: ## Fast lib tests only
+	cargo test --lib
+
+lint: clippy fmt-check ## Run all linters
 
 check:
 	cargo check --all-features
