@@ -253,6 +253,10 @@ cargo bench --bench benchmarks
 | Symbolic Links | Not yet | Yes |
 | Compression | Not yet | Yes (zlib) |
 
+## See Also
+
+- [Sovereign AI Cookbook](https://github.com/paiml/sovereign-ai-cookbook) — recipes and examples
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
