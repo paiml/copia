@@ -1,4 +1,4 @@
-# copia
+<h1 align="center">copia</h1>
 
 **Pure Rust rsync-style file synchronization library**
 
