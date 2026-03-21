@@ -64,6 +64,7 @@ pub struct CopiaTraceLayer<W: Write + Send + 'static> {
 
 impl<W: Write + Send + 'static> CopiaTraceLayer<W> {
     /// Create a new trace layer writing to the given output.
+    #[provable_contracts_macros::contract("copia-trace-v1", equation = "new")]
     pub fn new(writer: W) -> Self {
         let pid = std::process::id();
         Self {

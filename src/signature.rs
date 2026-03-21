@@ -57,6 +57,7 @@ impl BlockSignature {
     /// * `index` - Block index
     /// * `data` - Block data
     #[must_use]
+    #[provable_contracts_macros::contract("copia-block-sig-v1", equation = "compute")]
     pub fn compute(index: u32, data: &[u8]) -> Self {
         Self {
             index,
