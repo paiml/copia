@@ -255,7 +255,7 @@ cargo bench --bench benchmarks
 
 ## See Also
 
-- [Sovereign AI Cookbook](https://github.com/paiml/sovereign-ai-cookbook) — recipes and examples
+- [Cookbook](examples/) — 1 runnable example
 
 ## License
 
