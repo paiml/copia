@@ -18,7 +18,7 @@
 - [Contributing](#contributing)
 - [License](#license)
 
-## Why copia?
+## Features
 
 - **Embeddable**: Use rsync's delta-transfer algorithm as a library, not a subprocess
 - **Pure Rust**: 100% safe Rust, no unsafe code, fully auditable
