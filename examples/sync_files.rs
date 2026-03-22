@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 //! Demonstrates the copia signature/delta/patch synchronization flow.
 //!
 //! This example creates two in-memory "files" (basis and source),
