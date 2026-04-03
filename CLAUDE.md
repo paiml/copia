@@ -1,5 +1,11 @@
 # Copia Project Guidelines
 
+## Contract-First Design
+
+This project follows contract-first development with provable-contracts.
+Contracts live in `../provable-contracts/contracts/copia/`.
+Run `pmat comply check` to validate contract compliance.
+
 ## Overview
 Copia is a pure Rust rsync-style delta sync library providing efficient
 file synchronization with content-aware chunking and bandwidth optimization.
