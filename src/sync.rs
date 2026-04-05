@@ -43,7 +43,6 @@ pub trait Sync {
     /// # Errors
     ///
     /// Returns an error if reading/writing fails or delta is invalid.
-    contract_pre_delta_computation!(source);
     fn patch<R: Read + Seek, W: Write>(&self, basis: R, delta: &Delta, output: W) -> Result<()>;
 }
 
@@ -51,7 +50,6 @@ pub trait Sync {
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     /// Block size for signature generation (must be power of 2, 512-65536).
-    contract_pre_patch_apply!(basis);
     pub block_size: usize,
     /// Strong hash length for signature comparison (4-32 bytes).
     pub strong_hash_len: usize,
