@@ -29,6 +29,7 @@ jobs:
       # Phase 3 pilot (light workload) — build-performance.md §7 Phase 3.
       # Few deps, short cold build — break-even candidate for hit-rate signal.
       enable_sccache: true
+      use_nextest: true
     secrets: inherit
 
   # Top-level gate: org ruleset requires status check named "gate" (exact match).
