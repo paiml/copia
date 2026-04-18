@@ -26,5 +26,8 @@ jobs:
     uses: paiml/.github/.github/workflows/sovereign-ci.yml@main
     with:
       repo: ${{ github.event.repository.name }}
+      # Phase 3 pilot (light workload) — build-performance.md §7 Phase 3.
+      # Few deps, short cold build — break-even candidate for hit-rate signal.
+      enable_sccache: true
     secrets: inherit
 
