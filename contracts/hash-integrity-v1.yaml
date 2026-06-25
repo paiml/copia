@@ -74,3 +74,15 @@ kani_harnesses:
     obligation: "Truncation is prefix"
     bound: 32
     strategy: bounded_int
+
+qa_gate:
+  id: F-HASH-001
+  name: Hash Integrity Contract
+  description: BLAKE3 hash determinism, streaming parity, and constant-time equality quality gate
+  checks:
+    - hash_determinism
+    - hash_streaming_eq
+    - truncated_prefix
+    - ct_eq_correctness
+  pass_criteria: All 4 falsification tests pass + Kani truncation harness verifies
+  falsification: Non-deterministic hash state or streaming accumulation error yields divergent digests

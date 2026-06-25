@@ -61,3 +61,14 @@ kani_harnesses:
     obligation: "Compression ratio positive"
     bound: 4
     strategy: bounded_int
+
+qa_gate:
+  id: F-DELTA-001
+  name: Delta Sync Contract
+  description: Delta roundtrip fidelity, transmission savings, and positive compression ratio quality gate
+  checks:
+    - delta_roundtrip
+    - transmission_savings
+    - compression_ratio
+  pass_criteria: All 3 falsification tests pass + Kani compression-ratio harness verifies
+  falsification: Copy/literal instruction encoding error breaks byte-for-byte roundtrip reconstruction

@@ -245,7 +245,7 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0
                 .lock()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+                .map_err(|e| std::io::Error::other(e.to_string()))?
                 .write(buf)
         }
 
@@ -454,9 +454,9 @@ mod tests {
         assert_eq!(parsed["span_name"], "empty_span");
         assert!(parsed["attributes"]
             .as_object()
-            .map_or(false, |m| m.is_empty()));
+            .is_some_and(serde_json::Map::is_empty));
         assert!(parsed["trace_id"]
             .as_str()
-            .map_or(false, |s| s.starts_with("copia-")));
+            .is_some_and(|s| s.starts_with("copia-")));
     }
 }
