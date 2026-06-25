@@ -2,7 +2,7 @@
 //!
 //! Verifies that sync operations emit expected spans with correct fields
 //! and that NDJSON output deserializes to CopiaSpanRecord.
-#![allow(clippy::unwrap_used, clippy::doc_markdown)]
+#![allow(clippy::unwrap_used, clippy::doc_markdown, clippy::panic)]
 #![cfg(feature = "cli")]
 
 use std::io::{Cursor, Write};
@@ -21,13 +21,16 @@ impl TestBuf {
         Self(Arc::new(Mutex::new(Vec::new())))
     }
 
-    fn to_string(&self) -> String {
-        let guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+    fn as_string(&self) -> String {
+        let guard = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         String::from_utf8_lossy(&guard).to_string()
     }
 
     fn records(&self) -> Vec<serde_json::Value> {
-        self.to_string()
+        self.as_string()
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
@@ -38,7 +41,7 @@ impl Write for TestBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0
             .lock()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| std::io::Error::other(e.to_string()))?
             .write(buf)
     }
 
@@ -67,12 +70,11 @@ fn signature_emits_span_with_fields() {
     });
 
     // Should have spans for both CopiaSync::signature and Signature::generate
-    let sig_spans: Vec<_> = records
+    let has_sig_span = records
         .iter()
-        .filter(|r| r["span_name"] == "signature" || r["span_name"] == "generate")
-        .collect();
+        .any(|r| r["span_name"] == "signature" || r["span_name"] == "generate");
     assert!(
-        !sig_spans.is_empty(),
+        has_sig_span,
         "Expected signature/generate span, got: {records:?}"
     );
 
@@ -183,7 +185,7 @@ fn ndjson_output_deserializes_to_valid_records() {
         let _delta = sync.delta(Cursor::new(data.as_slice()), &sig).unwrap();
     });
 
-    let output = buf.to_string();
+    let output = buf.as_string();
     for line in output.trim().lines() {
         // Verify each line is valid JSON with expected fields
         let record: serde_json::Value = serde_json::from_str(line)
