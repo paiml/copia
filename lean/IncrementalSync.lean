@@ -30,4 +30,18 @@ theorem DeleteOptIn (candidates : List String) :
     deleteSet false candidates = [] := by
   rfl
 
+/-- Per-path plan decision (plan::build_plan): an excluded path is dropped;
+    otherwise the quick check decides transfer vs skip. -/
+inductive PlanAction | skip | transfer | delete
+def planFor (excluded needsXfer inDelete : Bool) : PlanAction :=
+  if excluded then PlanAction.skip
+  else if needsXfer then PlanAction.transfer
+  else if inDelete then PlanAction.delete
+  else PlanAction.skip
+
+/-- Theorems.ExcludeSafety — an excluded path is never transferred or deleted. -/
+theorem ExcludeSafety (nx del : Bool) :
+    planFor true nx del = PlanAction.skip := by
+  simp [planFor]
+
 end ProvableContracts.Copia

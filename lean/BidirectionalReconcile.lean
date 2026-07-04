@@ -41,4 +41,25 @@ theorem DeleteNeedsEvidence (av base : Nat) :
   next h => intro _; exact h
   next => intro h; exact absurd h (by decide)
 
+/-- Theorems.Blake3Oracle — identical content on both sides is NEVER a conflict
+    (content is the sole equality oracle), regardless of the base. -/
+theorem Blake3Oracle (h : Nat) (base : Option Nat) :
+    reconcile (some h) (some h) base ≠ Action.Conflict := by
+  cases base with
+  | none => simp [reconcile]
+  | some z =>
+      by_cases hz : h = z
+      · simp [reconcile, hz]
+      · simp [reconcile, hz]
+
+/-- Theorems.ConflictNotSilentPick — genuinely divergent content (both differ
+    from the base and from each other) yields a Conflict, never a silent
+    propagate or delete. -/
+theorem ConflictNotSilentPick (a b z : Nat) :
+    a ≠ b → a ≠ z → b ≠ z →
+    reconcile (some a) (some b) (some z) = Action.Conflict := by
+  intro hab haz hbz
+  simp only [reconcile]
+  rw [if_neg hab, if_neg haz, if_neg hbz]
+
 end ProvableContracts.Copia.Bidir

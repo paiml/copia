@@ -1,0 +1,102 @@
+version: 1.0.0
+target_crate: copia
+# Each contract equation bound to the copia function that implements it. `pv
+# proof-status --binding` VERIFIES these against source (a binding only counts
+# as implemented if `fn <function>` actually exists), so this is falsifiable —
+# rename a function and the contract drops below L5.
+bindings:
+  # ── incremental-sync-v1 ──
+  - contract: incremental-sync-v1.yaml
+    equation: quick_check
+    module_path: copia::plan
+    function: needs_transfer
+    signature: 'fn needs_transfer(src: FileMeta, dst: Option<FileMeta>) -> bool'
+    status: implemented
+  - contract: incremental-sync-v1.yaml
+    equation: atomic_delivery
+    module_path: copia::incremental
+    function: deliver_local
+    signature: 'async fn deliver_local(src: &Path, dst: &Path, mtime: Option<i64>) -> Result<u64, String>'
+    status: implemented
+  - contract: incremental-sync-v1.yaml
+    equation: mtime_preservation
+    module_path: copia::meta
+    function: set_local_mtime
+    signature: 'fn set_local_mtime(path: &Path, secs: i64) -> std::io::Result<()>'
+    status: implemented
+  - contract: incremental-sync-v1.yaml
+    equation: exclude_filtering
+    module_path: copia::plan
+    function: is_excluded
+    signature: 'fn is_excluded(rel: &Path, excludes: &[String]) -> bool'
+    status: implemented
+  - contract: incremental-sync-v1.yaml
+    equation: delete_mirror
+    module_path: copia::plan
+    function: build_plan
+    signature: 'fn build_plan(src: &MetaMap, dst: &MetaMap, excludes: &[String], with_delete: bool) -> SyncPlan'
+    status: implemented
+
+  # ── bidirectional-sync-v1 ──
+  - contract: bidirectional-sync-v1.yaml
+    equation: blake3_oracle
+    module_path: copia::meta
+    function: fingerprint_path
+    signature: 'fn fingerprint_path(full: &Path) -> std::io::Result<Fingerprint>'
+    status: implemented
+  - contract: bidirectional-sync-v1.yaml
+    equation: three_way_reconcile
+    module_path: copia::reconcile
+    function: reconcile_path
+    signature: 'fn reconcile_path(a: Option<Fingerprint>, b: Option<Fingerprint>, base: Option<Fingerprint>) -> Action'
+    status: implemented
+  - contract: bidirectional-sync-v1.yaml
+    equation: positive_evidence_delete
+    module_path: copia::reconcile
+    function: reconcile
+    signature: 'fn reconcile(a: &FpMap, b: &FpMap, base: &FpMap, trust_base: bool) -> Vec<(PathBuf, Action)>'
+    status: implemented
+  - contract: bidirectional-sync-v1.yaml
+    equation: convergent_conflict_copy
+    module_path: copia::bidir
+    function: apply
+    signature: 'fn apply(root_a, root_b, rel, act, a, b, host, common, conflicts) -> std::io::Result<()>'
+    status: implemented
+  - contract: bidirectional-sync-v1.yaml
+    equation: commit_then_record
+    module_path: copia::archive
+    function: save
+    signature: 'fn save(&self, path: &Path) -> std::io::Result<()>'
+    status: implemented
+
+  # ── hub-protocol-v1 ──
+  - contract: hub-protocol-v1.yaml
+    equation: cas_safety
+    module_path: copia::wire
+    function: cas_decide
+    signature: 'fn cas_decide(current: Option<Hash>, expected: Option<Hash>) -> Cas'
+    status: implemented
+  - contract: hub-protocol-v1.yaml
+    equation: bounded_framing
+    module_path: copia::wire
+    function: read_frame
+    signature: 'fn read_frame<R, T>(r: &mut R) -> std::io::Result<Option<T>>'
+    status: implemented
+  - contract: hub-protocol-v1.yaml
+    equation: magic_prologue
+    module_path: copia::wire
+    function: read_magic
+    signature: 'fn read_magic<R: Read>(r: &mut R) -> std::io::Result<bool>'
+    status: implemented
+  - contract: hub-protocol-v1.yaml
+    equation: path_traversal_guard
+    module_path: copia::serve
+    function: safe_join
+    signature: 'fn safe_join(root: &Path, rel: &str) -> Option<PathBuf>'
+    status: implemented
+  - contract: hub-protocol-v1.yaml
+    equation: content_integrity
+    module_path: copia::serve
+    function: handle_put
+    signature: 'fn handle_put<R, W>(...) -> std::io::Result<()>'
+    status: implemented

@@ -107,11 +107,14 @@ bench-compare:
 # PROVABLE CONTRACTS
 # =============================================================================
 
-# Validate every contract's schema + run the falsification tests that encode
-# each contract's predictions (the enforcement half of the provable contracts).
+# Validate every contract's schema, machine-check the Lean (L4) proofs, verify
+# the binding registry against source and report proof levels (expect L5), then
+# run the falsification tests that encode each contract's predictions (L2).
 contracts:
-	@for c in contracts/*.yaml; do pv validate "$$c" || exit 1; done
-	cargo test --features cli --test contract_falsification
+	@for c in contracts/*-v1.yaml; do pv validate "$$c" || exit 1; done
+	@echo "== Lean 4 proofs (L4) =="; for l in lean/*.lean; do lean "$$l" || exit 1; done
+	@echo "== proof levels (expect L5) =="; pv proof-status contracts/ --binding contracts/binding.yaml
+	cargo test --features cli --test contract_falsification --test e2e_bidir --test e2e_hub --test integration_all
 
 # =============================================================================
 # MAINTENANCE
