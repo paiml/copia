@@ -2,9 +2,44 @@
 //! preservation helpers that keep it stable across runs.
 
 use super::plan::{FileMeta, MetaMap};
+use super::reconcile::{FileType, Fingerprint, FpMap};
 use super::transfer::discover_local_files;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
+
+/// blake3-fingerprint one local path (streaming — never loads a >1GiB file into
+/// memory). A symlink hashes its target string; a regular file hashes its bytes.
+pub fn fingerprint_path(full: &Path) -> std::io::Result<Fingerprint> {
+    let meta = std::fs::symlink_metadata(full)?;
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(full)?;
+        let h = blake3::hash(target.as_os_str().as_encoded_bytes());
+        Ok(Fingerprint {
+            blake3: *h.as_bytes(),
+            ftype: FileType::Symlink,
+        })
+    } else {
+        let mut hasher = blake3::Hasher::new();
+        let mut f = std::fs::File::open(full)?;
+        std::io::copy(&mut f, &mut hasher)?;
+        Ok(Fingerprint {
+            blake3: *hasher.finalize().as_bytes(),
+            ftype: FileType::File,
+        })
+    }
+}
+
+/// Walk a local tree and content-fingerprint every file into an `FpMap`. Files
+/// whose fingerprint can't be read (permission/race) are skipped, never guessed.
+pub fn discover_local_fingerprints(root: &Path) -> Result<FpMap, Box<dyn std::error::Error>> {
+    let mut out = FpMap::new();
+    for rel in discover_local_files(root)? {
+        if let Ok(fp) = fingerprint_path(&root.join(&rel)) {
+            out.insert(rel, fp);
+        }
+    }
+    Ok(out)
+}
 
 /// A std file mtime as whole epoch seconds (the quick-check granularity).
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {

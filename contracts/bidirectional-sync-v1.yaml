@@ -1,0 +1,142 @@
+metadata:
+  id: C-COPIA-BIDIRECTIONAL-SYNC
+  version: "1.0.0"
+  created: "2026-07-04"
+  author: "PAIML Engineering"
+  kind: pattern
+  status: ACTIVE
+  description: |
+    Pins copia's L2 two-party bidirectional reconciler (Unison-shaped, vetted by a
+    6-system design quorum — docs/specifications/distributed-sync.md). blake3 is the
+    SOLE oracle for equal/changed/conflict/propagate/delete; mtime never decides
+    anything. A one-sided absence propagates as a DELETE only with positive archive
+    evidence (path was in the archive AND the survivor's blake3 == the archived
+    blake3); with no trusted base it is a CREATE, never a delete. Divergence is a
+    convergent conflict-copy that preserves BOTH versions on BOTH sides and picks a
+    deterministic (blake3) winner for the real path — never a clock/mtime winner.
+  references:
+    - "reconcile::reconcile_path / reconcile — the pure 3-way case table (Kani + Lean proved)"
+    - "reconcile::Fingerprint — blake3 + ftype; the only equality oracle"
+    - "archive::Archive — per-pair last-synced state, keyed by root_pair_hash+format+epoch, atomic save"
+    - "bidir::run_bisync / apply — scan+fingerprint, reconcile, atomic apply, commit-then-record"
+
+equations:
+  blake3_oracle:
+    formula: "equal(a,b) <=> blake3(a)==blake3(b) AND ftype(a)==ftype(b)"
+    domain: "a,b are file fingerprints; size+mtime never appear in a reconcile decision"
+    invariants:
+      - "Every equal/changed/conflict/propagate/delete decision is on the content digest"
+      - "A file<->symlink type flip is a change even if the hashed bytes coincide"
+  three_way_reconcile:
+    formula: "action(p) = f(A_now(p), B_now(p), base(p)) per the vetted case table"
+    domain: "p in relpaths(A) union relpaths(B); base = archived last-synced fingerprint"
+    invariants:
+      - "both==base -> noop; one!=base -> propagate; both!=base & equal -> converge; both!=base & differ -> conflict"
+      - "absent + survivor==base -> delete; absent + survivor!=base -> delete-vs-modify conflict; base-absent + present-one -> create"
+  positive_evidence_delete:
+    formula: "delete(p) => base(p) present AND survivor_blake3(p) == base_blake3(p)"
+    domain: "one-sided absence of p"
+    invariants:
+      - "No delete is ever inferred from a missing/mismatched archive or an incomplete/errored scan"
+      - "Safe no-base mode (archive absent/corrupt/pair-or-epoch mismatch) DISABLES all deletes"
+  convergent_conflict_copy:
+    formula: "on conflict both replicas end identical: {p = max-blake3 version, p.conflict-<host>-<h> = loser}"
+    domain: "irreconcilable divergence at p"
+    invariants:
+      - "BOTH versions are preserved on BOTH sides — never a data loss"
+      - "The real-path winner is deterministic by (blake3), computed identically on both ends — never mtime"
+  commit_then_record:
+    formula: "data committed (tmp+rename) BEFORE the archive entry is recorded; archive never ahead of data"
+    domain: "every applied path"
+    invariants:
+      - "Archive is written tmp+rename+fsync with the previous copy retained as .bak"
+      - "Crash recovery = re-scan + idempotent re-apply; no WAL"
+
+proof_obligations:
+  - type: safety
+    property: "No-base never deletes"
+    formal: "base=None => action not in {DeleteA, DeleteB}"
+    applies_to: positive_evidence_delete
+    lean:
+      theorem: Theorems.NoBaseNeverDeletes
+      status: proved
+  - type: safety
+    property: "Delete needs positive evidence"
+    formal: "action==DeleteA => survivor_blake3 == base_blake3"
+    applies_to: positive_evidence_delete
+    lean:
+      theorem: Theorems.DeleteNeedsEvidence
+      status: proved
+  - type: invariant
+    property: "Convergent conflict preserves both"
+    formal: "after a BothChanged conflict, relpaths(A)==relpaths(B) AND both source contents exist"
+    applies_to: convergent_conflict_copy
+    lean:
+      theorem: Theorems.ConflictPreservesBoth
+      status: sorry
+  - type: invariant
+    property: "blake3 is the equality oracle"
+    formal: "reconcile decisions never read size or mtime"
+    applies_to: blake3_oracle
+    lean:
+      theorem: Theorems.Blake3Oracle
+      status: sorry
+
+falsification_tests:
+  - id: FALSIFY-BIDIR-001
+    rule: "No-base never deletes"
+    prediction: "First sync (no archive) with a one-sided file CREATES it on the peer, never deletes"
+    test: "unit reconcile: no_base_absence_is_create_never_delete; Kani no_base_never_deletes; Lean NoBaseNeverDeletes"
+    if_fails: "A lost/corrupt archive turns a create into destructive deletion of real data"
+  - id: FALSIFY-BIDIR-002
+    rule: "Positive-evidence delete"
+    prediction: "A file modified on the survivor while deleted on the peer is a CONFLICT (kept), not a delete"
+    test: "unit reconcile: delete_needs_positive_evidence; Kani delete_requires_positive_evidence; Lean DeleteNeedsEvidence"
+    if_fails: "A concurrent modify+delete silently loses the modification"
+  - id: FALSIFY-BIDIR-003
+    rule: "Bidirectional propagation"
+    prediction: "A change on A propagates to B and a change on B propagates to A"
+    test: "e2e bisync: modify A -> B updates; modify B -> A updates"
+    if_fails: "One-way behaviour or a stale replica"
+  - id: FALSIFY-BIDIR-004
+    rule: "Convergent conflict-copy"
+    prediction: "Divergent edits converge to an identical file set with BOTH versions preserved"
+    test: "e2e bisync: edit both sides differently; assert A and B identical afterward and both contents present"
+    if_fails: "Data loss (a version dropped) or permanent non-convergence"
+  - id: FALSIFY-BIDIR-005
+    rule: "Safe deletes only with a trusted base"
+    prediction: "Deleting a common file on A mirrors the delete to B; a first-sync one-sided file is created not deleted"
+    test: "e2e bisync: delete-after-common mirrors; safe no-base absence creates"
+    if_fails: "Mass false-deletes on archive loss, or stale files never mirrored"
+
+kani_harnesses:
+  - id: reconcile-kani-001
+    obligation: "No-base never deletes"
+    harness: "reconcile::kani_proofs::no_base_never_deletes"
+    bound: 0
+    strategy: exhaustive
+    status: PROVED
+    notes: "cargo kani --features cli — SUCCESS, exhaustive over all (hash, ftype) pairs"
+  - id: reconcile-kani-002
+    obligation: "Delete needs positive evidence"
+    harness: "reconcile::kani_proofs::delete_requires_positive_evidence"
+    bound: 0
+    strategy: exhaustive
+    status: PROVED
+    notes: "cargo kani --features cli — SUCCESS"
+
+qa_gate:
+  id: F-BIDIR-001
+  name: Bidirectional Sync Contract
+  description: >
+    copia's L2 two-party reconcile is blake3-authoritative, loses no data on
+    conflict, and never deletes without positive archive evidence.
+  checks:
+    - blake3_oracle
+    - three_way_reconcile
+    - positive_evidence_delete
+    - convergent_conflict_copy
+    - commit_then_record
+  pass_criteria: >
+    All 5 FALSIFY-BIDIR tests pass (L2); the two reconcile Kani harnesses verify
+    exhaustively (L3); NoBaseNeverDeletes + DeleteNeedsEvidence are proved in Lean 4 (L4).
