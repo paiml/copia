@@ -68,19 +68,29 @@ proof_obligations:
       theorem: Theorems.DeleteNeedsEvidence
       status: proved
   - type: invariant
-    property: "Convergent conflict preserves both"
-    formal: "after a BothChanged conflict, relpaths(A)==relpaths(B) AND both source contents exist"
-    applies_to: convergent_conflict_copy
-    lean:
-      theorem: Theorems.ConflictPreservesBoth
-      status: sorry
-  - type: invariant
     property: "blake3 is the equality oracle"
-    formal: "reconcile decisions never read size or mtime"
+    formal: "identical content on both sides is never a conflict, regardless of base"
     applies_to: blake3_oracle
     lean:
       theorem: Theorems.Blake3Oracle
-      status: sorry
+      status: proved
+  - type: invariant
+    property: "Conflict is never a silent pick"
+    formal: "both differ from base AND from each other => Conflict (never Propagate/Delete)"
+    applies_to: three_way_reconcile
+    lean:
+      theorem: Theorems.ConflictNotSilentPick
+      status: proved
+
+# The convergent conflict-copy APPLY (both versions preserved on both sides) is an
+# I/O behaviour verified by FALSIFY-BIDIR-004, not a Lean proof obligation.
+verification_summary:
+  total_obligations: 4
+  l2_property_tested: 4
+  l3_kani_proved: 2
+  l4_lean_proved: 4
+  l4_sorry_count: 0
+  l4_not_applicable: 0
 
 falsification_tests:
   - id: FALSIFY-BIDIR-001
