@@ -387,3 +387,7 @@ fn e2e_signature_delta_patch_default_output_paths() {
     );
     std::fs::remove_dir_all(&base).ok();
 }
+
+// CI note: these SSH e2e tests self-provision sshd + localhost keys in the
+// sovereign-ci container (openssh baked in) so the SSH-transport paths are
+// covered rather than skipped.
