@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [0.1.5] - 2026-07-04
+## [0.2.0] - 2026-07-04
 
 Copia grows from a single-file rsync delta engine into a three-layer
 **distributed file-sync system** — one-way incremental mirror (L1),

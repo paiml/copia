@@ -46,7 +46,8 @@ coverage:
 # feature). tests/e2e_ssh.rs drives the binary against `ssh localhost` so the
 # CLI + SSH shims are covered by integration; NO bin/ exclusion.
 coverage-check:
-	cargo llvm-cov nextest --lib --bins --tests --features cli --fail-under-lines 95
+	cargo llvm-cov nextest --lib --bins --tests --features cli --no-cfg-coverage --lcov --output-path target/copia-lcov.info
+	@awk -F'[:,]' '/^DA:/{t++; if($$3>0)c++} END{p=(c/t)*100; printf "DA-line coverage: %.2f%%\n", p; if(p<95){print "FAIL: below the 95% floor"; exit 1}}' target/copia-lcov.info
 
 # =============================================================================
 # TIER 3: On-Merge (Exhaustive validation)
