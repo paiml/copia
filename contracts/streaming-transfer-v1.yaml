@@ -1,0 +1,73 @@
+metadata:
+  version: "1.0.0"
+  created: "2026-07-04"
+  author: "PAIML Engineering"
+  kind: pattern
+  description: "Streaming transfer bounded-memory invariant: per-file transfers never buffer a whole file in RAM"
+  references:
+    - "transfer_file_to_remote streams 256KiB chunks (cat > path); transfer_file_from_remote uses tokio::io::copy (bounded internal buffer)"
+    - "Motivation: the sovereign RAG index.json is >1 GiB — buffering it whole would OOM the transfer"
+
+equations:
+  bounded_peak_memory:
+    formula: "peak_buffer(transfer(file)) <= C, independent of size(file)"
+    domain: "file of arbitrary size N bytes; C = 256 KiB push chunk (or tokio::io::copy internal buffer on pull)"
+    codomain: "peak resident transfer buffer in bytes"
+    invariants:
+      - "Push reads a fixed 256 KiB buffer in a loop; it is never resized to the file size"
+      - "Pull streams ssh stdout straight to disk via tokio::io::copy — the file is never collected into a Vec"
+      - "Peak buffer is O(1) in the file size, not O(N)"
+  chunk_boundary_integrity:
+    formula: "concat(chunk_0, chunk_1, ..., chunk_k) = file"
+    domain: "file split into chunks of at most 256 KiB by the read loop"
+    codomain: "the reconstructed byte stream"
+    invariants:
+      - "Chunking at 256 KiB boundaries is lossless: a file larger than one chunk reconstructs exactly"
+      - "A short final read (n < buf.len()) writes exactly n bytes, never the stale buffer tail"
+
+proof_obligations:
+  - type: bound
+    property: "Bounded peak memory"
+    formal: "peak_buffer(transfer(file)) <= 256*1024 regardless of file size"
+    applies_to: transfer_file_to_remote
+  - type: invariant
+    property: "Chunk boundary integrity"
+    formal: "reconstruction of a multi-chunk file equals the original byte-for-byte"
+    applies_to: all
+  - type: invariant
+    property: "Short-read correctness"
+    formal: "each write emits buf[..n] where n is the bytes just read, never buf in full"
+    applies_to: transfer_file_to_remote
+
+falsification_tests:
+  - id: FALSIFY-STREAM-001
+    rule: "Chunk boundary integrity"
+    prediction: "A file larger than the 256 KiB chunk reconstructs byte-for-byte after a streamed transfer"
+    test: "local->local recursive sync of a >256 KiB pseudo-random binary; sha256(dst) == sha256(src)"
+    if_fails: "A chunk-boundary off-by-one, a stale-buffer-tail write, or an accidental whole-file buffer"
+  - id: FALSIFY-STREAM-002
+    rule: "Bounded peak memory"
+    prediction: "The push read buffer is a fixed 256 KiB and is never allocated to the file size"
+    test: "Static invariant of transfer_file_to_remote (buf = vec![0u8; 256*1024]); e2e large-file push exercises the loop"
+    if_fails: "buf was resized to file_size, or the file was read with read_to_end into a Vec"
+  - id: FALSIFY-STREAM-003
+    rule: "Short-read correctness"
+    prediction: "The final partial chunk writes only the freshly-read bytes"
+    test: "A file whose size is not a multiple of 256 KiB round-trips exactly (tail bytes not duplicated/zero-padded)"
+    if_fails: "write_all(&buf) instead of write_all(&buf[..n]) leaks stale bytes into the tail"
+
+kani_harnesses:
+  - id: stream-kani-001
+    obligation: "Chunked reconstruction of a byte sequence at a fixed chunk width equals the original for any length"
+    bound: 8
+    strategy: bounded_int
+
+qa_gate:
+  id: F-STREAM-001
+  name: Streaming Transfer Contract
+  description: Per-file transfers are O(1) in memory and lossless across chunk boundaries
+  checks:
+    - bounded_peak_memory
+    - chunk_boundary_integrity
+  pass_criteria: Multi-chunk + non-aligned round-trips pass and the fixed-buffer invariant holds
+  falsification: A whole-file buffer or a stale-tail write breaks bounded memory or byte fidelity

@@ -1,0 +1,84 @@
+metadata:
+  version: "1.0.0"
+  created: "2026-07-04"
+  author: "PAIML Engineering"
+  description: "Single-file (non-recursive) sync dispatches to the correct direction and round-trips the file exactly"
+  references:
+    - "run_sync matches (source, dest) FileLocation pairs → local/local, local/remote, remote/local; remote/remote is rejected"
+    - "FileLocation::parse distinguishes host:path from a local path (and from Windows-style single-letter drives)"
+
+equations:
+  parse_dispatch:
+    formula: "parse(s) = Remote{host,path} iff s = host ':' path with |host|>1 and host has no '/' or '\\\\', else Local(s)"
+    domain: "s is a CLI path argument"
+    codomain: "a FileLocation tag (Local | Remote)"
+    invariants:
+      - "'/local/abs' and 'rel/path' parse as Local (no host colon, or slash before the colon)"
+      - "'host:path' and 'host:~/path' parse as Remote{host, path}"
+      - "A single leading letter before ':' (e.g. 'C:') stays Local (Windows drive guard)"
+  direction_dispatch:
+    formula: "run_sync(src,dst) selects local2local | local2remote | remote2local; remote2remote => Err"
+    domain: "(src, dst) in {Local, Remote} x {Local, Remote}"
+    codomain: "the invoked transfer path, or an error"
+    invariants:
+      - "Exactly one of the three supported directions runs for a supported pair"
+      - "remote->remote is rejected with an explicit 'not yet supported' error, never silently mis-dispatched"
+  single_file_roundtrip:
+    formula: "read(dest) = read(source) after a single-file sync"
+    domain: "source is a readable file; local->local path via AsyncCopiaSync::sync_files"
+    codomain: "byte-identical destination"
+    invariants:
+      - "The destination file is byte-for-byte identical to the source after sync"
+
+proof_obligations:
+  - type: invariant
+    property: "Parse dispatch"
+    formal: "parse tags host:path as Remote and local/Windows-drive paths as Local"
+    applies_to: FileLocation::parse
+  - type: invariant
+    property: "Direction dispatch"
+    formal: "run_sync picks the one supported direction; remote->remote errors"
+    applies_to: run_sync
+  - type: roundtrip
+    property: "Single-file round-trip"
+    formal: "read(dest) == read(source) after `copia sync source dest`"
+    applies_to: all
+
+falsification_tests:
+  - id: FALSIFY-SINGLE-001
+    rule: "Single-file round-trip"
+    prediction: "A local->local single-file sync yields a byte-identical destination"
+    test: "CLI `copia sync src.bin dst.bin` (non-recursive); assert read(dst) == read(src)"
+    if_fails: "Delta/patch reconstruction bug on the single-file path"
+  - id: FALSIFY-SINGLE-002
+    rule: "Parse dispatch — remote"
+    prediction: "'host:path' parses to Remote{host,path}; the local->remote branch is chosen"
+    test: "e2e_ssh single-file push to localhost:tmp names the correct remote file (SSH-covered)"
+    if_fails: "parse split the colon wrong, or run_sync dispatched to the local branch"
+  - id: FALSIFY-SINGLE-003
+    rule: "Parse dispatch — local guard"
+    prediction: "'/abs/path' and 'C:' style args parse Local, never Remote"
+    test: "A local->local single-file sync of an absolute path never attempts SSH (completes offline)"
+    if_fails: "A local absolute path was misread as host:path and an SSH transfer was attempted"
+  - id: FALSIFY-SINGLE-004
+    rule: "Remote-to-remote rejection"
+    prediction: "A remote->remote sync is rejected with an explicit error, not mis-dispatched"
+    test: "`copia sync h1:a h2:b` exits non-zero with a 'not yet supported' message"
+    if_fails: "run_sync fell through and silently ran (or panicked on) an unsupported direction"
+
+kani_harnesses:
+  - id: single-kani-001
+    obligation: "FileLocation::parse total on arbitrary input: always returns Local or Remote, never panics"
+    bound: 8
+    strategy: bounded_int
+
+qa_gate:
+  id: F-SINGLE-001
+  name: Single-File Sync Round-Trip Contract
+  description: Non-recursive sync dispatches to the correct direction and round-trips the file exactly
+  checks:
+    - parse_dispatch
+    - direction_dispatch
+    - single_file_roundtrip
+  pass_criteria: Round-trip + local-guard tests pass locally; remote dispatch is SSH/e2e covered; remote->remote errors
+  falsification: A parse or dispatch bug sends bytes to the wrong place or drops the sync

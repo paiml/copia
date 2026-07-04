@@ -1,0 +1,83 @@
+metadata:
+  version: "1.0.0"
+  created: "2026-07-04"
+  author: "PAIML Engineering"
+  description: "Recursive local->local directory sync reconstructs the source tree byte-for-byte"
+  references:
+    - "run_sync_dir_local_to_local: discover_local_files + create_dir_all + AsyncCopiaSync::sync_files per file"
+    - "Uses the delta engine (recursive-remote-pull-v1 uses raw streaming); reconstruction must still be exact"
+
+equations:
+  tree_reconstruction:
+    formula: "relpaths(dest_tree) = relpaths(src_tree) AND sha256(dest/p) = sha256(src/p)"
+    domain: "p in relpaths(src_tree); src is a readable local directory tree"
+    codomain: "equal path sets and equal per-file digests"
+    invariants:
+      - "Every source file is reconstructed at the same relative path under dest"
+      - "Nested directory structure (collect_dirs) is created under dest before files are written"
+      - "Reconstruction is exact even when dest pre-exists (delta against an existing basis)"
+  delta_reconstruction_exact:
+    formula: "patch(basis, delta(source, signature(basis))) = source"
+    domain: "source, basis in [u8]; per-file sync_files path"
+    codomain: "source recovered exactly"
+    invariants:
+      - "sync_files reconstructs the source regardless of the basis contents (empty, identical, or divergent)"
+      - "block_size is threaded from the CLI (GH-17), not hardcoded, and does not affect correctness"
+  total_size_accounting:
+    formula: "reported_bytes = sum(size(src/p) for p in files)"
+    domain: "files = discover_local_files(src)"
+    invariants:
+      - "compute_total_size sums per-file metadata; files with unreadable metadata are skipped (and warned), never counted as zero silently"
+
+proof_obligations:
+  - type: roundtrip
+    property: "Tree reconstruction"
+    formal: "for every source file p, sha256(dest/p) == sha256(src/p)"
+    applies_to: all
+  - type: invariant
+    property: "Structure preservation"
+    formal: "relpaths(dest_tree) == relpaths(src_tree)"
+    applies_to: all
+  - type: roundtrip
+    property: "Delta reconstruction exact"
+    formal: "patch(basis, delta(source, sig(basis))) == source"
+    applies_to: all
+
+falsification_tests:
+  - id: FALSIFY-L2L-001
+    rule: "Tree reconstruction"
+    prediction: "A nested tree (text + multi-chunk binary) synced local->local matches byte-for-byte"
+    test: "CLI `copia sync --recursive src dst`; for every file assert read(dst/p) == read(src/p) and sha256 equal"
+    if_fails: "A per-file delta reconstruction bug or a wrong relative destination path"
+  - id: FALSIFY-L2L-002
+    rule: "Structure preservation"
+    prediction: "Destination has exactly the source's relative path set — no missing, no extra"
+    test: "discover_local_files(dst) == discover_local_files(src) after a recursive sync"
+    if_fails: "collect_dirs missed a parent dir, or a file was dropped/duplicated"
+  - id: FALSIFY-L2L-003
+    rule: "Empty tree"
+    prediction: "An empty source tree produces no destination files and no error"
+    test: "recursive sync of an empty dir prints 'No files found.' and exits 0"
+    if_fails: "discover_local_files errored or the run aborted non-zero on an empty tree"
+  - id: FALSIFY-L2L-004
+    rule: "Overwrite exactness"
+    prediction: "Re-syncing over a pre-existing, divergent destination reconstructs the source exactly"
+    test: "seed dst with different content, sync, assert dst == src byte-for-byte"
+    if_fails: "Delta-against-basis left stale bytes (patch did not fully reconstruct source)"
+
+kani_harnesses:
+  - id: l2l-kani-001
+    obligation: "collect_dirs over arbitrary relative paths yields only proper ancestors and never panics"
+    bound: 4
+    strategy: bounded_int
+
+qa_gate:
+  id: F-L2L-001
+  name: Local-to-Local Recursive Contract
+  description: Recursive local->local sync reconstructs the source tree byte-for-byte
+  checks:
+    - tree_reconstruction
+    - delta_reconstruction_exact
+    - total_size_accounting
+  pass_criteria: All 4 falsification tests pass (structure + byte fidelity, including overwrite)
+  falsification: A delta reconstruction bug or a wrong destination path breaks tree fidelity

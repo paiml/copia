@@ -13,24 +13,57 @@
 )]
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 
 fn copia() -> Command {
     Command::new(env!("CARGO_BIN_EXE_copia"))
 }
 
-fn ssh_localhost_ok() -> bool {
+fn ssh_probe() -> bool {
     Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
             "-o",
-            "StrictHostKeyChecking=accept-new",
+            "ConnectTimeout=5",
             "localhost",
             "true",
         ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// True if passwordless `ssh localhost` works — provisioning it once if needed.
+/// On dev boxes it already works (early return). In the CI clean-room container
+/// openssh is installed (Dockerfile) but sshd isn't running and no key exists,
+/// so as root we generate host+user keys, authorize the key, relax host-checking
+/// for localhost, and start sshd. Returns false (=> SSH tests skip) if that fails.
+fn ssh_localhost_ok() -> bool {
+    static READY: OnceLock<bool> = OnceLock::new();
+    *READY.get_or_init(|| {
+        if ssh_probe() {
+            return true;
+        }
+        let sh = |c: &str| {
+            let _ = Command::new("sh").arg("-c").arg(c).status();
+        };
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        // host keys + runtime dir + start sshd (idempotent)
+        sh("ssh-keygen -A 2>/dev/null; mkdir -p /run/sshd 2>/dev/null; \
+            pgrep -x sshd >/dev/null 2>&1 || /usr/sbin/sshd 2>/dev/null");
+        // user key, authorized_keys, and a relaxed localhost client config so
+        // copia's bare `ssh localhost <cmd>` runs non-interactively
+        sh(&format!(
+            "mkdir -p {home}/.ssh && chmod 700 {home}/.ssh && \
+             ([ -f {home}/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f {home}/.ssh/id_ed25519 2>/dev/null) && \
+             cat {home}/.ssh/id_ed25519.pub >> {home}/.ssh/authorized_keys && chmod 600 {home}/.ssh/authorized_keys && \
+             printf 'Host localhost\\n  StrictHostKeyChecking no\\n  UserKnownHostsFile /dev/null\\n  LogLevel ERROR\\n' \
+               > {home}/.ssh/config && chmod 600 {home}/.ssh/config"
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        ssh_probe()
+    })
 }
 
 fn tmp(tag: &str) -> std::path::PathBuf {
