@@ -1,0 +1,155 @@
+metadata:
+  id: C-COPIA-INCREMENTAL-SYNC
+  version: "1.0.0"
+  created: "2026-07-04"
+  author: "PAIML Engineering"
+  kind: pattern
+  status: ACTIVE
+  description: |
+    Pins copia's incremental recursive sync (the rsync-parity core): a run
+    transfers ONLY new-or-changed files (quick check on size+mtime), delivers
+    every file atomically (temp `.copia-tmp` + rename), preserves mtime so the
+    NEXT run's quick check is stable, honours `--exclude` filters, mirrors with
+    `--delete`, and previews with `--dry-run` — across all three directions
+    (push local->remote, pull remote->local, local->local).
+  references:
+    - "plan::needs_transfer / build_plan — the pure quick-check + plan diff (Kani-proved)"
+    - "incremental::run_remote / run_local — orchestration; deliver_pull / deliver_local — atomic delivery"
+    - "transfer::transfer_file_to_remote — remote atomic write (cat > tmp && mv -f) + touch -d @mtime"
+    - "meta::discover_*_with_meta — both-sides size+mtime discovery driving the diff"
+
+equations:
+  quick_check:
+    formula: "transfer(p) <=> (p not in dst) OR size(src/p) != size(dst/p) OR mtime(src/p) != mtime(dst/p)"
+    domain: "p in relpaths(src); size in u64, mtime in whole epoch seconds"
+    codomain: "boolean transfer decision per file"
+    invariants:
+      - "A file whose size AND mtime match the destination is NEVER re-transferred (skip)"
+      - "A file absent from the destination is ALWAYS transferred (new)"
+      - "mtime is compared at 1-second granularity (find %T@ truncated vs SystemTime)"
+  atomic_delivery:
+    formula: "for all readers r, observe(dst/p) in {old(dst/p), new(src/p)} — never a partial write"
+    domain: "any interleaving of a reader with an interrupted transfer"
+    invariants:
+      - "Bytes land in a sibling `<dst>.copia-tmp` and are rename(2)'d into place only after a clean transfer"
+      - "An interrupted push/pull leaves the destination file untouched (old) or fully replaced (new)"
+      - "No `.copia-tmp` staging file survives a successful transfer"
+  mtime_preservation:
+    formula: "after transfer(p): mtime(dst/p) == mtime(src/p) (whole seconds)"
+    domain: "p in transfer set"
+    invariants:
+      - "Push sets the remote mtime via `touch -d @<secs>`; pull/local via File::set_modified"
+      - "Preserving mtime is what makes the NEXT run's quick check skip the file (stability)"
+  exclude_filtering:
+    formula: "excluded(p) => p not in transfer AND p not in delete"
+    domain: "p in relpaths(src) union relpaths(dst); patterns are gitignore-style globs"
+    invariants:
+      - "A slash-free pattern matches any path component; a pattern with `/` matches the whole relative path"
+      - "An excluded destination path is left untouched — never deleted by --delete"
+  delete_mirror:
+    formula: "with --delete: delete set = { p in dst : p not in src AND not excluded(p) }"
+    domain: "p in relpaths(dst)"
+    invariants:
+      - "Without --delete the delete set is empty (never removes anything)"
+      - "--dry-run computes the delete set but removes nothing"
+
+proof_obligations:
+  - type: invariant
+    property: "Quick-check correctness"
+    formal: "needs_transfer(s, d) == (d is None) OR s.size != d.size OR s.mtime != d.mtime"
+    applies_to: quick_check
+    lean:
+      theorem: Theorems.QuickCheckCorrect
+      status: proved
+  - type: invariant
+    property: "Skip guarantee"
+    formal: "size(src/p)==size(dst/p) AND mtime(src/p)==mtime(dst/p) => p not in transfer"
+    applies_to: quick_check
+    lean:
+      theorem: Theorems.SkipGuarantee
+      status: proved
+  - type: roundtrip
+    property: "Atomic delivery"
+    formal: "a completed sync yields dst/p byte-identical to src/p with no surviving .copia-tmp"
+    applies_to: atomic_delivery
+    lean:
+      theorem: Theorems.AtomicDelivery
+      status: sorry
+  - type: invariant
+    property: "mtime stability (idempotence)"
+    formal: "sync; sync => second run transfers 0 files (all skipped)"
+    applies_to: mtime_preservation
+    lean:
+      theorem: Theorems.MtimeIdempotence
+      status: sorry
+  - type: invariant
+    property: "Exclude safety"
+    formal: "excluded(p) => p not in transfer AND p not in delete"
+    applies_to: exclude_filtering
+    lean:
+      theorem: Theorems.ExcludeSafety
+      status: sorry
+  - type: invariant
+    property: "Delete is opt-in"
+    formal: "NOT with_delete => delete set empty"
+    applies_to: delete_mirror
+    lean:
+      theorem: Theorems.DeleteOptIn
+      status: proved
+
+falsification_tests:
+  - id: FALSIFY-INCR-001
+    rule: "Skip guarantee / idempotence"
+    prediction: "A second sync of an unchanged tree transfers 0 files (all skipped)"
+    test: "e2e: sync twice; assert the 2nd run reports 0 to transfer and 'up to date'"
+    if_fails: "Quick check re-transfers unchanged files (mtime not preserved, or size/mtime not compared)"
+  - id: FALSIFY-INCR-002
+    rule: "Quick-check correctness"
+    prediction: "needs_transfer transfers iff new or size/mtime differ"
+    test: "unit: needs_transfer_matches_the_quick_check_rule; Kani: plan-kani-001 (exhaustive)"
+    if_fails: "A changed file is skipped (data loss) or an identical file re-sent (waste)"
+  - id: FALSIFY-INCR-003
+    rule: "Atomic delivery"
+    prediction: "After a sync no `.copia-tmp` survives and dst == src byte-for-byte"
+    test: "e2e: sync a tree; assert content identical and find '*.copia-tmp' is empty"
+    if_fails: "Delivery wrote in place (torn-file risk) or left staging files behind"
+  - id: FALSIFY-INCR-004
+    rule: "Exclude safety"
+    prediction: "`--exclude '*.tmp'` leaves matching files out of dst and never deletes an excluded dst path"
+    test: "e2e: source has skip.tmp; after sync skip.tmp is absent from dst"
+    if_fails: "Exclude glob failed to match, dragging junk across (or deleting an excluded dest file)"
+  - id: FALSIFY-INCR-005
+    rule: "Delete mirror + opt-in"
+    prediction: "`--delete` removes a dst file absent from src; without it, nothing is removed"
+    test: "e2e: remove a src file, sync --delete, assert dst mirror no longer has it; and a no-delete run keeps it"
+    if_fails: "Mirror left stale files, or --delete removed files it shouldn't have (foot-gun)"
+  - id: FALSIFY-INCR-006
+    rule: "Dry-run purity"
+    prediction: "`--dry-run` prints the plan but mutates neither side"
+    test: "e2e: add a src file, sync -n, assert the file is NOT created on dst"
+    if_fails: "Dry-run performed real transfers/deletes"
+
+kani_harnesses:
+  - id: plan-kani-001
+    obligation: "Quick-check correctness"
+    harness: "plan::kani_proofs::needs_transfer_iff_new_or_differing"
+    bound: 0
+    strategy: exhaustive
+    status: PROVED
+    notes: "cargo kani --features cli — SUCCESS, exhaustive over all (size,mtime) pairs for new/identical/differing"
+
+qa_gate:
+  id: F-INCR-001
+  name: Incremental Sync Contract
+  description: >
+    copia's recursive sync is incremental (quick-check skip), atomic, mtime-stable,
+    exclude-aware, mirror-capable, and dry-runnable.
+  checks:
+    - quick_check
+    - atomic_delivery
+    - mtime_preservation
+    - exclude_filtering
+    - delete_mirror
+  pass_criteria: >
+    All 6 FALSIFY-INCR falsification tests pass (L2) AND the plan-kani-001 Kani
+    harness verifies quick-check correctness exhaustively (L3).

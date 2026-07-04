@@ -330,3 +330,163 @@ fn falsify_single_004_remote_to_remote_rejected() {
         "FALSIFY-SINGLE-004: expected an explicit rejection, got: {stderr}"
     );
 }
+
+// ── incremental-sync-v1 (L1-L4: tests here are L2; L3 Kani plan-kani-001; L4 Lean) ──
+
+fn seed(src: &std::path::Path) {
+    std::fs::create_dir_all(src.join("d")).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(src.join("d/b.bin"), vec![7u8; 4096]).unwrap();
+}
+fn out_of(cmd: &mut Command) -> (bool, String) {
+    let o = cmd.output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    (o.status.success(), combined)
+}
+
+/// FALSIFY-INCR-001: a 2nd sync of an unchanged tree transfers 0 files.
+#[test]
+fn falsify_incr_001_idempotent_second_run_skips_all() {
+    let base = tmp("incr-idem");
+    let (src, dst) = (base.join("src"), base.join("dst"));
+    seed(&src);
+    let (s1, _) = out_of(copia().args(["sync", "-r"]).arg(&src).arg(&dst));
+    assert!(s1, "first sync must succeed");
+    let (s2, log) = out_of(copia().args(["sync", "-r"]).arg(&src).arg(&dst));
+    assert!(
+        s2 && (log.contains("0 to transfer") || log.contains("up to date")),
+        "FALSIFY-INCR-001: unchanged re-sync must skip all — got: {log}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// FALSIFY-INCR-003: atomic delivery — content identical, no `.copia-tmp` survives.
+#[test]
+fn falsify_incr_003_atomic_no_tmp_survives() {
+    let base = tmp("incr-atomic");
+    let (src, dst) = (base.join("src"), base.join("dst"));
+    seed(&src);
+    assert!(out_of(copia().args(["sync", "-r"]).arg(&src).arg(&dst)).0);
+    assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(dst.join("d/b.bin")).unwrap(), vec![7u8; 4096]);
+    let leftover = walk_find(&dst, "copia-tmp");
+    assert!(
+        leftover.is_none(),
+        "FALSIFY-INCR-003: staging file survived: {leftover:?}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// FALSIFY-INCR-004: `--exclude '*.tmp'` keeps matching files out of the destination.
+#[test]
+fn falsify_incr_004_exclude_omits_matches() {
+    let base = tmp("incr-excl");
+    let (src, dst) = (base.join("src"), base.join("dst"));
+    seed(&src);
+    std::fs::write(src.join("junk.tmp"), b"junk").unwrap();
+    assert!(
+        out_of(
+            copia()
+                .args(["sync", "-r", "--exclude", "*.tmp"])
+                .arg(&src)
+                .arg(&dst)
+        )
+        .0
+    );
+    assert!(dst.join("a.txt").exists(), "wanted file must sync");
+    assert!(
+        !dst.join("junk.tmp").exists(),
+        "FALSIFY-INCR-004: excluded file must NOT sync"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// FALSIFY-INCR-005: `--delete` mirrors away a stale dest file; without it, it stays.
+#[test]
+fn falsify_incr_005_delete_is_mirror_and_opt_in() {
+    let base = tmp("incr-del");
+    let (src, dst) = (base.join("src"), base.join("dst"));
+    seed(&src);
+    assert!(out_of(copia().args(["sync", "-r"]).arg(&src).arg(&dst)).0);
+    std::fs::remove_file(src.join("a.txt")).unwrap(); // a.txt now stale on dst
+                                                      // no --delete: stale file is retained
+    assert!(out_of(copia().args(["sync", "-r"]).arg(&src).arg(&dst)).0);
+    assert!(
+        dst.join("a.txt").exists(),
+        "without --delete, stale file must remain"
+    );
+    // --delete: stale file is mirrored away
+    assert!(out_of(copia().args(["sync", "-r", "--delete"]).arg(&src).arg(&dst)).0);
+    assert!(
+        !dst.join("a.txt").exists(),
+        "FALSIFY-INCR-005: --delete must remove the stale file"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// FALSIFY-INCR-006: `--dry-run` mutates nothing.
+#[test]
+fn falsify_incr_006_dry_run_mutates_nothing() {
+    let base = tmp("incr-dry");
+    let (src, dst) = (base.join("src"), base.join("dst"));
+    seed(&src);
+    let (ok, log) = out_of(copia().args(["sync", "-r", "-n"]).arg(&src).arg(&dst));
+    assert!(
+        ok && log.contains("dry run"),
+        "dry-run must report a plan: {log}"
+    );
+    assert!(
+        !dst.exists() || !dst.join("a.txt").exists(),
+        "FALSIFY-INCR-006: dry-run must not create destination files"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Recursively find a file whose name contains `needle` (for temp-file leak checks).
+fn walk_find(root: &std::path::Path, needle: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(needle))
+        {
+            return Some(p);
+        }
+        if p.is_dir() {
+            if let Some(f) = walk_find(&p, needle) {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// FALSIFY-INCR-006b: `--dry-run --delete` lists the delete plan but removes nothing.
+#[test]
+fn falsify_incr_006b_dry_run_delete_lists_but_keeps() {
+    let base = tmp("incr-drydel");
+    let (src, dst) = (base.join("src"), base.join("dst"));
+    seed(&src);
+    assert!(out_of(copia().args(["sync", "-r"]).arg(&src).arg(&dst)).0);
+    std::fs::remove_file(src.join("a.txt")).unwrap();
+    let (ok, log) = out_of(
+        copia()
+            .args(["sync", "-r", "-n", "--delete"])
+            .arg(&src)
+            .arg(&dst),
+    );
+    assert!(
+        ok && log.contains("delete a.txt"),
+        "dry-run --delete must LIST the delete: {log}"
+    );
+    assert!(
+        dst.join("a.txt").exists(),
+        "FALSIFY-INCR-006b: dry-run must not actually delete"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
