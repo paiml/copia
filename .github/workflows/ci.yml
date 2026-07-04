@@ -30,14 +30,17 @@ jobs:
       # Few deps, short cold build — break-even candidate for hit-rate signal.
       enable_sccache: true
       use_nextest: true
-      # LIVE coverage gate (build-system audit gap #1 — the opt-in ratchet from
-      # sovereign-ci #37). copia is a clean single-crate; local lcov-DA line
-      # coverage is 96.1%, but the CI container's lcov-DA came in lower (an
-      # environment delta — CI lcov appears to include files local does not).
-      # Floor set CONSERVATIVELY at 80% to unblock the live gate; tighten toward
-      # the real CI value once a green run prints "Measured line coverage: NN%".
-      # coverage_min is inert for every other repo (opt-in).
-      coverage_min: "80.0"
+      # Cover ALL targets: --lib (library) + --bins (bin #[cfg(test)] unit tests)
+      # + --tests (tests/e2e_ssh.rs drives the CLI binary against `ssh localhost`,
+      # covering main.rs + the SSH shims that are integration-tested, not unit).
+      # The default --lib scope alone leaves the bin uncovered. Whole-crate
+      # lcov-DA coverage with all three: 95.27% (3062/3214).
+      test_args: "--features cli --bins --tests"
+      # HARD 95% coverage floor (build-system audit gap #1 ratchet). Requires
+      # `ssh localhost` in the coverage env so the e2e SSH tests exercise the
+      # remote paths; they skip gracefully if unavailable (which would drop below
+      # the floor and fail — by design).
+      coverage_min: "95.0"
     secrets: inherit
 
   # Top-level gate: org ruleset requires status check named "gate" (exact match).
