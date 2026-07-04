@@ -1,0 +1,79 @@
+metadata:
+  version: "1.0.0"
+  created: "2026-07-04"
+  author: "PAIML Engineering"
+  kind: pattern
+  description: "Remote path safety: single-quote and special-char paths are escaped so the SSH command names the exact intended file"
+  references:
+    - "transfer.rs / dir_sync.rs / main.rs use $'...' ANSI-C quoting with .replace('\\\\', ...).replace('\\'', ...)"
+    - "create_remote_dirs avoids quoting entirely by piping the dir list via stdin to xargs -d '\\n' mkdir -p"
+
+equations:
+  escape_roundtrip:
+    formula: "ansi_c_unquote(concat(\"$'\", escape(p), \"'\")) = p"
+    domain: "p is a remote path string containing arbitrary printable bytes (apostrophes, backslashes, spaces, $, angle brackets)"
+    codomain: "the byte string the remote shell resolves"
+    invariants:
+      - "escape(p) = p.replace('\\\\', '\\\\\\\\').replace('\\'', '\\\\'')"
+      - "Backslashes are doubled BEFORE quotes are escaped, so escaping is unambiguous and order-stable"
+      - "Wrapping escape(p) in $'...' resolves back to exactly p under bash ANSI-C quoting"
+  no_shell_injection:
+    formula: "resolve(cmd(p)) names exactly one file: p"
+    domain: "p as above"
+    invariants:
+      - "A single quote in p cannot terminate the $'...' literal (it is emitted as \\')"
+      - "A $ or backtick inside $'...' is literal (no command/parameter expansion), so no injection is possible"
+  mkdir_quote_free:
+    formula: "create_remote_dirs(dirs) passes each path as data, not as shell syntax"
+    domain: "dirs with special characters in their names"
+    invariants:
+      - "Directory names travel over stdin to `xargs -d '\\n' mkdir -p`, so shell metacharacters are never re-parsed"
+      - "Only a literal newline in a directory name could break the NUL-free line protocol (out of scope; find/discover forbid it)"
+
+proof_obligations:
+  - type: roundtrip
+    property: "Escape round-trip"
+    formal: "ansi_c_unquote(\"$'\" + escape(p) + \"'\") == p for all tested p"
+    applies_to: all
+  - type: invariant
+    property: "No shell injection"
+    formal: "a single quote in p is emitted as \\' and never closes the literal"
+    applies_to: all
+  - type: invariant
+    property: "Order stability"
+    formal: "escaping backslash before quote is idempotent w.r.t. the intended file name"
+    applies_to: all
+
+falsification_tests:
+  - id: FALSIFY-PATH-001
+    rule: "Escape round-trip"
+    prediction: "For paths with ', \\, space, $, and >, the $'...'-quoted escape resolves back to the original under bash"
+    test: "For each tricky path, run bash -c \"printf %s $'<escape(p)>'\" and assert stdout bytes == p"
+    if_fails: "The escape order or replacement is wrong; bash resolves a different (or split) filename"
+  - id: FALSIFY-PATH-002
+    rule: "Single-quote containment"
+    prediction: "A path containing ' does not prematurely close the ANSI-C literal"
+    test: "path \"it's a file.txt\" round-trips to exactly \"it's a file.txt\" via bash"
+    if_fails: "The apostrophe closed $'...' and the remainder was parsed as separate shell words"
+  - id: FALSIFY-PATH-003
+    rule: "No expansion / no injection"
+    prediction: "$ and backtick in a path are literal inside $'...' — no command substitution runs"
+    test: "path \"$(touch pwned).txt\" round-trips verbatim; no side-effect file is created"
+    if_fails: "The $ triggered expansion — the path was interpreted, not named"
+
+kani_harnesses:
+  - id: path-kani-001
+    obligation: "escape() never shrinks a path and every ' is preceded by a backslash in the output"
+    bound: 8
+    strategy: bounded_int
+
+qa_gate:
+  id: F-PATH-001
+  name: Path Safety Contract
+  description: Special-character remote paths are escaped so the SSH command names exactly the intended file
+  checks:
+    - escape_roundtrip
+    - no_shell_injection
+    - mkdir_quote_free
+  pass_criteria: All 3 falsification tests pass under a real bash ANSI-C round-trip
+  falsification: A mis-ordered or missing escape lets a quote/`$` change which file (or command) the shell resolves

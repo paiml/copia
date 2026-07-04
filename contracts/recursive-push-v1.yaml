@@ -1,0 +1,83 @@
+metadata:
+  version: "1.0.0"
+  created: "2026-07-04"
+  author: "PAIML Engineering"
+  description: "Recursive local->remote directory push: structure preservation + byte fidelity (mirror of recursive-remote-pull)"
+  references:
+    - "Symmetric with run_sync_dir(TransferDir::Pull) — the remote->local path proven by recursive-remote-pull-v1"
+    - "Tridgell (1999) Efficient Algorithms for Sorting and Synchronization (rsync) — recursive tree transfer"
+
+equations:
+  push_structure_preservation:
+    formula: "relpaths(push(local_root)) = relpaths(local_tree(local_root))"
+    domain: "local_root is a readable local directory tree"
+    invariants:
+      - "Every local file lands at the same path relative to the remote destination root"
+      - "Nested subdirectories are created remotely (mkdir -p) before their files are written"
+      - "Symlinked directories are not descended into (discover_local_files skips is_symlink dirs)"
+  push_byte_fidelity:
+    formula: "sha256(remote(root/p)) = sha256(local(local_root/p))"
+    domain: "p in relpaths(local_tree)"
+    codomain: "equal digests"
+    invariants:
+      - "Each pushed file is byte-for-byte identical to its local source (streamed via cat > $'path', not truncated)"
+  discover_relativization:
+    formula: "discover(root) = sort({ strip_prefix(root, f) : f in files_under(root) })"
+    domain: "root is a directory; files_under enumerates regular files recursively"
+    codomain: "sorted relative paths"
+    invariants:
+      - "Discovered paths are relative to root (leading root prefix stripped) and sorted"
+      - "Only regular files are emitted; directories and symlink-dirs are not files"
+
+proof_obligations:
+  - type: roundtrip
+    property: "Push byte fidelity"
+    formal: "sha256(remote(p)) == sha256(local(p)) for every pushed file p"
+    applies_to: all
+  - type: invariant
+    property: "Structure preservation"
+    formal: "the set of remote relative paths equals the local file set"
+    applies_to: all
+  - type: invariant
+    property: "Discovery relativization"
+    formal: "discover_local_files strips the root prefix and returns sorted relative paths"
+    applies_to: discover_local_files
+
+falsification_tests:
+  - id: FALSIFY-PUSH-001
+    rule: "Byte fidelity"
+    prediction: "Every pushed file's sha256 matches the local source"
+    test: "Push a 3-file tree (text + multi-chunk binary across 2 nested dirs), compare sha256 remote vs local"
+    if_fails: "Streaming chunk-boundary corruption or truncation in transfer_file_to_remote"
+  - id: FALSIFY-PUSH-002
+    rule: "Structure preservation"
+    prediction: "Nested subdirs are recreated remotely; each file lands at its correct relative path"
+    test: "local sub/deep/big.bin arrives at remote root/sub/deep/big.bin"
+    if_fails: "create_remote_dirs missed a parent, or spawn_dir_transfers computed a wrong remote path"
+  - id: FALSIFY-PUSH-003
+    rule: "Empty tree"
+    prediction: "An empty local dir yields zero files and no error"
+    test: "discover_local_files over an empty tree returns []; run_sync_dir short-circuits with 'No files found.'"
+    if_fails: "discover_local_files errors or emits phantom entries for an empty directory"
+  - id: FALSIFY-PUSH-004
+    rule: "Discovery relativization"
+    prediction: "discover_local_files returns paths relative to root, sorted, files only"
+    test: "transfer_tests::discover_and_total_size_over_a_temp_tree (a.txt, sub/b.txt, sorted, dirs excluded)"
+    if_fails: "strip_prefix or sort bug, or a directory leaked into the file list"
+
+kani_harnesses:
+  - id: push-kani-001
+    obligation: "collect_dirs never panics and yields each file's ancestor chain for arbitrary path bytes"
+    bound: 4
+    strategy: bounded_int
+
+qa_gate:
+  id: F-PUSH-001
+  name: Recursive Push Contract
+  description: Local->remote recursive sync structure preservation + byte fidelity
+  checks:
+    - push_structure_preservation
+    - push_byte_fidelity
+    - discover_relativization
+  pass_criteria: All 4 falsification tests pass + discovery relativization holds
+  falsification: A wrong relative-path computation or a truncated stream breaks structure/byte fidelity

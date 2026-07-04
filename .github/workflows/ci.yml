@@ -30,19 +30,54 @@ jobs:
       # Few deps, short cold build — break-even candidate for hit-rate signal.
       enable_sccache: true
       use_nextest: true
+      # Cover ALL targets: --lib (library) + --bins (bin #[cfg(test)] unit tests)
+      # + --tests (tests/e2e_ssh.rs drives the CLI binary against `ssh localhost`,
+      # covering main.rs + the SSH shims that are integration-tested, not unit).
+      # The default --lib scope alone leaves the bin uncovered. Whole-crate
+      # lcov-DA coverage with all three: 95.27% (3062/3214).
+      test_args: "--features cli --bins --tests"
+      # HARD 95% coverage floor (build-system audit gap #1 ratchet). Requires
+      # `ssh localhost` in the coverage env so the e2e SSH tests exercise the
+      # remote paths; they skip gracefully if unavailable (which would drop below
+      # the floor and fail — by design).
+      coverage_min: "95.0"
     secrets: inherit
+
+  # Benchmarks: compile + smoke-run the criterion suite (async transfer engine)
+  # so a broken/removed benchmark fails the PR. `-- --test` runs each bench once
+  # (no timing), keeping it fast. Provable-contract schemas + falsification tests
+  # are enforced separately: `pv validate` is run below and the falsification
+  # #[test]s (tests/contract_falsification.rs) run in the reusable `ci / test`.
+  benchmarks:
+    name: benchmarks
+    runs-on: [self-hosted, clean-room]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compile + smoke-run benchmarks
+        run: cargo bench --features async -- --test
+      - name: Validate provable contracts (schema)
+        run: |
+          if command -v pv >/dev/null 2>&1; then
+            for c in contracts/*.yaml; do pv validate "$c"; done
+          else
+            echo "pv unavailable on this runner — schema validation is covered by the nightly + local \`make contracts\`; falsification #[test]s still gate in ci/test"
+          fi
 
   # Top-level gate: org ruleset requires status check named "gate" (exact match).
   # The reusable workflow produces "ci / gate" which doesn't satisfy the ruleset.
   gate:
     runs-on: ubuntu-latest
-    needs: [ci]
+    needs: [ci, benchmarks]
     if: always()
     steps:
       - name: Check required jobs
         run: |
           if [ "${{ needs.ci.result }}" != "success" ]; then
             echo "ci failed: ${{ needs.ci.result }}"
+            exit 1
+          fi
+          if [ "${{ needs.benchmarks.result }}" != "success" ]; then
+            echo "benchmarks failed: ${{ needs.benchmarks.result }}"
             exit 1
           fi
           echo "All required jobs passed"

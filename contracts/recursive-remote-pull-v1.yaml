@@ -1,0 +1,77 @@
+metadata:
+  version: "1.0.0"
+  created: "2026-07-04"
+  author: "PAIML Engineering"
+  description: "Recursive remote->local directory pull: structure preservation + byte fidelity"
+  references:
+    - "Symmetric with run_sync_dir_local_to_remote (the existing push path)"
+    - "Consumer: infra rag-sync pulls the sovereign RAG index from intel (remote->local) — this replaced the rsync fallback"
+
+equations:
+  pull_structure_preservation:
+    formula: "relpaths(pull(host:root)) = relpaths(remote_tree(host:root))"
+    domain: "host:root is a readable remote directory tree"
+    invariants:
+      - "Every remote file lands at the same path relative to the destination root"
+      - "Nested subdirectories are created locally before their files are written"
+  pull_byte_fidelity:
+    formula: "sha256(local(p)) = sha256(remote(host:root/p))"
+    domain: "p in relpaths(remote_tree)"
+    codomain: "equal digests"
+    invariants:
+      - "Each pulled file is byte-for-byte identical to its remote source (streamed, not truncated)"
+  find_parse_relativization:
+    formula: "parse(find0(root)) = sort({ strip_prefix('./', e) : e in split0(out), e != '' })"
+    domain: "NUL-delimited `find . -type f -print0` output bytes"
+    codomain: "sorted relative paths, no empty entries"
+    invariants:
+      - "Leading './' is stripped; empty entries (e.g. trailing NUL) are dropped; result is sorted"
+
+proof_obligations:
+  - type: roundtrip
+    property: "Pull byte fidelity"
+    formal: "sha256(local(p)) == sha256(remote(p)) for every pulled file p"
+    applies_to: all
+  - type: invariant
+    property: "Structure preservation"
+    formal: "the set of destination relative paths equals the remote file set"
+    applies_to: all
+  - type: invariant
+    property: "find-output parse relativization"
+    formal: "parse_remote_find_output strips './', drops empty entries, sorts"
+    applies_to: parse_remote_find_output
+
+falsification_tests:
+  - id: FALSIFY-PULL-001
+    rule: "Byte fidelity"
+    prediction: "Every pulled file's sha256 matches the remote source"
+    test: "Pull a 3-file tree (text + 100KB binary across 2 nested dirs), compare sha256 — VERIFIED 2026-07-04: 3/3 match, 0 failed"
+  - id: FALSIFY-PULL-002
+    rule: "Structure preservation"
+    prediction: "Nested subdirs are recreated; each file lands at its correct relative path"
+    test: "sub/deep/big.bin arrives at dest/sub/deep/big.bin — VERIFIED"
+  - id: FALSIFY-PULL-003
+    rule: "Empty listing"
+    prediction: "An empty remote dir yields zero files and no error"
+    test: "remote_pull_tests::parse_find_handles_empty_and_spaces (empty + only-NUL => [])"
+  - id: FALSIFY-PULL-004
+    rule: "find-output relativization"
+    prediction: "'./a', './sub/b' become 'a', 'sub/b'; embedded spaces preserved; sorted"
+    test: "remote_pull_tests::parse_find_strips_dot_slash_and_sorts"
+
+kani_harnesses:
+  - id: pull-kani-001
+    obligation: "find-output parse drops empty entries and never panics on arbitrary bytes"
+    bound: 4
+    strategy: bounded_int
+
+qa_gate:
+  id: F-PULL-001
+  name: Recursive Remote Pull Contract
+  description: Remote->local recursive sync structure preservation + byte fidelity
+  checks:
+    - pull_structure_preservation
+    - pull_byte_fidelity
+    - find_parse_relativization
+  pass_criteria: All 4 falsification tests pass + parse relativization holds
+  falsification: A wrong relative-path computation or a truncated stream breaks structure/byte fidelity

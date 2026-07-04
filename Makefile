@@ -1,6 +1,7 @@
 # Copia Makefile - Iron Lotus + Certeza Quality Framework
 # Three-Tier Testing Methodology
 
+.PHONY: contracts bench bench-baseline bench-compare coverage coverage-check
 .PHONY: all build test test-fast lint fmt clean tier1 tier2 tier3 coverage bench doc
 
 # Default target
@@ -41,8 +42,11 @@ test:
 coverage:
 	cargo llvm-cov --all-features --html --ignore-filename-regex 'bin/'
 
+# Whole-crate 95% floor — matches CI exactly (--lib + --bins + --tests, cli
+# feature). tests/e2e_ssh.rs drives the binary against `ssh localhost` so the
+# CLI + SSH shims are covered by integration; NO bin/ exclusion.
 coverage-check:
-	cargo llvm-cov --all-features --fail-under-lines 95 --ignore-filename-regex 'bin/|rustlib/'
+	cargo llvm-cov nextest --lib --bins --tests --features cli --fail-under-lines 95
 
 # =============================================================================
 # TIER 3: On-Merge (Exhaustive validation)
@@ -88,14 +92,26 @@ doc-open:
 # BENCHMARKS
 # =============================================================================
 
+# --features async: the sync-throughput + rsync-comparison benches drive the
+# async transfer engine (required-features = ["async"]).
 bench:
-	cargo bench
+	cargo bench --features async
 
 bench-baseline:
-	cargo bench -- --save-baseline main
+	cargo bench --features async -- --save-baseline main
 
 bench-compare:
-	cargo bench -- --baseline main
+	cargo bench --features async -- --baseline main
+
+# =============================================================================
+# PROVABLE CONTRACTS
+# =============================================================================
+
+# Validate every contract's schema + run the falsification tests that encode
+# each contract's predictions (the enforcement half of the provable contracts).
+contracts:
+	@for c in contracts/*.yaml; do pv validate "$$c" || exit 1; done
+	cargo test --features cli --test contract_falsification
 
 # =============================================================================
 # MAINTENANCE

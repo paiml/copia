@@ -1,6 +1,6 @@
 [package]
 name = "copia"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Pragmatic AI Labs <info@paiml.com>"]
@@ -72,7 +72,7 @@ cli = ["clap", "async", "tracing", "dep:tracing-subscriber", "tokio/rt-multi-thr
 
 [[bin]]
 name = "copia"
-path = "src/bin/copia.rs"
+path = "src/bin/copia/main.rs"
 required-features = ["cli"]
 
 [lints.rust]
@@ -118,5 +118,10 @@ harness = false
 
 [[bench]]
 name = "rsync_comparison"
+harness = false
+required-features = ["async"]
+
+[[bench]]
+name = "sync_throughput"
 harness = false
 required-features = ["async"]
