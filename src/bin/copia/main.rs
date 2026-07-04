@@ -118,6 +118,26 @@ enum Commands {
         verbose: bool,
     },
 
+    /// Run the L3 hub daemon: serve a directory over stdin/stdout. Clients spawn
+    /// this as `ssh <host> copia serve <root>`; it applies CAS-on-blake3 writes.
+    Serve {
+        /// Directory the hub serves as the source of truth
+        #[arg(required = true)]
+        root: PathBuf,
+    },
+
+    /// Push a local tree to a hub with CAS-on-blake3 concurrency safety. TARGET
+    /// is `host:root` (over SSH) or a local hub path (spawns a local `serve`).
+    HubSync {
+        /// Local source directory
+        #[arg(required = true)]
+        local: PathBuf,
+
+        /// Hub target: `host:root` or a local path
+        #[arg(required = true)]
+        target: String,
+    },
+
     /// Generate signature for a file
     Signature {
         /// File to generate signature for
@@ -240,6 +260,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             dry_run,
             verbose,
         } => bidir::run_bisync(&a, &b, &bidir::BidirOptions { dry_run, verbose }),
+        Commands::Serve { root } => serve::serve(&root),
+        Commands::HubSync { local, target } => hub::hub_sync(&local, &target),
         Commands::Signature {
             file,
             output,
@@ -261,12 +283,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 mod archive;
 mod bidir;
 mod dir_sync;
+mod hub;
 mod incremental;
 mod meta;
 mod plan;
 mod reconcile;
+mod serve;
 mod single_sync;
 mod transfer;
+mod wire;
 use incremental::{run_sync_recursive, SyncOptions};
 use single_sync::run_sync;
 
