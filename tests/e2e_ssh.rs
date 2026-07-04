@@ -25,6 +25,10 @@ fn ssh_probe() -> bool {
             "-o",
             "BatchMode=yes",
             "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
             "ConnectTimeout=5",
             "localhost",
             "true",
@@ -36,31 +40,39 @@ fn ssh_probe() -> bool {
 
 /// True if passwordless `ssh localhost` works — provisioning it once if needed.
 /// On dev boxes it already works (early return). In the CI clean-room container
-/// openssh is installed (Dockerfile) but sshd isn't running and no key exists,
-/// so as root we generate host+user keys, authorize the key, relax host-checking
-/// for localhost, and start sshd. Returns false (=> SSH tests skip) if that fails.
+/// openssh is installed but `sshd` isn't running and no key exists, so we set it
+/// up. Three subtleties, all verified against the sovereign-ci container: keys and
+/// `authorized_keys` must live in the login user's passwd home (from `getent`),
+/// not `$HOME` — GitHub Actions sets `$HOME` to `/github/home` for container jobs
+/// but `sshd` and bare `ssh` resolve `~` from the passwd database (`/root`); the
+/// stock image may ship `PermitRootLogin no`, so a drop-in enables key-only root
+/// login; and a system-wide client config under `/etc/ssh/ssh_config.d` relaxes
+/// host-key checking and pins the identity for `localhost`, so copia's bare
+/// `ssh localhost` runs non-interactively. Returns false (SSH tests skip) on failure.
 fn ssh_localhost_ok() -> bool {
     static READY: OnceLock<bool> = OnceLock::new();
     *READY.get_or_init(|| {
         if ssh_probe() {
             return true;
         }
-        let sh = |c: &str| {
-            let _ = Command::new("sh").arg("-c").arg(c).status();
-        };
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        // host keys + runtime dir + start sshd (idempotent)
-        sh("ssh-keygen -A 2>/dev/null; mkdir -p /run/sshd 2>/dev/null; \
-            pgrep -x sshd >/dev/null 2>&1 || /usr/sbin/sshd 2>/dev/null");
-        // user key, authorized_keys, and a relaxed localhost client config so
-        // copia's bare `ssh localhost <cmd>` runs non-interactively
-        sh(&format!(
-            "mkdir -p {home}/.ssh && chmod 700 {home}/.ssh && \
-             ([ -f {home}/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f {home}/.ssh/id_ed25519 2>/dev/null) && \
-             cat {home}/.ssh/id_ed25519.pub >> {home}/.ssh/authorized_keys && chmod 600 {home}/.ssh/authorized_keys && \
-             printf 'Host localhost\\n  StrictHostKeyChecking no\\n  UserKnownHostsFile /dev/null\\n  LogLevel ERROR\\n' \
-               > {home}/.ssh/config && chmod 600 {home}/.ssh/config"
-        ));
+        let script = r#"
+RH=$(getent passwd "$(id -un)" | cut -d: -f6); [ -n "$RH" ] || RH="${HOME:-/root}"
+mkdir -p /etc/ssh/sshd_config.d /etc/ssh/ssh_config.d 2>/dev/null
+printf 'PermitRootLogin prohibit-password\nPubkeyAuthentication yes\n' \
+  > /etc/ssh/sshd_config.d/99-ci-localhost.conf 2>/dev/null
+printf 'Host localhost\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  IdentityFile %s/.ssh/id_ed25519\n  LogLevel ERROR\n' "$RH" \
+  > /etc/ssh/ssh_config.d/99-ci-localhost.conf 2>/dev/null
+grep -q 'ssh_config.d/' /etc/ssh/ssh_config 2>/dev/null \
+  || echo 'Include /etc/ssh/ssh_config.d/*.conf' >> /etc/ssh/ssh_config 2>/dev/null
+ssh-keygen -A 2>/dev/null
+mkdir -p /run/sshd 2>/dev/null
+pgrep -x sshd >/dev/null 2>&1 || /usr/sbin/sshd 2>/dev/null
+mkdir -p "$RH/.ssh" && chmod 700 "$RH/.ssh"
+[ -f "$RH/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N '' -f "$RH/.ssh/id_ed25519" 2>/dev/null
+cat "$RH/.ssh/id_ed25519.pub" >> "$RH/.ssh/authorized_keys" 2>/dev/null
+chmod 600 "$RH/.ssh/authorized_keys" 2>/dev/null
+"#;
+        let _ = Command::new("sh").arg("-c").arg(script).status();
         std::thread::sleep(std::time::Duration::from_millis(800));
         ssh_probe()
     })
