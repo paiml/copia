@@ -403,3 +403,96 @@ fn e2e_signature_delta_patch_default_output_paths() {
 // CI note: these SSH e2e tests self-provision sshd + localhost keys in the
 // sovereign-ci container (openssh baked in) so the SSH-transport paths are
 // covered rather than skipped.
+
+#[test]
+fn e2e_incremental_push_idempotent_delete_verbose() {
+    if !ssh_localhost_ok() {
+        eprintln!("skip: no localhost ssh");
+        return;
+    }
+    let base = tmp("incr-push");
+    let src = base.join("src");
+    seed_tree(&src);
+    let rdst = base.join("rdst");
+    let remote = format!("localhost:{}/", rdst.display());
+    let src_arg = format!("{}/", src.display());
+    assert!(copia()
+        .args(["sync", "-r", &src_arg, &remote])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    // 2nd push, verbose → covers the run_remote skip path + verbose report
+    let out = copia()
+        .args(["sync", "-r", "-v", &src_arg, &remote])
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && (log.contains("up to date") || log.contains("0 to transfer")),
+        "push must be idempotent: {log}"
+    );
+    // push --delete removes a remote file no longer in source
+    std::fs::remove_file(src.join("a.txt")).unwrap();
+    assert!(copia()
+        .args(["sync", "-r", "--delete", &src_arg, &remote])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(
+        !rdst.join("a.txt").exists(),
+        "push --delete must remove the remote stale file"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn e2e_incremental_pull_delete() {
+    if !ssh_localhost_ok() {
+        eprintln!("skip: no localhost ssh");
+        return;
+    }
+    let base = tmp("incr-pull");
+    let rsrc = base.join("rsrc");
+    seed_tree(&rsrc);
+    let local = base.join("ldst");
+    let rsrc_arg = format!("localhost:{}/", rsrc.display());
+    let local_arg = format!("{}/", local.display());
+    assert!(copia()
+        .args(["sync", "-r", &rsrc_arg, &local_arg])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    std::fs::remove_file(rsrc.join("a.txt")).unwrap();
+    assert!(copia()
+        .args(["sync", "-r", "--delete", &rsrc_arg, &local_arg])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(
+        !local.join("a.txt").exists(),
+        "pull --delete must remove the local stale file"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn e2e_recursive_remote_to_remote_rejected() {
+    // Reaches the reject branch before any SSH — safe offline.
+    let out = copia()
+        .args(["sync", "-r", "h1:/a", "h2:/b"])
+        .env("PATH", "/nonexistent-copia-path")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "recursive remote->remote must be rejected"
+    );
+}

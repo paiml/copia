@@ -77,6 +77,8 @@ required-features = ["cli"]
 
 [lints.rust]
 unsafe_code = "deny"
+# `cfg(kani)` is set by the Kani model checker (`cargo kani`), not by a feature.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

@@ -97,11 +97,18 @@ pub async fn create_remote_dirs(
 
 /// Transfer a single file from local to remote via SSH streaming.
 /// Uses streaming I/O — does not read entire file into memory.
+/// Stream a local file to `host:remote_path` over SSH. Atomic + optionally
+/// mtime-preserving: the bytes land in a `.copia-tmp` sibling and are renamed
+/// into place (`mv -f`) only after a clean transfer, so an interrupted push
+/// never leaves a truncated/corrupt destination a reader could observe. When
+/// `mtime` is Some, the destination's mtime is set to it (epoch seconds) so the
+/// next run's quick check can skip the unchanged file.
 #[instrument(skip(local_path), fields(host, remote_path))]
 pub async fn transfer_file_to_remote(
     local_path: &Path,
     host: &str,
     remote_path: &str,
+    mtime: Option<i64>,
 ) -> Result<u64, String> {
     use tokio::io::AsyncReadExt;
 
@@ -110,11 +117,15 @@ pub async fn transfer_file_to_remote(
         .map_err(|e| format!("{}: {e}", local_path.display()))?;
     let file_size = metadata.len();
 
-    // Use $'...' quoting with backslash escapes for paths with special chars
+    // Use $'...' quoting with backslash escapes for paths with special chars.
     let escaped = remote_path.replace('\\', "\\\\").replace('\'', "\\'");
+    let tmp_escaped = format!("{escaped}.copia-tmp");
+    let touch = mtime.map_or(String::new(), |t| format!(" && touch -d @{t} $'{escaped}'"));
     let mut child = tokio::process::Command::new("ssh")
         .arg(host)
-        .arg(format!("cat > $'{escaped}'"))
+        .arg(format!(
+            "cat > $'{tmp_escaped}' && mv -f $'{tmp_escaped}' $'{escaped}'{touch}"
+        ))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -155,25 +166,6 @@ pub async fn transfer_file_to_remote(
     }
 
     Ok(file_size)
-}
-
-/// Compute the total size of files relative to a root directory.
-pub fn compute_total_size(root: &Path, files: &[PathBuf]) -> u64 {
-    let mut total: u64 = 0;
-    let mut skipped = 0usize;
-    for f in files {
-        match std::fs::metadata(root.join(f)) {
-            Ok(m) => total += m.len(),
-            Err(_) => skipped += 1,
-        }
-    }
-    // GH-23: Warn if metadata errors caused files to be excluded from total
-    if skipped > 0 {
-        eprintln!(
-            "Warning: {skipped} file(s) excluded from size calculation (metadata unavailable)"
-        );
-    }
-    total
 }
 
 /// Calculate transfer speed in bytes per second.
@@ -262,18 +254,17 @@ mod transfer_tests {
     }
 
     #[test]
-    fn discover_and_total_size_over_a_temp_tree() {
+    fn discover_local_files_over_a_temp_tree() {
         let tmp = std::env::temp_dir().join(format!("copia-disc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("sub")).unwrap();
-        std::fs::write(tmp.join("a.txt"), b"12345").unwrap(); // 5 bytes
-        std::fs::write(tmp.join("sub/b.txt"), b"678").unwrap(); // 3 bytes
+        std::fs::write(tmp.join("a.txt"), b"12345").unwrap();
+        std::fs::write(tmp.join("sub/b.txt"), b"678").unwrap();
         let files = discover_local_files(&tmp).unwrap();
         assert_eq!(
             files,
             vec![PathBuf::from("a.txt"), PathBuf::from("sub/b.txt")]
         );
-        assert_eq!(compute_total_size(&tmp, &files), 8);
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
