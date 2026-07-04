@@ -98,6 +98,26 @@ enum Commands {
         excludes: Vec<String>,
     },
 
+    /// Bidirectional sync of two local directories (L2: blake3 3-way reconcile,
+    /// safe deletes, convergent conflict-copy — never loses data).
+    Bisync {
+        /// First directory
+        #[arg(required = true)]
+        a: PathBuf,
+
+        /// Second directory
+        #[arg(required = true)]
+        b: PathBuf,
+
+        /// Show the reconcile plan without modifying either side
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+
+        /// Show verbose output (per-conflict listing)
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
     /// Generate signature for a file
     Signature {
         /// File to generate signature for
@@ -214,6 +234,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 run_sync(src_loc, dest_loc, block_size, verbose).await
             }
         }
+        Commands::Bisync {
+            a,
+            b,
+            dry_run,
+            verbose,
+        } => bidir::run_bisync(&a, &b, &bidir::BidirOptions { dry_run, verbose }),
         Commands::Signature {
             file,
             output,
@@ -232,10 +258,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+mod archive;
+mod bidir;
 mod dir_sync;
 mod incremental;
 mod meta;
 mod plan;
+mod reconcile;
 mod single_sync;
 mod transfer;
 use incremental::{run_sync_recursive, SyncOptions};
