@@ -1,0 +1,129 @@
+metadata:
+  id: C-COPIA-HUB-PROTOCOL
+  version: "1.0.0"
+  created: "2026-07-04"
+  author: "PAIML Engineering"
+  kind: pattern
+  status: ACTIVE
+  description: |
+    Pins copia's L3 distributed hub (N clients -> 1 hub, star topology) — vetted by
+    the 6-system design quorum (docs/specifications/distributed-sync.md). A
+    `copia serve <root>` process speaks a framed, versioned, self-describing (CBOR)
+    request/response protocol over one persistent stdin/stdout pipe. Concurrency
+    safety is CAS-on-blake3 under a brief tree commit-lock: a write commits ONLY
+    when the hub's CURRENT content hash equals what the client last observed
+    (`expected`); a stale CAS NEVER overwrites — it lands a conflict-copy. No
+    client-held locks, leases, fencing tokens, or vector clocks: the single hub is
+    the total order, and the content-hash CAS is immune to pause/partition and ABA.
+  references:
+    - "wire::cas_decide — the pure CAS gate (Kani + Lean proved)"
+    - "wire::read_frame/write_frame — bounded length-prefixed CBOR framing; read_magic prologue guard"
+    - "serve::handle_put/handle_delete — CAS commit under with_commit_lock; conflict-copy on loss"
+    - "serve::safe_join — path-traversal guard (rejects .. / absolute)"
+    - "hub::HubClient/hub_sync — persistent-connection client, CAS push"
+
+equations:
+  cas_safety:
+    formula: "commit(p) <=> hub_current_hash(p) == client_expected_hash(p)"
+    domain: "concurrent clients writing path p to the hub"
+    invariants:
+      - "A stale expected (a concurrent writer changed p since the client read it) NEVER commits"
+      - "A lost CAS lands the incoming content at p.conflict-<hash>, never overwriting the current value"
+      - "compare + rename are one atomic step under the tree commit-lock -> linearizable, ABA-immune"
+  bounded_framing:
+    formula: "read_frame rejects any length prefix > MAX_FRAME BEFORE allocating"
+    domain: "an adversarial or corrupt peer"
+    invariants:
+      - "A 0xFFFFFFFF prefix cannot trigger a multi-GiB allocation (DoS guard)"
+      - "Bulk file content streams as raw bytes after the frame, not inside a CBOR blob"
+  magic_prologue:
+    formula: "the hub aborts unless the first bytes are exactly MAGIC"
+    domain: "an ssh banner / motd / rc output / non-copia peer on the channel"
+    invariants:
+      - "A desynchronising prologue is caught before any frame is parsed"
+  path_traversal_guard:
+    formula: "safe_join(root, rel) = None if rel is absolute or contains .. / root escape"
+    domain: "a client-supplied relative path"
+    invariants:
+      - "A client can never write or read outside the served root"
+  content_integrity:
+    formula: "a Put is rejected unless blake3(streamed bytes) == the client's claimed hash"
+    domain: "every Put"
+    invariants:
+      - "Corrupted/truncated content never commits"
+
+proof_obligations:
+  - type: safety
+    property: "Stale CAS never commits"
+    formal: "cas_decide(current, expected) == Commit => current == expected"
+    applies_to: cas_safety
+    lean:
+      theorem: Theorems.StaleCasNeverCommits
+      status: proved
+  - type: safety
+    property: "Bounded frame allocation"
+    formal: "length_prefix > MAX_FRAME => error before allocation"
+    applies_to: bounded_framing
+    lean:
+      theorem: Theorems.BoundedFrame
+      status: sorry
+  - type: safety
+    property: "No path traversal"
+    formal: "safe_join(root, rel) = Some(p) => p is under root"
+    applies_to: path_traversal_guard
+    lean:
+      theorem: Theorems.NoTraversal
+      status: sorry
+
+falsification_tests:
+  - id: FALSIFY-HUB-001
+    rule: "Stale CAS never commits (lost-update fence)"
+    prediction: "A Put whose expected != the hub's current hash does NOT overwrite; it lands a conflict-copy"
+    test: "unit serve::cas_commit_then_stale_expected_conflicts_never_overwrites; Kani hub-kani-001; Lean StaleCasNeverCommits"
+    if_fails: "A concurrent writer's update is silently lost"
+  - id: FALSIFY-HUB-002
+    rule: "CAS delete needs matching expected"
+    prediction: "A Delete with a stale expected is refused; with the matching hash it removes"
+    test: "unit serve::cas_delete_only_with_matching_expected"
+    if_fails: "A stale client deletes a file another writer just changed"
+  - id: FALSIFY-HUB-003
+    rule: "End-to-end push + CAS skip"
+    prediction: "hub-sync lands the local tree on the hub; a 2nd identical push transfers 0"
+    test: "e2e hub_push_lands_files_then_second_push_skips"
+    if_fails: "Protocol/streaming break or the quick-check re-sends unchanged files"
+  - id: FALSIFY-HUB-004
+    rule: "Prologue guard"
+    prediction: "A non-copia prologue (ssh banner / garbage) is rejected before any frame parse"
+    test: "e2e hub_rejects_bad_protocol_prologue"
+    if_fails: "Banner/rc output desyncs every subsequent frame"
+  - id: FALSIFY-HUB-005
+    rule: "Path-traversal guard"
+    prediction: "A `..`/absolute path is refused; a client cannot escape the served root"
+    test: "unit serve::safe_join_blocks_traversal_and_absolute"
+    if_fails: "A malicious client writes outside the hub root"
+
+kani_harnesses:
+  - id: hub-kani-001
+    obligation: "Stale CAS never commits"
+    harness: "wire::kani_proofs::stale_cas_never_commits"
+    bound: 0
+    strategy: exhaustive
+    status: PROVED
+    notes: "cargo kani --features cli — SUCCESS, exhaustive over all (current, expected) hash pairs"
+
+qa_gate:
+  id: F-HUB-001
+  name: Hub Protocol Contract
+  description: >
+    copia's L3 hub is concurrency-safe by CAS-on-blake3 (no lost updates), frames
+    are bounded + magic-guarded, paths cannot escape the root, and content integrity
+    is enforced.
+  checks:
+    - cas_safety
+    - bounded_framing
+    - magic_prologue
+    - path_traversal_guard
+    - content_integrity
+  pass_criteria: >
+    All 5 FALSIFY-HUB tests pass (L2); the CAS Kani harness verifies exhaustively
+    (L3); StaleCasNeverCommits is proved in Lean 4 (L4).

@@ -54,6 +54,8 @@ contracts = { version = "0.6", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "registry"], optional = true }
 serde_json = { version = "1.0", optional = true }
+ciborium = { version = "0.2", optional = true }
+fs2 = { version = "0.4", optional = true }
 provable-contracts-macros = "0.1"
 
 [dev-dependencies]
@@ -68,7 +70,7 @@ default = []
 async = ["tokio"]
 contracts = ["dep:contracts"]
 tracing = ["dep:tracing", "dep:serde_json"]
-cli = ["clap", "async", "tracing", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/macros", "tokio/process"]
+cli = ["clap", "async", "tracing", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/macros", "tokio/process", "dep:ciborium", "dep:fs2"]
 
 [[bin]]
 name = "copia"
