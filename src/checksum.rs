@@ -74,20 +74,23 @@ impl RollingChecksum {
     #[cfg_attr(feature = "contracts", ensures(ret.b < Self::MOD, "b < MOD"))]
     #[cfg_attr(feature = "contracts", ensures(ret.count == data.len(), "count == input len"))]
     pub fn new(data: &[u8]) -> Self {
-        let mut a: u32 = 0;
-        let mut b: u32 = 0;
+        // Accumulate in u64: the weighted sum b = Σ (len-i)·byte reaches
+        // ~255·len²/2, which overflows u32 for windows ≥ ~8-16 KiB and would
+        // silently disagree with FastRollingChecksum (u64) used by the delta
+        // matcher — breaking block matching for large block sizes.
+        let mut a: u64 = 0;
+        let mut b: u64 = 0;
         let len = data.len();
 
         for (i, &byte) in data.iter().enumerate() {
-            a = a.wrapping_add(u32::from(byte));
+            a = a.wrapping_add(u64::from(byte));
             // Weight is (len - i) so first byte has highest weight
-            // Truncation is intentional: checksum uses 32-bit arithmetic
-            b = b.wrapping_add((len - i) as u32 * u32::from(byte));
+            b = b.wrapping_add((len - i) as u64 * u64::from(byte));
         }
 
         let result = Self {
-            a: a % Self::MOD,
-            b: b % Self::MOD,
+            a: (a % u64::from(Self::MOD)) as u32,
+            b: (b % u64::from(Self::MOD)) as u32,
             count: len,
         };
         debug_assert!(result.a < Self::MOD, "a must be < MOD after init");
@@ -352,6 +355,22 @@ mod tests {
     // ==========================================================================
     // UNIT TESTS - Basic functionality
     // ==========================================================================
+
+    #[test]
+    fn strict_and_fast_rolling_checksums_agree_for_all_block_sizes() {
+        // RollingChecksum (u32 accumulators historically) feeds signature weak
+        // hashes; FastRollingChecksum (u64) feeds the delta matcher. For
+        // windows where Σ (len-i)·byte exceeds u32::MAX the strict variant
+        // used to wrap and disagree, so no block ever matched. See issue #44.
+        for &bs in &[512usize, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
+            let data: Vec<u8> = (0..bs).map(|i| (i * 31 % 251) as u8).collect();
+            assert_eq!(
+                RollingChecksum::new(&data).digest(),
+                FastRollingChecksum::new(&data).digest(),
+                "strict/fast weak-hash disagreement at block_size {bs}"
+            );
+        }
+    }
 
     #[test]
     fn new_empty_slice() {

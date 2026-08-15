@@ -428,6 +428,27 @@ mod tests {
     // ==========================================================================
 
     #[test]
+    fn identity_delta_uses_copy_ops_at_large_block_size() {
+        // Regression for issue #44: with block_size ≥ 16 KiB the signature's
+        // weak hashes disagreed with the delta matcher's rolling checksum,
+        // so even identical inputs produced an all-literal delta.
+        let data: Vec<u8> = (0..1usize << 20)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
+        let sync = SyncBuilder::new()
+            .block_size(65_536)
+            .strong_hash_len(32)
+            .build();
+        let sig = sync.signature(Cursor::new(&data)).unwrap();
+        let delta = sync.delta(Cursor::new(&data), &sig).unwrap();
+        assert_eq!(delta.bytes_literal(), 0, "identity input must not be literal");
+        assert!(
+            delta.bytes_matched() == data.len() as u64,
+            "identity input must be fully matched by copy ops"
+        );
+    }
+
+    #[test]
     fn builder_default() {
         let sync = SyncBuilder::new().build();
         assert_eq!(sync.block_size(), 2048);
