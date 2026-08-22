@@ -107,19 +107,59 @@ impl Report {
     /// other — and collapsing them would let "I could not look" be reported as
     /// "I looked and found a difference", which is a claim we did not earn.
     pub fn exit_code(&self) -> i32 {
-        if !self.unreadable.is_empty() {
-            EXIT_UNREADABLE
-        } else if !self.differs.is_empty() || !self.missing.is_empty() || !self.extra.is_empty() {
-            EXIT_DIFFERS
-        } else {
-            EXIT_IDENTICAL
-        }
+        exit_code_for(
+            self.differs.len(),
+            self.missing.len(),
+            self.extra.len(),
+            self.unreadable.len(),
+        )
     }
 
     /// True only when the source may safely be deleted.
     pub fn safe_to_delete_source(&self) -> bool {
-        self.exit_code() == EXIT_IDENTICAL && self.identical > 0
+        safe_to_delete_for(
+            self.identical,
+            self.differs.len(),
+            self.missing.len(),
+            self.extra.len(),
+            self.unreadable.len(),
+        )
     }
+}
+
+/// The exit-code decision, as a pure function of the counts.
+///
+/// Extracted from `Report` so it can be PROVED rather than sampled: `Report`
+/// carries `Vec`s, and a Kani harness that constructs one drags the allocator
+/// and `core::fmt` into the model — measured elsewhere in this fleet at 117
+/// minutes for a 216-case space. Over four `usize` counts the same property is
+/// exhaustive and instant.
+#[must_use]
+pub const fn exit_code_for(differs: usize, missing: usize, extra: usize, unreadable: usize) -> i32 {
+    if unreadable > 0 {
+        EXIT_UNREADABLE
+    } else if differs > 0 || missing > 0 || extra > 0 {
+        EXIT_DIFFERS
+    } else {
+        EXIT_IDENTICAL
+    }
+}
+
+/// Whether the source may be deleted, as a pure function of the counts.
+///
+/// `identical > 0` is not pedantry. Two empty trees produce all-zero counts and
+/// would otherwise authorise deleting a source on a comparison that examined
+/// nothing — a conclusion with no evidence under it, which is the same shape as
+/// a green test over an empty set.
+#[must_use]
+pub const fn safe_to_delete_for(
+    identical: usize,
+    differs: usize,
+    missing: usize,
+    extra: usize,
+    unreadable: usize,
+) -> bool {
+    identical > 0 && exit_code_for(differs, missing, extra, unreadable) == EXIT_IDENTICAL
 }
 
 /// One side's scan: fingerprints we got, and paths we could not read.
@@ -428,4 +468,61 @@ mod tests {
         assert_eq!(Outcome::Extra.token(), "extra");
         assert_eq!(Outcome::Unreadable.token(), "unreadable");
     }
+}
+
+// ── Kani: the decision that authorises destroying data ───────────────────
+//
+// These target `exit_code_for` / `safe_to_delete_for`, never `Report`. That is
+// the allocation-free boundary: `Report` carries `Vec`s, and modelling the
+// allocator to prove arithmetic over four counts buys nothing and costs hours.
+
+/// Any count, bounded so the model stays small. The properties below do not
+/// depend on magnitude — only on zero versus non-zero — so a bound of 3 covers
+/// every distinct case rather than sampling a large space.
+#[cfg(kani)]
+fn any_count() -> usize {
+    let n: usize = kani::any();
+    kani::assume(n <= 3);
+    n
+}
+
+/// A delete is NEVER authorised without positive evidence.
+///
+/// This is the safety property the whole command exists for. If it can be
+/// violated, copia can tell a caller to delete 755 GB on the strength of a
+/// comparison that found a difference, could not look, or examined nothing.
+#[cfg(kani)]
+#[kani::proof]
+fn verify_never_authorises_a_delete_without_positive_evidence() {
+    let (identical, differs, missing, extra, unreadable) = (
+        any_count(),
+        any_count(),
+        any_count(),
+        any_count(),
+        any_count(),
+    );
+    if safe_to_delete_for(identical, differs, missing, extra, unreadable) {
+        assert!(identical > 0, "authorised a delete having compared nothing");
+        assert!(differs == 0, "authorised a delete with known differences");
+        assert!(missing == 0, "authorised a delete with a missing path");
+        assert!(extra == 0, "authorised a delete with an unexpected path");
+        assert!(unreadable == 0, "authorised a delete over unreadable paths");
+    }
+}
+
+/// `unreadable` outranks `differs`, always.
+///
+/// Both refuse the delete, so collapsing them is tempting. They must not
+/// collapse: "I could not look" reported as "I looked and found a difference"
+/// is a claim about evidence we do not have.
+#[cfg(kani)]
+#[kani::proof]
+fn unreadable_is_never_reported_as_a_difference() {
+    let (differs, missing, extra, unreadable) =
+        (any_count(), any_count(), any_count(), any_count());
+    let code = exit_code_for(differs, missing, extra, unreadable);
+    if unreadable > 0 {
+        assert!(code == EXIT_UNREADABLE);
+    }
+    assert!(code == EXIT_IDENTICAL || code == EXIT_DIFFERS || code == EXIT_UNREADABLE);
 }

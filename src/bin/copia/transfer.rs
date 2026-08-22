@@ -14,7 +14,24 @@ pub fn discover_local_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::er
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() && !path.is_symlink() {
+            // ORDER MATTERS: a symlink is an ENTRY, never a door to walk
+            // through, so it is classified before is_dir/is_file — both of
+            // which FOLLOW links.
+            //
+            // The previous order lost data twice over. `is_file()` follows, so
+            // a symlink-to-file was copied as its target's bytes and the link
+            // was gone. Worse, a symlink-to-DIRECTORY matched `is_dir()` but
+            // was excluded by `!is_symlink()`, and then failed `is_file()` —
+            // so it was dropped from the walk entirely. Measured 2026-08-22:
+            // `copia sync -r` silently discarded `dirlink -> realdir`, and
+            // because `copia verify` shares this walk the path was absent from
+            // BOTH scans and the trees compared IDENTICAL. A verifier that
+            // authorises deleting a source reported success over data it had
+            // just lost.
+            if path.is_symlink() {
+                let rel = path.strip_prefix(root)?.to_path_buf();
+                files.push(rel);
+            } else if path.is_dir() {
                 dirs.push(path);
             } else if path.is_file() {
                 let rel = path.strip_prefix(root)?.to_path_buf();
@@ -25,6 +42,37 @@ pub fn discover_local_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::er
 
     files.sort();
     Ok(files)
+}
+
+/// Every directory under `root`, relative — INCLUDING ones that hold no files.
+///
+/// `collect_dirs` derives directories from file paths, so a directory with no
+/// files in it does not exist as far as the sync is concerned and is never
+/// created at the destination. rsync -a preserves it. Caught by the rsync
+/// differential harness on the `empty-dir` shape.
+///
+/// Structure is part of what an ARCHIVE is: a course tree whose empty chapter
+/// directories vanish on the way to the NAS has not been faithfully archived,
+/// even though every byte arrived.
+pub fn discover_local_dirs(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            // Never walk THROUGH a symlink: it is an entry, and following one
+            // can also loop forever.
+            if path.is_symlink() {
+                continue;
+            }
+            if path.is_dir() {
+                out.push(path.strip_prefix(root)?.to_path_buf());
+                stack.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Collect unique directory paths from a list of relative file paths.

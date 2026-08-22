@@ -289,7 +289,16 @@ async fn run_local(
         return Ok(());
     }
 
-    create_local_dirs(dst, &collect_dirs(&plan.transfer))?;
+    // Create EVERY directory in the source, not only the ones that happen to
+    // contain a file in this transfer. An empty directory is structure, and an
+    // archive that drops it has not faithfully copied the tree even though
+    // every byte arrived (infra rsync-differential, `empty-dir` shape).
+    // Falls back to the file-derived set if the source cannot be walked, so a
+    // discovery failure degrades to the previous behaviour rather than
+    // aborting a transfer that would otherwise succeed.
+    let all_dirs =
+        crate::transfer::discover_local_dirs(src).unwrap_or_else(|_| collect_dirs(&plan.transfer));
+    create_local_dirs(dst, &all_dirs)?;
     let semaphore = Arc::new(Semaphore::new(opts.jobs));
     let progress = TransferProgress::new(plan.transfer.len() as u64);
     let mut handles = Vec::with_capacity(plan.transfer.len());
@@ -326,8 +335,37 @@ async fn run_local(
     )
 }
 
-/// Atomic local copy: copy to a `.copia-tmp` sibling, rename, set mtime.
+/// Atomic local delivery: write a `.copia-tmp` sibling, rename, set mtime.
+///
+/// A SYMLINK is recreated as a symlink, never followed. `tokio::fs::copy`
+/// dereferences, so the previous version replaced `link -> target` with a second
+/// copy of the target's bytes — the link was gone and the tree silently grew.
+/// Paired with the walk fix in `transfer::discover_local_files`; either alone
+/// leaves `copia verify` disagreeing with what `copia sync` actually wrote.
 async fn deliver_local(src: &Path, dst: &Path, mtime: Option<i64>) -> Result<u64, String> {
+    if let Ok(md) = tokio::fs::symlink_metadata(src).await {
+        if md.file_type().is_symlink() {
+            let target = tokio::fs::read_link(src)
+                .await
+                .map_err(|e| format!("read_link {}: {e}", src.display()))?;
+            // Replace whatever is there. A stale regular file at this path is
+            // exactly what the old dereferencing behaviour left behind.
+            let _ = tokio::fs::remove_file(dst).await;
+            #[cfg(unix)]
+            tokio::fs::symlink(&target, dst)
+                .await
+                .map_err(|e| format!("symlink {}: {e}", dst.display()))?;
+            #[cfg(not(unix))]
+            return Err(format!(
+                "cannot recreate symlink {} on this platform",
+                dst.display()
+            ));
+            // mtime is deliberately NOT set: on Linux `utimes` follows the link
+            // and would stamp the TARGET, mutating a file we were only asked to
+            // link to. rsync needs -h/--no-dereference for the same reason.
+            return Ok(0);
+        }
+    }
     let tmp = tmp_path(dst);
     let size = tokio::fs::copy(src, &tmp)
         .await
