@@ -14,7 +14,24 @@ pub fn discover_local_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::er
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() && !path.is_symlink() {
+            // ORDER MATTERS: a symlink is an ENTRY, never a door to walk
+            // through, so it is classified before is_dir/is_file — both of
+            // which FOLLOW links.
+            //
+            // The previous order lost data twice over. `is_file()` follows, so
+            // a symlink-to-file was copied as its target's bytes and the link
+            // was gone. Worse, a symlink-to-DIRECTORY matched `is_dir()` but
+            // was excluded by `!is_symlink()`, and then failed `is_file()` —
+            // so it was dropped from the walk entirely. Measured 2026-08-22:
+            // `copia sync -r` silently discarded `dirlink -> realdir`, and
+            // because `copia verify` shares this walk the path was absent from
+            // BOTH scans and the trees compared IDENTICAL. A verifier that
+            // authorises deleting a source reported success over data it had
+            // just lost.
+            if path.is_symlink() {
+                let rel = path.strip_prefix(root)?.to_path_buf();
+                files.push(rel);
+            } else if path.is_dir() {
                 dirs.push(path);
             } else if path.is_file() {
                 let rel = path.strip_prefix(root)?.to_path_buf();
@@ -25,6 +42,37 @@ pub fn discover_local_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::er
 
     files.sort();
     Ok(files)
+}
+
+/// Every directory under `root`, relative — INCLUDING ones that hold no files.
+///
+/// `collect_dirs` derives directories from file paths, so a directory with no
+/// files in it does not exist as far as the sync is concerned and is never
+/// created at the destination. rsync -a preserves it. Caught by the rsync
+/// differential harness on the `empty-dir` shape.
+///
+/// Structure is part of what an ARCHIVE is: a course tree whose empty chapter
+/// directories vanish on the way to the NAS has not been faithfully archived,
+/// even though every byte arrived.
+pub fn discover_local_dirs(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            // Never walk THROUGH a symlink: it is an entry, and following one
+            // can also loop forever.
+            if path.is_symlink() {
+                continue;
+            }
+            if path.is_dir() {
+                out.push(path.strip_prefix(root)?.to_path_buf());
+                stack.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Collect unique directory paths from a list of relative file paths.
@@ -235,6 +283,76 @@ mod transfer_tests {
         assert_eq!(transfer_speed(2000, Duration::from_secs(2)), 1000);
         // zero elapsed must not divide-by-zero
         assert_eq!(transfer_speed(1000, Duration::from_secs(0)), 0);
+    }
+
+    #[test]
+    fn discover_local_dirs_finds_directories_with_no_files() {
+        let tmp = std::env::temp_dir().join(format!("copia-dld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("a/b/c")).unwrap();
+        std::fs::create_dir_all(tmp.join("hollow")).unwrap();
+        std::fs::write(tmp.join("a/f.txt"), b"x").unwrap();
+
+        let dirs = discover_local_dirs(&tmp).unwrap();
+        // `hollow` holds no files, so collect_dirs cannot see it at all — that
+        // is the empty-directory loss this function exists to prevent.
+        assert!(
+            dirs.contains(&PathBuf::from("hollow")),
+            "an empty directory was not discovered: {dirs:?}"
+        );
+        assert!(dirs.contains(&PathBuf::from("a/b/c")), "{dirs:?}");
+        assert!(
+            !collect_dirs(&[PathBuf::from("a/f.txt")]).contains(&PathBuf::from("hollow")),
+            "fixture is wrong: collect_dirs must NOT find the empty dir, or this \
+             test is not measuring the difference"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discover_local_dirs_does_not_walk_through_a_symlink() {
+        let tmp = std::env::temp_dir().join(format!("copia-dld2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("real/inner")).unwrap();
+        std::os::unix::fs::symlink("real", tmp.join("link")).unwrap();
+
+        let dirs = discover_local_dirs(&tmp).unwrap();
+        assert!(dirs.contains(&PathBuf::from("real")), "{dirs:?}");
+        assert!(
+            !dirs.iter().any(|d| d.starts_with("link")),
+            "walked THROUGH a symlink — that duplicates the tree and can loop \
+             forever on a cycle: {dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_walk_surfaces_symlinks_instead_of_following_or_dropping_them() {
+        let tmp = std::env::temp_dir().join(format!("copia-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("realdir")).unwrap();
+        std::fs::write(tmp.join("realdir/inside.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink("realdir", tmp.join("dirlink")).unwrap();
+        std::os::unix::fs::symlink("nowhere", tmp.join("dangling")).unwrap();
+
+        let files = discover_local_files(&tmp).unwrap();
+        // Both were invisible before: a symlinked DIRECTORY matched is_dir() but
+        // was excluded by !is_symlink() and then failed is_file(), so it left the
+        // walk entirely — and `copia verify` shares this walk, so the trees
+        // compared IDENTICAL over the loss.
+        assert!(files.contains(&PathBuf::from("dirlink")), "{files:?}");
+        assert!(files.contains(&PathBuf::from("dangling")), "{files:?}");
+        assert!(
+            files.contains(&PathBuf::from("realdir/inside.txt")),
+            "{files:?}"
+        );
+        assert!(
+            !files.contains(&PathBuf::from("dirlink/inside.txt")),
+            "followed the symlink and duplicated its contents: {files:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

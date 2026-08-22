@@ -1,0 +1,179 @@
+metadata:
+  id: C-COPIA-VERIFY-BEFORE-DELETE
+  version: "1.0.0"
+  created: "2026-08-22"
+  author: "PAIML Engineering"
+  kind: pattern
+  status: ACTIVE
+  description: |
+    Pins `copia verify` — the pass that authorises destroying data. copia is the
+    Sovereign AI Stack's rsync replacement; until this it was that for TRANSFER and
+    not for ARCHIVAL, so the one operation where being wrong destroys data (move a
+    tree, then delete the original) was still delegated to rsync. forjar's
+    nas_archive moves 755 GB to the NAS and deletes the source.
+
+    The contract is narrow and absolute: a deletion is authorised ONLY by positive
+    evidence — every path compared by CONTENT, nothing unreadable, nothing missing,
+    nothing extra, and at least one path actually examined. "I could not look" is
+    never reported as "I looked and found nothing wrong", and never as "I looked and
+    found a difference" either; it is its own outcome with its own exit code.
+  references:
+    - "verify::compare — the read-only content comparison over both trees"
+    - "verify::exit_code_for / safe_to_delete_for — the pure decision, Kani-proved"
+    - "verify::scan — records unreadable paths instead of dropping them"
+    - "meta::fingerprint_path — streaming blake3; a symlink hashes its target string"
+    - "transfer::discover_local_files — the shared walk; symlinks are entries, not doors"
+    - "tests/rsync_differential.rs — rsync as the oracle for the behaviour being replaced"
+
+equations:
+  content_oracle:
+    formula: "identical(p) <=> blake3(a[p]) == blake3(b[p]) AND ftype(a[p]) == ftype(b[p])"
+    domain: "p in relpaths(src) union relpaths(dest)"
+    invariants:
+      - "size and mtime never appear in a verify decision"
+      - "a file<->symlink type flip is a difference even if the hashed bytes coincide"
+      - "a symlink is compared by its TARGET STRING, never by following it"
+  positive_evidence_delete:
+    formula: "safe_to_delete <=> identical > 0 AND differs = missing = extra = unreadable = 0"
+    domain: "the five counts of one comparison"
+    invariants:
+      - "identical > 0 is required: two empty trees examine nothing and must not authorise a delete"
+      - "no single non-zero failure count can be overridden by a large identical count"
+  unreadable_is_not_a_verdict:
+    formula: "unreadable > 0 => exit = 2, and exit 2 != exit 1"
+    domain: "any comparison where a path could not be read on either side"
+    invariants:
+      - "an unreadable path is never counted identical"
+      - "an unreadable path is never reported as a difference"
+      - "the scan RECORDS read failures; it never drops them the way discover_local_fingerprints does"
+  read_only:
+    formula: "fingerprints(src, dest) before verify == fingerprints(src, dest) after verify"
+    domain: "any pair of trees"
+    invariants:
+      - "verify holds no write handle to either tree"
+      - "a symlink is never followed for writing, and its target is never stamped"
+  rsync_equivalence:
+    formula: "copia_verify_identical(a,b) <=> rsync -a --checksum --dry-run --itemize-changes produces no output"
+    domain: "the fixture shapes in tests/rsync_differential.rs"
+    invariants:
+      - "agreement is required in BOTH directions; a verifier that always says identical satisfies only one"
+      - "copia sync -r must produce the same tree as rsync -a: structure, content, symlink-ness and link targets"
+
+proof_obligations:
+  - type: safety
+    property: "No delete without positive evidence"
+    formal: "safe_to_delete_for(i,d,m,e,u) => i>0 AND d=0 AND m=0 AND e=0 AND u=0"
+    applies_to: positive_evidence_delete
+    kani:
+      harness: verify_never_authorises_a_delete_without_positive_evidence
+      status: proved
+  - type: safety
+    property: "Unreadable outranks differs and is total"
+    formal: "u>0 => exit=2; and exit in {0,1,2} always"
+    applies_to: unreadable_is_not_a_verdict
+    kani:
+      harness: unreadable_is_never_reported_as_a_difference
+      status: proved
+  - type: safety
+    property: "Verify mutates neither tree"
+    formal: "fingerprints before == fingerprints after"
+    applies_to: read_only
+    test: "verify::tests::verify_read_only_never_writes"
+  - type: soundness
+    property: "Content, not size+mtime"
+    formal: "equal size AND equal mtime AND differing bytes => differs"
+    applies_to: content_oracle
+    test: "verify::tests::same_size_same_mtime_different_bytes_is_caught"
+  - type: equivalence
+    property: "copia agrees with the tool it replaces"
+    formal: "for every fixture shape, copia_sync == rsync -a AND copia_verify == rsync --checksum"
+    applies_to: rsync_equivalence
+    test: "tests/rsync_differential.rs"
+
+verification_summary:
+  total_obligations: 5
+  l2_property_tested: 5
+  l3_kani_proved: 2
+  l4_lean_proved: 0
+  l4_sorry_count: 0
+  l4_not_applicable: 3
+  notes: |
+    The two Kani harnesses target `exit_code_for` / `safe_to_delete_for`, never
+    `Report`. That is the allocation-free boundary: `Report` carries Vecs, and a
+    harness constructing one drags the allocator and core::fmt into the model —
+    measured elsewhere in this fleet at 117 minutes for a 216-case space. Over
+    four bounded counts the same property is exhaustive and instant.
+
+    The three obligations without a Kani harness are properties of the
+    FILESYSTEM, not of a decision function: whether a run wrote anything, whether
+    blake3 distinguishes equal-size files, and whether copia matches rsync. A
+    bounded model cannot say anything useful about any of them, so they are
+    proved by EXECUTION and the contract says so rather than claiming a proof
+    that does not exist.
+
+falsification_tests:
+  - id: FALSIFY-VERIFY-001
+    rule: "No delete without positive evidence"
+    prediction: "Weakening safe_to_delete_for to ignore `unreadable` makes the Kani harness FAIL"
+    test: "kani verify_never_authorises_a_delete_without_positive_evidence"
+    if_fails: "copia authorises deleting 755 GB over paths it could not read"
+    verified: "2026-08-22 — injected the weakening; VERIFICATION:- FAILED with `authorised a delete over unreadable paths`"
+  - id: FALSIFY-VERIFY-002
+    rule: "Content, not size+mtime"
+    prediction: "One byte changed at equal size with mtime forced equal is reported as differs, exit 1"
+    test: "verify::tests::same_size_same_mtime_different_bytes_is_caught"
+    if_fails: "a truncated or corrupted file passes verification and its source is deleted"
+  - id: FALSIFY-VERIFY-003
+    rule: "Verify mutates neither tree"
+    prediction: "Fingerprints of both trees are unchanged across a full run"
+    test: "verify::tests::verify_read_only_never_writes"
+    if_fails: "the verifier alters the evidence it is judging"
+  - id: FALSIFY-VERIFY-004
+    rule: "An empty comparison proves nothing"
+    prediction: "Two empty trees are NOT safe_to_delete_source despite zero failures"
+    test: "verify::tests::two_empty_trees_are_not_safe_to_delete"
+    if_fails: "a comparison that examined nothing authorises a deletion"
+  - id: FALSIFY-VERIFY-005
+    rule: "copia agrees with rsync"
+    prediction: "Removing the symlink handling makes copia_sync_matches_rsync_on_every_shape FAIL"
+    test: "tests/rsync_differential.rs::copia_sync_matches_rsync_on_every_shape"
+    if_fails: "copia silently loses symlinks, empty directories or dangling links, and verify — sharing the same walk — reports the trees IDENTICAL over the loss"
+    verified: "2026-08-22 — the harness caught exactly this on first run: symlink-to-dir dropped, dangling symlink dropped, empty dir dropped"
+  - id: FALSIFY-VERIFY-006
+    rule: "The oracle must exist"
+    prediction: "With rsync absent, the differential suite FAILS rather than passing vacuously"
+    test: "tests/rsync_differential.rs::the_oracle_is_present"
+    if_fails: "every differential case compares copia against nothing and reports PASS"
+
+kani_harnesses:
+  - id: verify-kani-001
+    obligation: "No delete without positive evidence"
+    harness: verify::verify_never_authorises_a_delete_without_positive_evidence
+    bound: 3
+    strategy: bounded_int
+    status: PROVED
+    notes: "cargo kani --features cli — SUCCESSFUL. Bound 3 covers every distinct case; the property depends on zero vs non-zero, not magnitude."
+  - id: verify-kani-002
+    obligation: "Unreadable outranks differs and the code set is total"
+    harness: verify::unreadable_is_never_reported_as_a_difference
+    bound: 3
+    strategy: bounded_int
+    status: PROVED
+    notes: "cargo kani --features cli — SUCCESSFUL."
+
+qa_gate:
+  id: F-VERIFY-001
+  name: Verify-Before-Delete Contract
+  description: |
+    copia verify authorises a deletion only on positive, content-based evidence,
+    never mutates what it inspects, and agrees with the tool it replaces.
+  checks:
+    - content_oracle
+    - positive_evidence_delete
+    - unreadable_is_not_a_verdict
+    - read_only
+    - rsync_equivalence
+  pass_criteria: |
+    All 6 FALSIFY-VERIFY tests pass (L2); both verify Kani harnesses report
+    VERIFICATION:- SUCCESSFUL (L3); the rsync differential harness passes on every
+    fixture shape with rsync PRESENT — an absent oracle is a FAIL, not a skip.

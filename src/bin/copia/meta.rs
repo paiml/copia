@@ -53,7 +53,13 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 pub fn discover_local_with_meta(root: &Path) -> Result<MetaMap, Box<dyn std::error::Error>> {
     let mut out = MetaMap::new();
     for rel in discover_local_files(root)? {
-        if let Ok(meta) = std::fs::metadata(root.join(&rel)) {
+        // symlink_metadata, not metadata: `metadata` FOLLOWS the link, so a
+        // DANGLING symlink errors and the `if let Ok` silently drops it from
+        // the plan — copia then omits a path rsync -a faithfully recreates.
+        // Caught by the rsync differential harness on the `dangling-symlink`
+        // shape. A symlink's own size/mtime is the right quick-check value
+        // anyway; `deliver_local` recreates it as a link regardless.
+        if let Ok(meta) = std::fs::symlink_metadata(root.join(&rel)) {
             out.insert(
                 rel,
                 FileMeta {

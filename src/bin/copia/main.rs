@@ -57,6 +57,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Prove two local trees are byte-identical, changing nothing
+    ///
+    /// Exit codes are a contract, because a caller deletes 755 GB on them:
+    ///   0 identical (safe to delete the source) · 1 differences found
+    ///   2 could not compare — NOT the same as 1 · 3 error before comparing
+    Verify {
+        /// Source tree
+        #[arg(required = true)]
+        source: PathBuf,
+
+        /// Destination tree, the one about to justify a deletion
+        #[arg(required = true)]
+        dest: PathBuf,
+
+        /// Suppress the per-path lines; the summary and exit code remain
+        #[arg(short, long)]
+        quiet: bool,
+    },
+
     /// Synchronize source to destination (supports host:path for SSH)
     Sync {
         /// Source path (local path or host:path for SSH)
@@ -228,6 +247,17 @@ async fn main() -> ExitCode {
 #[instrument(skip(cli))]
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
+        Commands::Verify {
+            source,
+            dest,
+            quiet,
+        } => {
+            // The exit code IS the result. Returning it through the normal Ok
+            // path would collapse 1 and 2 into "success", which is the
+            // distinction the whole command exists to preserve.
+            std::process::exit(verify::verify(&source, &dest, quiet));
+        }
+
         Commands::Sync {
             source,
             dest,
@@ -291,6 +321,7 @@ mod reconcile;
 mod serve;
 mod single_sync;
 mod transfer;
+mod verify;
 mod wire;
 use incremental::{run_sync_recursive, SyncOptions};
 use single_sync::run_sync;

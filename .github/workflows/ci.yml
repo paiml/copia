@@ -58,7 +58,17 @@ jobs:
       - name: Validate provable contracts (schema)
         run: |
           if command -v pv >/dev/null 2>&1; then
-            for c in contracts/*.yaml; do pv validate "$c"; done
+            # `contracts/binding.yaml` is a BINDINGS MANIFEST, not a contract:
+            # it maps each contract equation to the function implementing it and
+            # is consumed by `pv proof-status --binding`. Its schema has no
+            # `metadata` block and `pv validate` rightly rejects it. The loop was
+            # written before that file existed and this step only runs when `pv`
+            # is on the runner, so the mismatch stayed invisible until a runner
+            # had it — the last green ci.yml on main predates the file entirely.
+            for c in contracts/*.yaml; do
+              [ "$(basename "$c")" = "binding.yaml" ] && continue
+              pv validate "$c"
+            done
           else
             echo "pv unavailable on this runner — schema validation is covered by the nightly + local \`make contracts\`; falsification #[test]s still gate in ci/test"
           fi
