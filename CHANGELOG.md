@@ -6,6 +6,72 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-08-22
+
+Archival becomes sovereign. copia was the rsync replacement for **transfer** and
+not for **archival** — so the one operation where being wrong destroys data
+(move a tree, then delete the original) was still delegated to rsync. It no
+longer is.
+
+### Added
+
+- **`copia verify <src> <dest>`** — proves two trees are byte-identical without
+  touching either. Compares by CONTENT, never size+mtime. Exit codes are a
+  contract, because a caller deletes on them: `0` identical (safe to delete the
+  source), `1` differences found, `2` **could not compare**, `3` error before
+  comparing.
+
+  `2` is deliberately distinct from `1`. Both refuse the delete, but collapsing
+  them would report "I could not look" as "I looked and found a difference" —
+  a claim about evidence that does not exist. An unreadable path is never
+  counted identical and never reported as a difference.
+
+  Two empty trees are **not** safe to delete: a comparison that examined nothing
+  authorises nothing.
+
+- **`tests/rsync_differential.rs`** — eight fixture shapes run through BOTH
+  `rsync -a` and `copia sync -r`, with rsync as the oracle for the behaviour
+  copia claims to replace. `copia verify` must also agree with
+  `rsync -a --checksum --dry-run --itemize-changes`, in both directions.
+  `the_oracle_is_present` FAILS rather than skips: an absent oracle makes every
+  differential case vacuous.
+
+- **`contracts/verify-before-delete-v1.yaml`** — five equations, six
+  falsification tests, two Kani harnesses (both proved), plus bindings so a
+  renamed function drops the contract below L5 instead of leaving a citation
+  pointing at nothing.
+
+### Fixed
+
+Three data-loss defects, all found by the differential harness on its first run.
+
+- **A symlink to a directory was silently dropped.** `discover_local_files`
+  pushed onto the directory stack only when `is_dir() && !is_symlink()`, and
+  such a path then failed `is_file()` too — so it was in neither list and left
+  the walk entirely.
+
+  Because `copia verify` shares that walk, the path was absent from **both**
+  scans, so the trees compared IDENTICAL and copia reported *safe to delete the
+  source* over data it had just destroyed. Symlinks are now classified BEFORE
+  `is_dir`/`is_file`, both of which follow links.
+
+- **Dangling symlinks were dropped.** `discover_local_with_meta` used
+  `fs::metadata`, which follows the link, so a dangling one errored and was
+  discarded by `if let Ok(..)`. Now `symlink_metadata`.
+
+- **Empty directories were dropped.** Destination directories were derived from
+  file paths, so a directory containing no files did not exist as far as the
+  sync was concerned. Structure is part of what an archive is.
+
+- `deliver_local` recreates a symlink as a symlink rather than dereferencing it,
+  and deliberately does not stamp its mtime — `utimes` follows the link and
+  would modify the target.
+
+### Changed
+
+- CI validates `contracts/*.yaml` excluding `binding.yaml`, which is a bindings
+  manifest with a different schema and was never a contract.
+
 ## [0.2.0] - 2026-07-04
 
 Copia grows from a single-file rsync delta engine into a three-layer
