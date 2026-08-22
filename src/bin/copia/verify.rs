@@ -460,6 +460,101 @@ mod tests {
         fs::remove_dir_all(&t).ok();
     }
 
+    /// The non-quiet path prints one line per non-identical path. Untested
+    /// until now, which meant the ONLY output an operator actually reads was
+    /// the part with no test behind it.
+    #[test]
+    fn the_per_path_report_is_emitted_and_the_verdict_refuses() {
+        let t = tmp();
+        let (a, b) = (t.join("a"), t.join("b"));
+        write(&a, "gone", b"1");
+        write(&a, "changed", b"one");
+        write(&b, "changed", b"two");
+        write(&b, "unexpected", b"3");
+
+        let rep = compare(&a, &b).unwrap();
+        assert_eq!(rep.missing, vec![PathBuf::from("gone")]);
+        assert_eq!(rep.differs, vec![PathBuf::from("changed")]);
+        assert_eq!(rep.extra, vec![PathBuf::from("unexpected")]);
+        assert!(!rep.safe_to_delete_source());
+
+        // The printing path itself must not panic and must not change the code.
+        assert_eq!(verify(&a, &b, false), EXIT_DIFFERS);
+        fs::remove_dir_all(&t).ok();
+    }
+
+    /// A path present only at the DESTINATION is not harmless. It means the
+    /// destination is not a faithful copy, and a caller about to delete the
+    /// source is entitled to know before it does.
+    #[test]
+    fn an_extra_file_at_the_destination_refuses_the_delete() {
+        let t = tmp();
+        let (a, b) = (t.join("a"), t.join("b"));
+        write(&a, "shared", b"x");
+        write(&b, "shared", b"x");
+        write(&b, "stowaway", b"y");
+        let rep = compare(&a, &b).unwrap();
+        assert_eq!(rep.exit_code(), EXIT_DIFFERS);
+        assert_eq!(rep.extra, vec![PathBuf::from("stowaway")]);
+        assert!(!rep.safe_to_delete_source());
+        fs::remove_dir_all(&t).ok();
+    }
+
+    /// A source that cannot be walked is an ERROR, distinct from every verdict.
+    /// Returning 1 here would tell a caller "I compared them and they differ",
+    /// which is a claim about a comparison that never happened.
+    #[test]
+    fn an_unwalkable_source_is_exit_3_not_a_verdict() {
+        let t = tmp();
+        let missing = t.join("does-not-exist");
+        let dest = t.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        assert_eq!(verify(&missing, &dest, true), EXIT_ERROR);
+        fs::remove_dir_all(&t).ok();
+    }
+
+    /// A file replaced by a symlink whose target string happens to hash to the
+    /// same bytes must still be a difference. Type is part of identity.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_to_symlink_flip_is_a_difference() {
+        let t = tmp();
+        let (a, b) = (t.join("a"), t.join("b"));
+        write(&a, "thing", b"target.txt");
+        write(&a, "target.txt", b"payload");
+        write(&b, "target.txt", b"payload");
+        std::os::unix::fs::symlink("target.txt", b.join("thing")).unwrap();
+
+        let rep = compare(&a, &b).unwrap();
+        assert_eq!(
+            rep.differs,
+            vec![PathBuf::from("thing")],
+            "a regular file and a symlink are different entries even when the \
+             hashed bytes coincide"
+        );
+        fs::remove_dir_all(&t).ok();
+    }
+
+    /// The pure decision, exercised over the whole shape space the Kani harness
+    /// proves. Kani proves it holds; this pins the exact codes so a renumbering
+    /// is a test failure and not a silent contract change.
+    #[test]
+    fn the_pure_decision_matches_the_published_codes() {
+        assert_eq!(exit_code_for(0, 0, 0, 0), EXIT_IDENTICAL);
+        assert_eq!(exit_code_for(1, 0, 0, 0), EXIT_DIFFERS);
+        assert_eq!(exit_code_for(0, 1, 0, 0), EXIT_DIFFERS);
+        assert_eq!(exit_code_for(0, 0, 1, 0), EXIT_DIFFERS);
+        assert_eq!(exit_code_for(0, 0, 0, 1), EXIT_UNREADABLE);
+        // unreadable outranks every other failure, together or alone
+        assert_eq!(exit_code_for(9, 9, 9, 1), EXIT_UNREADABLE);
+        assert!(safe_to_delete_for(1, 0, 0, 0, 0));
+        assert!(!safe_to_delete_for(0, 0, 0, 0, 0), "examined nothing");
+        assert!(
+            !safe_to_delete_for(99, 0, 0, 0, 1),
+            "one unreadable path is enough"
+        );
+    }
+
     #[test]
     fn outcome_tokens_are_stable() {
         assert_eq!(Outcome::Identical.token(), "identical");

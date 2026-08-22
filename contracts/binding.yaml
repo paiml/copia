@@ -100,3 +100,35 @@ bindings:
     function: handle_put
     signature: 'fn handle_put<R, W>(...) -> std::io::Result<()>'
     status: implemented
+
+  # ── verify-before-delete-v1 ──
+  - contract: verify-before-delete-v1.yaml
+    equation: content_oracle
+    module_path: copia::verify
+    function: compare
+    signature: 'fn compare(src: &Path, dest: &Path) -> Result<Report, Box<dyn std::error::Error>>'
+    status: implemented
+  - contract: verify-before-delete-v1.yaml
+    equation: positive_evidence_delete
+    module_path: copia::verify
+    function: safe_to_delete_for
+    signature: 'const fn safe_to_delete_for(identical: usize, differs: usize, missing: usize, extra: usize, unreadable: usize) -> bool'
+    status: implemented
+  - contract: verify-before-delete-v1.yaml
+    equation: unreadable_is_not_a_verdict
+    module_path: copia::verify
+    function: exit_code_for
+    signature: 'const fn exit_code_for(differs: usize, missing: usize, extra: usize, unreadable: usize) -> i32'
+    status: implemented
+  - contract: verify-before-delete-v1.yaml
+    equation: read_only
+    module_path: copia::verify
+    function: scan
+    signature: 'fn scan(root: &Path) -> Result<Scan, Box<dyn std::error::Error>>'
+    status: implemented
+  - contract: verify-before-delete-v1.yaml
+    equation: rsync_equivalence
+    module_path: copia::transfer
+    function: discover_local_dirs
+    signature: 'fn discover_local_dirs(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>>'
+    status: implemented

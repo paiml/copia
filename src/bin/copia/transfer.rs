@@ -286,6 +286,76 @@ mod transfer_tests {
     }
 
     #[test]
+    fn discover_local_dirs_finds_directories_with_no_files() {
+        let tmp = std::env::temp_dir().join(format!("copia-dld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("a/b/c")).unwrap();
+        std::fs::create_dir_all(tmp.join("hollow")).unwrap();
+        std::fs::write(tmp.join("a/f.txt"), b"x").unwrap();
+
+        let dirs = discover_local_dirs(&tmp).unwrap();
+        // `hollow` holds no files, so collect_dirs cannot see it at all — that
+        // is the empty-directory loss this function exists to prevent.
+        assert!(
+            dirs.contains(&PathBuf::from("hollow")),
+            "an empty directory was not discovered: {dirs:?}"
+        );
+        assert!(dirs.contains(&PathBuf::from("a/b/c")), "{dirs:?}");
+        assert!(
+            !collect_dirs(&[PathBuf::from("a/f.txt")]).contains(&PathBuf::from("hollow")),
+            "fixture is wrong: collect_dirs must NOT find the empty dir, or this \
+             test is not measuring the difference"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discover_local_dirs_does_not_walk_through_a_symlink() {
+        let tmp = std::env::temp_dir().join(format!("copia-dld2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("real/inner")).unwrap();
+        std::os::unix::fs::symlink("real", tmp.join("link")).unwrap();
+
+        let dirs = discover_local_dirs(&tmp).unwrap();
+        assert!(dirs.contains(&PathBuf::from("real")), "{dirs:?}");
+        assert!(
+            !dirs.iter().any(|d| d.starts_with("link")),
+            "walked THROUGH a symlink — that duplicates the tree and can loop \
+             forever on a cycle: {dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_walk_surfaces_symlinks_instead_of_following_or_dropping_them() {
+        let tmp = std::env::temp_dir().join(format!("copia-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("realdir")).unwrap();
+        std::fs::write(tmp.join("realdir/inside.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink("realdir", tmp.join("dirlink")).unwrap();
+        std::os::unix::fs::symlink("nowhere", tmp.join("dangling")).unwrap();
+
+        let files = discover_local_files(&tmp).unwrap();
+        // Both were invisible before: a symlinked DIRECTORY matched is_dir() but
+        // was excluded by !is_symlink() and then failed is_file(), so it left the
+        // walk entirely — and `copia verify` shares this walk, so the trees
+        // compared IDENTICAL over the loss.
+        assert!(files.contains(&PathBuf::from("dirlink")), "{files:?}");
+        assert!(files.contains(&PathBuf::from("dangling")), "{files:?}");
+        assert!(
+            files.contains(&PathBuf::from("realdir/inside.txt")),
+            "{files:?}"
+        );
+        assert!(
+            !files.contains(&PathBuf::from("dirlink/inside.txt")),
+            "followed the symlink and duplicated its contents: {files:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn collect_dirs_builds_unique_sorted_parent_set() {
         let files = vec![
             PathBuf::from("a.txt"),

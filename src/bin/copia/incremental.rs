@@ -384,6 +384,67 @@ async fn deliver_local(src: &Path, dst: &Path, mtime: Option<i64>) -> Result<u64
 mod tests {
     use super::*;
 
+    /// `deliver_local` must recreate a symlink, not copy what it points at.
+    ///
+    /// `tokio::fs::copy` dereferences, so the previous version replaced
+    /// `link -> target` with a second copy of the target's bytes: the link was
+    /// gone and the tree silently grew. Caught by the rsync differential
+    /// harness; pinned here so it cannot regress without a unit failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deliver_local_recreates_a_symlink_rather_than_following_it() {
+        let base = std::env::temp_dir().join(format!("copia-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("target.txt");
+        std::fs::write(&target, b"payload").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink("target.txt", &link).unwrap();
+        let dst = base.join("delivered");
+
+        deliver_local(&link, &dst, Some(1_000_000)).await.unwrap();
+
+        let md = std::fs::symlink_metadata(&dst).unwrap();
+        assert!(
+            md.file_type().is_symlink(),
+            "delivered a regular file where the source was a symlink"
+        );
+        assert_eq!(
+            std::fs::read_link(&dst).unwrap(),
+            std::path::PathBuf::from("target.txt")
+        );
+
+        // The TARGET must be untouched. `utimes` follows a link, so stamping the
+        // delivered path would have mutated a file we were only asked to link to.
+        let tmeta = std::fs::metadata(&target).unwrap();
+        assert_eq!(tmeta.len(), 7, "the link's target was rewritten");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Delivering over an existing regular file must leave a link, not fail.
+    /// That is exactly the state the old dereferencing behaviour left behind,
+    /// so the first corrected run has to be able to repair it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deliver_local_replaces_a_stale_regular_file_with_the_link() {
+        let base = std::env::temp_dir().join(format!("copia-dl2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("t.txt"), b"x").unwrap();
+        let link = base.join("l");
+        std::os::unix::fs::symlink("t.txt", &link).unwrap();
+        let dst = base.join("stale");
+        std::fs::write(&dst, b"left over from the dereferencing bug").unwrap();
+
+        deliver_local(&link, &dst, None).await.unwrap();
+
+        assert!(std::fs::symlink_metadata(&dst)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn tmp_path_appends_suffix_without_colliding() {
         assert_eq!(
