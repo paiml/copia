@@ -555,6 +555,41 @@ mod tests {
         );
     }
 
+    /// A FIFO replaced by a regular file is a DIFFERENCE, not agreement.
+    ///
+    /// This is the integrity property the `Other` fingerprint kind exists for.
+    /// Before it, neither entry was in the walk at all, so the comparison saw
+    /// nothing on either side and reported identical — the shape that made
+    /// `copia verify` certify a lost FIFO as safe to delete.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_kind_swap_is_a_difference() {
+        let t = tmp();
+        let (a, b) = (t.join("a"), t.join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(a.join("thing"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            fs::remove_dir_all(&t).ok();
+            return;
+        }
+        // Same NAME, different KIND.
+        write(&b, "thing", b"i am a regular file");
+
+        let rep = compare(&a, &b).unwrap();
+        assert_eq!(
+            rep.differs,
+            vec![PathBuf::from("thing")],
+            "a FIFO and a regular file at the same path must not compare equal"
+        );
+        assert!(!rep.safe_to_delete_source());
+        fs::remove_dir_all(&t).ok();
+    }
+
     #[test]
     fn outcome_tokens_are_stable() {
         assert_eq!(Outcome::Identical.token(), "identical");

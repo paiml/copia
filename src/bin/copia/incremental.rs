@@ -344,6 +344,27 @@ async fn run_local(
 /// leaves `copia verify` disagreeing with what `copia sync` actually wrote.
 async fn deliver_local(src: &Path, dst: &Path, mtime: Option<i64>) -> Result<u64, String> {
     if let Ok(md) = tokio::fs::symlink_metadata(src).await {
+        let ft = md.file_type();
+        // REFUSE what cannot be copied, LOUDLY. Never open it.
+        //
+        // Making the walk record every entry kind — so `verify` can SEE a
+        // FIFO instead of silently agreeing it is absent — means this
+        // function now receives paths it must not read. `tokio::fs::copy`
+        // on a FIFO BLOCKS until a writer appears. Measured: it hung a sync
+        // for ten minutes until the process was killed. A hang is not better
+        // than a silent drop; it is the same failure with worse manners.
+        //
+        // So the entry stays VISIBLE to the walk and this transfer FAILS with
+        // a named reason, counted in the run summary — which leaves `verify`
+        // reporting the destination as `missing`, the correct refusal.
+        if !ft.is_symlink() && !ft.is_file() {
+            return Err(format!(
+                "{}: copia cannot carry this entry kind (fifo/socket/device); it is \
+                 recorded, not skipped, so verify refuses to certify a destination \
+                 without it",
+                src.display()
+            ));
+        }
         if md.file_type().is_symlink() {
             let target = tokio::fs::read_link(src)
                 .await
@@ -383,6 +404,66 @@ async fn deliver_local(src: &Path, dst: &Path, mtime: Option<i64>) -> Result<u64
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A FIFO must be REFUSED with a named reason — never opened, never hung on.
+    ///
+    /// Making the walk record every entry kind means this function now receives
+    /// paths it must not read. `tokio::fs::copy` on a FIFO blocks until a writer
+    /// appears; measured, it hung a real sync for ten minutes. The timeout below
+    /// is the assertion: without it a regression hangs the suite instead of
+    /// failing it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deliver_local_refuses_a_fifo_instead_of_blocking_on_it() {
+        let base = std::env::temp_dir().join(format!(
+            "copia-dl-fifo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let fifo = base.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let dst = base.join("delivered");
+
+        // A thread + channel rather than tokio::time::timeout: this crate does
+        // not enable tokio's `time` feature, and adding a feature for one test
+        // assertion is a worse trade than four lines here.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (f, d) = (fifo, dst.clone());
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let _ = tx.send(rt.block_on(deliver_local(&f, &d, None)));
+        });
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deliver_local BLOCKED on a FIFO — it must refuse, not read");
+
+        let err = res.expect_err("a FIFO must not deliver successfully");
+        assert!(
+            err.contains("cannot carry this entry kind"),
+            "the refusal must NAME why, so an operator knows the entry was seen \
+             and declined rather than lost: {err}"
+        );
+        assert!(
+            !dst.exists(),
+            "a refused entry must leave nothing behind at the destination"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// `deliver_local` must recreate a symlink, not copy what it points at.
     ///

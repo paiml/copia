@@ -18,7 +18,7 @@ pub fn fingerprint_path(full: &Path) -> std::io::Result<Fingerprint> {
             blake3: *h.as_bytes(),
             ftype: FileType::Symlink,
         })
-    } else {
+    } else if meta.file_type().is_file() {
         let mut hasher = blake3::Hasher::new();
         let mut f = std::fs::File::open(full)?;
         std::io::copy(&mut f, &mut hasher)?;
@@ -26,7 +26,42 @@ pub fn fingerprint_path(full: &Path) -> std::io::Result<Fingerprint> {
             blake3: *hasher.finalize().as_bytes(),
             ftype: FileType::File,
         })
+    } else {
+        // A FIFO, socket, or device. NEVER OPEN IT: opening a FIFO for reading
+        // BLOCKS until a writer appears, which would hang the walk indefinitely
+        // on an ordinary tree. That hazard is why these were skipped, and
+        // skipping them is what made them invisible to every comparison.
+        //
+        // Fingerprint the KIND instead. It cannot detect a change in what flows
+        // through a pipe — nothing can — but it makes the entry EXIST, so a
+        // destination missing it reads as `missing` rather than as agreement.
+        let tag = kind_tag(meta.file_type());
+        Ok(Fingerprint {
+            blake3: *blake3::hash(tag.as_bytes()).as_bytes(),
+            ftype: FileType::Other,
+        })
     }
+}
+
+/// A stable name for a non-regular, non-symlink entry kind.
+fn kind_tag(ft: std::fs::FileType) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if ft.is_fifo() {
+            return "fifo";
+        }
+        if ft.is_socket() {
+            return "socket";
+        }
+        if ft.is_block_device() {
+            return "block-device";
+        }
+        if ft.is_char_device() {
+            return "char-device";
+        }
+    }
+    "unknown"
 }
 
 /// Walk a local tree and content-fingerprint every file into an `FpMap`. Files
@@ -82,7 +117,17 @@ pub async fn discover_remote_with_meta(
     let output = tokio::process::Command::new("ssh")
         .arg(host)
         .arg(format!(
-            "cd $'{escaped}' && find . -type f -printf '%s\\t%T@\\t%p\\0'"
+            // `! -type d`, NOT `-type f`. The previous form enumerated regular
+            // files ONLY, so a symlink, FIFO, socket or device on a remote tree
+            // was invisible to every plan built from this listing — and a
+            // destination missing one read as agreement, the same omission that
+            // made `copia verify` certify a lost FIFO locally.
+            //
+            // Directories are excluded because they are handled separately;
+            // everything else is an ENTRY and must be visible even when copia
+            // cannot carry it. `find` does not follow symlinks by default, so
+            // %s/%T@ describe the link itself rather than its target.
+            "cd $'{escaped}' && find . ! -type d -printf '%s\\t%T@\\t%p\\0'"
         ))
         .output()
         .await?;
@@ -177,6 +222,90 @@ mod tests {
         set_local_mtime(&base.join("d/f"), 1_600_000_000).unwrap();
         let m2 = discover_local_with_meta(&base).unwrap();
         assert_eq!(m2[&PathBuf::from("d/f")].mtime, 1_600_000_000);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A FIFO must fingerprint as `Other` — and must NOT be opened.
+    ///
+    /// This is the test that would have caught the original defect. Opening a
+    /// FIFO for reading BLOCKS until a writer appears, which is exactly why the
+    /// walk skipped these kinds, and skipping them is what made a lost FIFO read
+    /// as agreement. The `timeout` here is load-bearing: without it a regression
+    /// that opens the pipe hangs the SUITE rather than failing it, and a hung
+    /// test is indistinguishable from a slow one.
+    #[test]
+    #[cfg(unix)]
+    fn a_fifo_fingerprints_by_kind_and_never_blocks() {
+        let base = std::env::temp_dir().join(format!(
+            "copia-fifo-fp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let fifo = base.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo;
+        std::thread::spawn(move || {
+            let _ = tx.send(fingerprint_path(&probe).map(|f| f.ftype));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("fingerprint_path BLOCKED on a FIFO — it must classify without opening");
+
+        assert_eq!(got.unwrap(), FileType::Other);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Each kind gets its own tag, so two different kinds never fingerprint
+    /// alike. Collapsing them would make a socket-where-a-FIFO-was read as
+    /// identical — the same omission defect one level down.
+    #[test]
+    #[cfg(unix)]
+    fn distinct_entry_kinds_get_distinct_tags() {
+        use std::os::unix::net::UnixListener;
+        let base = std::env::temp_dir().join(format!(
+            "copia-kindtag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let fifo = base.join("f");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let sock = UnixListener::bind(base.join("s")).ok();
+
+        if made && sock.is_some() {
+            let ft_fifo = std::fs::symlink_metadata(&fifo).unwrap().file_type();
+            let ft_sock = std::fs::symlink_metadata(base.join("s"))
+                .unwrap()
+                .file_type();
+            assert_eq!(kind_tag(ft_fifo), "fifo");
+            assert_eq!(kind_tag(ft_sock), "socket");
+            assert_ne!(
+                fingerprint_path(&fifo).unwrap().blake3,
+                fingerprint_path(&base.join("s")).unwrap().blake3,
+                "a FIFO and a socket fingerprint alike — one could replace the other silently"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }
