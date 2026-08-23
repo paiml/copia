@@ -41,7 +41,7 @@ jobs:
       has_binaries: ${{ steps.bincheck.outputs.has_binaries }}
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Parse tag and verify version
         id: parse
@@ -117,15 +117,25 @@ jobs:
     runs-on: [self-hosted, clean-room]
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Verify package tarball
         run: |
+          # `cargo package` VERIFIES BY DEFAULT — it builds the crate from the
+          # generated tarball. There is no `--verify` flag; the only related
+          # switch is `--no-verify`, which turns the check OFF. Current cargo
+          # rejects it outright:
+          #
+          #     error: unexpected argument '--verify' found
+          #
+          # So this step could not run at all, and it sits between the gates and
+          # `publish`. The release stopped at a step that was never doing the
+          # verification its name promises.
           CRATE="${{ needs.create-release.outputs.crate_name }}"
           if [ -n "$CRATE" ]; then
-            cargo package --verify -p "$CRATE"
+            cargo package -p "$CRATE"
           else
-            cargo package --verify
+            cargo package
           fi
 
   # ── Publish: OIDC trusted publishing to crates.io ──────
@@ -134,10 +144,10 @@ jobs:
     runs-on: [self-hosted, clean-room]
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Authenticate to crates.io (OIDC)
-        uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec  # v1.0.3
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe  # v1.0.4
 
       - name: Publish
         run: |
@@ -169,7 +179,7 @@ jobs:
       CROSS_VERSION: v0.2.5
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Install target prerequisites
         run: |
