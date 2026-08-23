@@ -32,7 +32,7 @@
 | `hub-sync` | **L3** — hub client | Pushes a local tree to a hub (`host:root` over SSH, or a local hub path) over one persistent connection. CAS concurrency safety: N clients → 1 hub, a stale write lands a conflict-copy, never a lost update. |
 | `signature` / `delta` / `patch` | primitives | The rsync delta primitives, usable standalone: generate a block signature, compute a delta against it, apply the delta to reconstruct a file. |
 
-## Install
+## Installation
 
 ```bash
 cargo install copia --features cli
@@ -40,7 +40,9 @@ cargo install copia --features cli
 
 The `cli` feature builds the `copia` binary (it pulls in `async` + `tracing`). To embed the delta-transfer engine as a **library**, add `copia = "0.1"` (with `features = ["async"]` for the tokio engine) — see [docs.rs/copia](https://docs.rs/copia).
 
-## Quick start
+## Usage
+
+Every example below is a real command; none is pseudocode.
 
 ### L1 — incremental one-way sync (`sync`)
 
@@ -133,6 +135,36 @@ Enforce it all with `make contracts`. Details in **[docs/proofs.md](docs/proofs.
 - **[docs/usage.md](docs/usage.md)** — full command reference and worked examples.
 - **[docs/specifications/rsync-copia-spec.md](docs/specifications/rsync-copia-spec.md)** — the L1 rsync-engine specification.
 - **[docs/specifications/distributed-sync.md](docs/specifications/distributed-sync.md)** — the L2/L3 distributed-sync specification (quorum-vetted against Unison, Syncthing, git, Dynamo/Cassandra, etcd, rsync).
+
+## Contributing
+
+copia is part of the Sovereign AI Stack. Two things are worth knowing before you
+open a PR, because both will fail your build otherwise.
+
+**Every claim needs a falsifier.** A test that has never failed has not been
+shown to test anything. When you add a check, also show the injection that makes
+it fail — the differential harness in `tests/rsync_differential.rs` does this
+explicitly: `the_oracle_is_present` FAILS rather than skips when rsync is
+missing, because an absent oracle makes every case in that file vacuously green.
+
+**Gates are not advisory.**
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --features cli -- -D warnings
+cargo test --features cli
+pmat quality-gate --fail-on-violation --max-dead-code 15.0 --max-complexity-p99 50
+pv validate contracts/*.yaml          # binding.yaml is a manifest, not a contract
+```
+
+`pmat.toml` sets cognitive complexity to **20**. If a function trips it, flatten
+the nesting rather than deleting branches — cognitive complexity scores depth,
+not branch count, and merging cases to get under the number changes behaviour.
+
+Contracts in `contracts/` bind each equation to the function implementing it
+(`contracts/binding.yaml`), and `pv proof-status --binding` checks the function
+actually exists — so renaming one drops the contract a level rather than leaving
+a citation pointing at nothing.
 
 ## License
 

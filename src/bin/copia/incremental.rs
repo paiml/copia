@@ -114,16 +114,15 @@ fn report(
     Ok(())
 }
 
-#[allow(clippy::cast_possible_truncation)]
-async fn run_remote(
+/// The `(source, destination)` labels for this direction, as an operator sees
+/// them in the scan line and in the final report.
+fn endpoint_descriptions(
     dir: Dir,
     host: &str,
     remote_root: &str,
     local_root: &Path,
-    opts: &SyncOptions,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let start = Instant::now();
-    let (src_desc, dst_desc) = match dir {
+) -> (String, String) {
+    match dir {
         Dir::Push => (
             local_root.display().to_string(),
             format!("{host}:{remote_root}"),
@@ -132,27 +131,112 @@ async fn run_remote(
             format!("{host}:{remote_root}"),
             local_root.display().to_string(),
         ),
-    };
-    eprintln!("Scanning {src_desc} and {dst_desc}...");
+    }
+}
 
-    // Source drives transfers; destination drives skip + delete. A missing dest
-    // (first sync) yields an empty map, so every source file is new.
-    // Resolve each `?` into a binding BEFORE any await so no error-carrying
-    // temporary is held across it (keeps the future `Send`).
-    let (src_meta, dst_meta): (MetaMap, MetaMap) = match dir {
+/// Both sides' metadata, as `(source, destination)`.
+///
+/// Source drives transfers; destination drives skip + delete. A missing dest
+/// (first sync) yields an empty map, so every source file is new.
+/// Resolve each `?` into a binding BEFORE any await so no error-carrying
+/// temporary is held across it (keeps the future `Send`).
+async fn discover_both(
+    dir: Dir,
+    host: &str,
+    remote_root: &str,
+    local_root: &Path,
+) -> Result<(MetaMap, MetaMap), Box<dyn std::error::Error>> {
+    match dir {
         Dir::Push => {
             let local = discover_local_with_meta(local_root)?;
             let remote = discover_remote_with_meta(host, remote_root)
                 .await
                 .unwrap_or_default();
-            (local, remote)
+            Ok((local, remote))
         }
         Dir::Pull => {
             let remote = discover_remote_with_meta(host, remote_root).await?;
             let local = discover_local_with_meta(local_root).unwrap_or_default();
-            (remote, local)
+            Ok((remote, local))
         }
-    };
+    }
+}
+
+/// Create the destination-side directories this transfer needs.
+async fn create_transfer_dirs(
+    dir: Dir,
+    host: &str,
+    remote_root: &str,
+    local_root: &Path,
+    dirs: &[PathBuf],
+) -> Result<(), Box<dyn std::error::Error>> {
+    match dir {
+        Dir::Push => create_remote_dirs(host, remote_root, dirs).await,
+        Dir::Pull => create_local_dirs(local_root, dirs),
+    }
+}
+
+/// Deliver one file in this direction: push streams it up over SSH, pull
+/// streams it down into a temp sibling and renames it into place.
+async fn deliver_one(
+    dir: Dir,
+    host: &str,
+    remote_file: &str,
+    local_file: &Path,
+    mtime: Option<i64>,
+) -> Result<u64, String> {
+    match dir {
+        Dir::Push => transfer_file_to_remote(local_file, host, remote_file, mtime).await,
+        Dir::Pull => deliver_pull(host, remote_file, local_file, mtime).await,
+    }
+}
+
+/// Spawn one task per planned file, `jobs`-limited by a shared semaphore.
+/// Returns the handles in plan order plus the counters every task writes into.
+#[allow(clippy::cast_possible_truncation)]
+fn spawn_transfers(
+    dir: Dir,
+    host: &str,
+    remote_root: &str,
+    local_root: &Path,
+    transfer: &[PathBuf],
+    src_meta: &MetaMap,
+    jobs: usize,
+) -> (Vec<tokio::task::JoinHandle<()>>, TransferProgress) {
+    let semaphore = Arc::new(Semaphore::new(jobs));
+    let progress = TransferProgress::new(transfer.len() as u64);
+    let mut handles = Vec::with_capacity(transfer.len());
+    for rel in transfer {
+        let mtime = src_meta.get(rel).map(|m| m.mtime);
+        let remote_file = format!("{}/{}", remote_root, rel.display());
+        let local_file = local_root.join(rel);
+        let host = host.to_string();
+        let sem = Arc::clone(&semaphore);
+        let prog = progress.clone();
+        let rel_disp = rel.display().to_string();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            match deliver_one(dir, &host, &remote_file, &local_file, mtime).await {
+                Ok(size) => prog.record_ok(size),
+                Err(e) => prog.record_err(&rel_disp, &e),
+            }
+        }));
+    }
+    (handles, progress)
+}
+
+async fn run_remote(
+    dir: Dir,
+    host: &str,
+    remote_root: &str,
+    local_root: &Path,
+    opts: &SyncOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let (src_desc, dst_desc) = endpoint_descriptions(dir, host, remote_root, local_root);
+    eprintln!("Scanning {src_desc} and {dst_desc}...");
+
+    let (src_meta, dst_meta) = discover_both(dir, host, remote_root, local_root).await?;
     // Empty source short-circuits (unless mirroring, where empty source is a
     // legitimate "delete everything on the destination").
     if src_meta.is_empty() && !opts.delete {
@@ -170,34 +254,17 @@ async fn run_remote(
     }
 
     let dirs = collect_dirs(&plan.transfer);
-    match dir {
-        Dir::Push => create_remote_dirs(host, remote_root, &dirs).await?,
-        Dir::Pull => create_local_dirs(local_root, &dirs)?,
-    }
+    create_transfer_dirs(dir, host, remote_root, local_root, &dirs).await?;
 
-    let semaphore = Arc::new(Semaphore::new(opts.jobs));
-    let progress = TransferProgress::new(plan.transfer.len() as u64);
-    let mut handles = Vec::with_capacity(plan.transfer.len());
-    for rel in &plan.transfer {
-        let mtime = src_meta.get(rel).map(|m| m.mtime);
-        let remote_file = format!("{}/{}", remote_root, rel.display());
-        let local_file = local_root.join(rel);
-        let host = host.to_string();
-        let sem = Arc::clone(&semaphore);
-        let prog = progress.clone();
-        let rel_disp = rel.display().to_string();
-        handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await;
-            let res = match dir {
-                Dir::Push => transfer_file_to_remote(&local_file, &host, &remote_file, mtime).await,
-                Dir::Pull => deliver_pull(&host, &remote_file, &local_file, mtime).await,
-            };
-            match res {
-                Ok(size) => prog.record_ok(size),
-                Err(e) => prog.record_err(&rel_disp, &e),
-            }
-        }));
-    }
+    let (handles, progress) = spawn_transfers(
+        dir,
+        host,
+        remote_root,
+        local_root,
+        &plan.transfer,
+        &src_meta,
+        opts.jobs,
+    );
     join_handles(handles).await;
 
     if !plan.delete.is_empty() {
