@@ -121,11 +121,21 @@ jobs:
 
       - name: Verify package tarball
         run: |
+          # `cargo package` VERIFIES BY DEFAULT — it builds the crate from the
+          # generated tarball. There is no `--verify` flag; the only related
+          # switch is `--no-verify`, which turns the check OFF. Current cargo
+          # rejects it outright:
+          #
+          #     error: unexpected argument '--verify' found
+          #
+          # So this step could not run at all, and it sits between the gates and
+          # `publish`. The release stopped at a step that was never doing the
+          # verification its name promises.
           CRATE="${{ needs.create-release.outputs.crate_name }}"
           if [ -n "$CRATE" ]; then
-            cargo package --verify -p "$CRATE"
+            cargo package -p "$CRATE"
           else
-            cargo package --verify
+            cargo package
           fi
 
   # ── Publish: OIDC trusted publishing to crates.io ──────
