@@ -172,39 +172,7 @@ impl AsyncCopiaSync {
             return Ok(delta);
         }
 
-        let mut pos = 0usize;
-
-        // Initialize fast rolling checksum with first block
-        let init_len = block_size.min(source_data.len());
-        let mut rolling = FastRollingChecksum::new(&source_data[..init_len]);
-
-        while pos + block_size <= source_data.len() {
-            let weak = rolling.digest();
-
-            // Fast path: check weak hash first before computing strong hash
-            if table.has_weak_match(weak) {
-                let block_data = &source_data[pos..pos + block_size];
-                if let Some(sig) = table.find_match(weak, block_data) {
-                    let offset = u64::from(sig.index) * block_size as u64;
-                    delta.push_copy(offset, block_size as u32);
-                    pos += block_size;
-
-                    // Re-initialize rolling checksum for next window
-                    if pos + block_size <= source_data.len() {
-                        rolling = FastRollingChecksum::new(&source_data[pos..pos + block_size]);
-                    }
-                    continue;
-                }
-            }
-
-            // No match - emit literal byte and roll window
-            delta.push_literal_byte(source_data[pos]);
-
-            if pos + block_size < source_data.len() {
-                rolling.roll(source_data[pos], source_data[pos + block_size]);
-            }
-            pos += 1;
-        }
+        let pos = scan_blocks(&table, &source_data, block_size, &mut delta);
 
         if pos < source_data.len() {
             delta.push_literal(&source_data[pos..]);
@@ -383,6 +351,75 @@ impl AsyncCopiaSync {
     }
 }
 
+/// Look up the block at `pos` in the signature table.
+///
+/// Checks the weak (rolling) hash first and only computes the strong hash when
+/// the weak hash has candidates. Returns the basis-file offset of the matching
+/// block, or `None` when the block does not match.
+#[cfg(feature = "async")]
+#[allow(clippy::cast_possible_truncation)] // block_size validated to be <= 65536
+fn match_block_at(
+    table: &SignatureTable,
+    source_data: &[u8],
+    pos: usize,
+    block_size: usize,
+    weak: u32,
+) -> Option<u64> {
+    // Fast path: check weak hash first before computing strong hash
+    if !table.has_weak_match(weak) {
+        return None;
+    }
+
+    let block_data = &source_data[pos..pos + block_size];
+    let sig = table.find_match(weak, block_data)?;
+    Some(u64::from(sig.index) * block_size as u64)
+}
+
+/// Scan `source_data` for blocks present in `table`, pushing copy and literal
+/// ops onto `delta`.
+///
+/// Returns the position of the first byte not yet emitted; the caller flushes
+/// the trailing remainder (shorter than one block) as a literal.
+#[cfg(feature = "async")]
+#[allow(clippy::cast_possible_truncation)] // block_size validated to be <= 65536
+fn scan_blocks(
+    table: &SignatureTable,
+    source_data: &[u8],
+    block_size: usize,
+    delta: &mut Delta,
+) -> usize {
+    let mut pos = 0usize;
+
+    // Initialize fast rolling checksum with first block
+    let init_len = block_size.min(source_data.len());
+    let mut rolling = FastRollingChecksum::new(&source_data[..init_len]);
+
+    while pos + block_size <= source_data.len() {
+        let weak = rolling.digest();
+
+        if let Some(offset) = match_block_at(table, source_data, pos, block_size, weak) {
+            delta.push_copy(offset, block_size as u32);
+            pos += block_size;
+
+            // Re-initialize rolling checksum for next window
+            if pos + block_size <= source_data.len() {
+                rolling = FastRollingChecksum::new(&source_data[pos..pos + block_size]);
+            }
+            continue;
+        }
+
+        // No match - emit literal byte and roll window
+        delta.push_literal_byte(source_data[pos]);
+
+        if pos + block_size < source_data.len() {
+            rolling.roll(source_data[pos], source_data[pos + block_size]);
+        }
+        pos += 1;
+    }
+
+    pos
+}
+
 impl Default for AsyncCopiaSync {
     fn default() -> Self {
         Self::new()
@@ -472,6 +509,29 @@ mod tests {
         let delta = sync.delta(Cursor::new(&data), &sig).await.unwrap();
 
         assert_eq!(delta.bytes_matched(), 1024);
+        assert_eq!(delta.bytes_literal(), 0);
+    }
+
+    /// Block-aligned source whose blocks differ from one another.
+    ///
+    /// After the last match `pos + block_size == source_data.len()` exactly, so
+    /// the scan loop runs one final iteration and must read a freshly seeded
+    /// rolling window. `async_delta_identical` cannot catch a stale window
+    /// because its data is uniform (every window has the same digest); distinct
+    /// per-block content makes a missed re-seed show up as literal bytes.
+    #[tokio::test]
+    async fn async_delta_block_aligned_distinct_blocks_is_all_copies() {
+        let sync = AsyncCopiaSync::with_block_size(512);
+        let mut data = Vec::new();
+        for b in 0u8..4 {
+            data.extend(vec![b.wrapping_mul(37).wrapping_add(1); 512]);
+        }
+        assert_eq!(data.len(), 2048);
+
+        let sig = sync.signature(Cursor::new(&data)).await.unwrap();
+        let delta = sync.delta(Cursor::new(&data), &sig).await.unwrap();
+
+        assert_eq!(delta.bytes_matched(), 2048);
         assert_eq!(delta.bytes_literal(), 0);
     }
 

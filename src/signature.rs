@@ -281,31 +281,70 @@ impl SignatureTable {
 
         // Fast path: if there's only one candidate and it's the expected one,
         // verify with strong hash (can't skip entirely for correctness)
-        if candidates.len() == 1 {
-            let sig = &self.signature.blocks[candidates[0]];
-            if sig.index == expected_index {
-                // Still verify, but this is the common case
-                let strong = StrongHash::compute(data);
-                if sig.strong_hash == strong {
-                    return Some(sig);
-                }
-            }
+        if let Some(sig) = self.match_sole_expected(candidates, data, expected_index) {
+            return Some(sig);
         }
 
         // Check expected index first if present
-        for &i in candidates {
-            let sig = &self.signature.blocks[i];
-            if sig.index == expected_index {
-                let strong = StrongHash::compute(data);
-                if sig.strong_hash == strong {
-                    return Some(sig);
-                }
-                // Expected didn't match, check others
-                break;
-            }
+        if let Some(sig) = self.match_expected_first(candidates, data, expected_index) {
+            return Some(sig);
         }
 
         // Fall back to checking all candidates
+        self.match_any(candidates, data)
+    }
+
+    /// Fast path for the single-candidate case.
+    ///
+    /// Matches only when the lone candidate carries `expected_index` and its
+    /// strong hash verifies against `data`. Any other shape — more than one
+    /// candidate, a different index, a failed verification — yields `None` and
+    /// leaves the decision to the scans that follow. The strong hash is
+    /// computed only once the index has already matched.
+    #[inline]
+    fn match_sole_expected(
+        &self,
+        candidates: &[usize],
+        data: &[u8],
+        expected_index: u32,
+    ) -> Option<&BlockSignature> {
+        if candidates.len() != 1 {
+            return None;
+        }
+        let sig = &self.signature.blocks[candidates[0]];
+        if sig.index != expected_index {
+            return None;
+        }
+        // Still verify, but this is the common case
+        let strong = StrongHash::compute(data);
+        (sig.strong_hash == strong).then_some(sig)
+    }
+
+    /// Verify the expected block ahead of any other candidate.
+    ///
+    /// Stops at the first candidate carrying `expected_index` and verifies only
+    /// that one; if it fails to verify this gives up rather than resuming the
+    /// scan, so the caller falls back to the full scan. When no candidate
+    /// carries `expected_index` no strong hash is computed at all.
+    #[inline]
+    fn match_expected_first(
+        &self,
+        candidates: &[usize],
+        data: &[u8],
+        expected_index: u32,
+    ) -> Option<&BlockSignature> {
+        let sig = candidates
+            .iter()
+            .map(|&i| &self.signature.blocks[i])
+            .find(|sig| sig.index == expected_index)?;
+        let strong = StrongHash::compute(data);
+        (sig.strong_hash == strong).then_some(sig)
+    }
+
+    /// Full scan: the first candidate, in candidate order, whose strong hash
+    /// matches `data`.
+    #[inline]
+    fn match_any(&self, candidates: &[usize], data: &[u8]) -> Option<&BlockSignature> {
         let strong = StrongHash::compute(data);
         candidates
             .iter()
@@ -695,6 +734,180 @@ mod tests {
         assert!(SignatureTable::validate_block_size(1000).is_err());
         assert!(SignatureTable::validate_block_size(1023).is_err());
         assert!(SignatureTable::validate_block_size(1025).is_err());
+    }
+
+    // ==========================================================================
+    // FIND_MATCH_OPTIMIZED CHARACTERIZATION TESTS
+    // ==========================================================================
+    //
+    // These pin every path through `find_match_optimized`: the sole-candidate
+    // fast path, the expected-index-first scan, the break out of that scan into
+    // the full scan, and which block wins when more than one could.
+
+    /// Build a table from hand-written blocks so weak-hash collisions and
+    /// index/expectation mismatches can be constructed deliberately.
+    fn table_of(blocks: Vec<BlockSignature>) -> SignatureTable {
+        SignatureTable::from_signature(Signature {
+            block_size: 512,
+            file_size: 0,
+            blocks,
+        })
+    }
+
+    #[test]
+    fn find_match_optimized_no_weak_candidate() {
+        let table = table_of(vec![BlockSignature::new(0, 111, StrongHash::compute(b"a"))]);
+        assert!(table.find_match_optimized(222, b"a", 0).is_none());
+    }
+
+    #[test]
+    fn find_match_optimized_sole_candidate_is_expected() {
+        let table = table_of(vec![BlockSignature::new(
+            7,
+            111,
+            StrongHash::compute(b"payload"),
+        )]);
+        let found = table.find_match_optimized(111, b"payload", 7).unwrap();
+        assert_eq!(found.index, 7);
+    }
+
+    #[test]
+    fn find_match_optimized_sole_candidate_weak_collision_rejected() {
+        // Same weak hash, different content: the strong hash must reject it.
+        let table = table_of(vec![BlockSignature::new(
+            7,
+            111,
+            StrongHash::compute(b"other"),
+        )]);
+        assert!(table.find_match_optimized(111, b"payload", 7).is_none());
+    }
+
+    #[test]
+    fn find_match_optimized_sole_candidate_wrong_index_still_matches() {
+        // Not the expected index, so the fast path and the expected-first scan
+        // both decline; the full scan still returns it.
+        let table = table_of(vec![BlockSignature::new(
+            7,
+            111,
+            StrongHash::compute(b"payload"),
+        )]);
+        let found = table.find_match_optimized(111, b"payload", 3).unwrap();
+        assert_eq!(found.index, 7);
+    }
+
+    #[test]
+    fn find_match_optimized_expected_found_late_in_candidates() {
+        let table = table_of(vec![
+            BlockSignature::new(3, 111, StrongHash::compute(b"other")),
+            BlockSignature::new(7, 111, StrongHash::compute(b"payload")),
+        ]);
+        let found = table.find_match_optimized(111, b"payload", 7).unwrap();
+        assert_eq!(found.index, 7);
+    }
+
+    #[test]
+    fn find_match_optimized_expected_beats_earlier_identical_block() {
+        // Two blocks with the SAME strong hash: the expected index wins, which
+        // is the whole point of the expected-first scan.
+        let table = table_of(vec![
+            BlockSignature::new(2, 111, StrongHash::compute(b"payload")),
+            BlockSignature::new(7, 111, StrongHash::compute(b"payload")),
+        ]);
+        let found = table.find_match_optimized(111, b"payload", 7).unwrap();
+        assert_eq!(found.index, 7);
+    }
+
+    #[test]
+    fn find_match_optimized_expected_mismatch_falls_back_to_others() {
+        // The expected block is present but its content differs: the scan stops
+        // at it (break) and the full scan finds the real match.
+        let table = table_of(vec![
+            BlockSignature::new(7, 111, StrongHash::compute(b"wrong")),
+            BlockSignature::new(9, 111, StrongHash::compute(b"payload")),
+        ]);
+        let found = table.find_match_optimized(111, b"payload", 7).unwrap();
+        assert_eq!(found.index, 9);
+    }
+
+    /// TWO candidates carry `expected_index`, and the first does not match.
+    ///
+    /// `find_match_optimized_expected_mismatch_falls_back_to_others` is the test
+    /// that was believed to pin the break-vs-continue semantics of the
+    /// expected-first scan. It does not: it builds only ONE candidate carrying
+    /// `expected_index`, and with one candidate `break` and `continue` are
+    /// indistinguishable. An adversarial review injected exactly that change —
+    /// resuming the scan instead of breaking — and all eleven characterization
+    /// tests still passed.
+    ///
+    /// This is the discriminating input. With a second `index == 7` that DOES
+    /// match, `break` yields index 3 (the full scan's first hit) while a
+    /// resuming scan yields index 7.
+    ///
+    /// Reachable, not theoretical: `Signature::generate` assigns `index` from
+    /// `enumerate()` so duplicates cannot arise from generation, but `Signature`
+    /// derives `Deserialize` — a corrupt or hostile signature file can carry
+    /// them.
+    #[test]
+    fn find_match_optimized_two_candidates_share_the_expected_index() {
+        let table = table_of(vec![
+            BlockSignature::new(7, 111, StrongHash::compute(b"wrong")),
+            BlockSignature::new(3, 111, StrongHash::compute(b"payload")),
+            BlockSignature::new(7, 111, StrongHash::compute(b"payload")),
+        ]);
+        let found = table.find_match_optimized(111, b"payload", 7).unwrap();
+        assert_eq!(
+            found.index, 3,
+            "the expected-first scan must BREAK on the first expected-index \
+             candidate, not resume past it"
+        );
+    }
+
+    #[test]
+    fn find_match_optimized_expected_absent_falls_back() {
+        let table = table_of(vec![
+            BlockSignature::new(3, 111, StrongHash::compute(b"payload")),
+            BlockSignature::new(9, 111, StrongHash::compute(b"x")),
+        ]);
+        let found = table.find_match_optimized(111, b"payload", 7).unwrap();
+        assert_eq!(found.index, 3);
+    }
+
+    #[test]
+    fn find_match_optimized_no_strong_match_returns_none() {
+        let table = table_of(vec![
+            BlockSignature::new(3, 111, StrongHash::compute(b"a")),
+            BlockSignature::new(9, 111, StrongHash::compute(b"b")),
+        ]);
+        assert!(table.find_match_optimized(111, b"payload", 7).is_none());
+    }
+
+    #[test]
+    fn find_match_optimized_full_scan_returns_first_duplicate() {
+        // Neither is the expected index and both match: candidate order wins.
+        let table = table_of(vec![
+            BlockSignature::new(5, 111, StrongHash::compute(b"payload")),
+            BlockSignature::new(6, 111, StrongHash::compute(b"payload")),
+        ]);
+        let found = table.find_match_optimized(111, b"payload", 99).unwrap();
+        assert_eq!(found.index, 5);
+    }
+
+    #[test]
+    fn find_match_optimized_agrees_with_find_match_when_index_unknown() {
+        // With no expected index in play, the optimized lookup must return the
+        // same block as the plain one.
+        let data = vec![7u8; 4096];
+        let mut cursor = Cursor::new(data.as_slice());
+        let table = SignatureTable::build(&mut cursor, 1024).unwrap();
+        let block = &data[..1024];
+        let weak = RollingChecksum::new(block).digest();
+
+        let plain = table.find_match(weak, block).unwrap().index;
+        let optimized = table
+            .find_match_optimized(weak, block, u32::MAX)
+            .unwrap()
+            .index;
+        assert_eq!(plain, optimized);
     }
 
     // ==========================================================================

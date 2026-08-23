@@ -268,44 +268,7 @@ impl Sync for CopiaSync {
             return Ok(delta);
         }
 
-        let mut pos = 0usize;
-
-        // Initialize rolling checksum with first block
-        let init_len = block_size.min(source_data.len());
-        let mut rolling = FastRollingChecksum::new(&source_data[..init_len]);
-
-        while pos + block_size <= source_data.len() {
-            let weak = rolling.digest();
-
-            // Fast path: check weak hash first before computing strong hash
-            if table.has_weak_match(weak) {
-                let block_data = &source_data[pos..pos + block_size];
-                if let Some(sig) = table.find_match(weak, block_data) {
-                    // Found a match - emit copy operation
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        let offset = u64::from(sig.index) * block_size as u64;
-                        delta.push_copy(offset, block_size as u32);
-                    }
-                    pos += block_size;
-
-                    // After match, we need new checksum at new position
-                    // Roll forward by block_size bytes OR reinit (same cost)
-                    if pos + block_size <= source_data.len() {
-                        rolling = FastRollingChecksum::new(&source_data[pos..pos + block_size]);
-                    }
-                    continue;
-                }
-            }
-
-            // No match - emit literal byte and roll window
-            delta.push_literal_byte(source_data[pos]);
-
-            if pos + block_size < source_data.len() {
-                rolling.roll(source_data[pos], source_data[pos + block_size]);
-            }
-            pos += 1;
-        }
+        let pos = scan_blocks(&table, &source_data, block_size, &mut delta);
 
         // Handle remaining bytes as literals
         if pos < source_data.len() {
@@ -393,6 +356,75 @@ impl Sync for CopiaSync {
 
         Ok(())
     }
+}
+
+/// Look up the block at `pos` in the signature table.
+///
+/// Checks the weak (rolling) hash first and only computes the strong hash when
+/// the weak hash has candidates. Returns the basis-file offset of the matching
+/// block, or `None` when the block does not match.
+#[allow(clippy::cast_possible_truncation)] // block_size validated to be <= 65536
+fn match_block_at(
+    table: &SignatureTable,
+    source_data: &[u8],
+    pos: usize,
+    block_size: usize,
+    weak: u32,
+) -> Option<u64> {
+    // Fast path: check weak hash first before computing strong hash
+    if !table.has_weak_match(weak) {
+        return None;
+    }
+
+    let block_data = &source_data[pos..pos + block_size];
+    let sig = table.find_match(weak, block_data)?;
+    Some(u64::from(sig.index) * block_size as u64)
+}
+
+/// Scan `source_data` for blocks present in `table`, pushing copy and literal
+/// ops onto `delta`.
+///
+/// Returns the position of the first byte not yet emitted; the caller flushes
+/// the trailing remainder (shorter than one block) as a literal.
+#[allow(clippy::cast_possible_truncation)] // block_size validated to be <= 65536
+fn scan_blocks(
+    table: &SignatureTable,
+    source_data: &[u8],
+    block_size: usize,
+    delta: &mut Delta,
+) -> usize {
+    let mut pos = 0usize;
+
+    // Initialize rolling checksum with first block
+    let init_len = block_size.min(source_data.len());
+    let mut rolling = FastRollingChecksum::new(&source_data[..init_len]);
+
+    while pos + block_size <= source_data.len() {
+        let weak = rolling.digest();
+
+        if let Some(offset) = match_block_at(table, source_data, pos, block_size, weak) {
+            // Found a match - emit copy operation
+            delta.push_copy(offset, block_size as u32);
+            pos += block_size;
+
+            // After match, we need new checksum at new position
+            // Roll forward by block_size bytes OR reinit (same cost)
+            if pos + block_size <= source_data.len() {
+                rolling = FastRollingChecksum::new(&source_data[pos..pos + block_size]);
+            }
+            continue;
+        }
+
+        // No match - emit literal byte and roll window
+        delta.push_literal_byte(source_data[pos]);
+
+        if pos + block_size < source_data.len() {
+            rolling.roll(source_data[pos], source_data[pos + block_size]);
+        }
+        pos += 1;
+    }
+
+    pos
 }
 
 /// Statistics from a sync operation.
