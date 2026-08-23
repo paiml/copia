@@ -33,7 +33,14 @@ pub fn discover_local_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::er
                 files.push(rel);
             } else if path.is_dir() {
                 dirs.push(path);
-            } else if path.is_file() {
+            } else {
+                // EVERYTHING else, not just is_file(). A filesystem has seven
+                // entry kinds and this arm used to admit one of them, so a FIFO,
+                // socket or device was in neither list and left the walk — and
+                // `copia verify`, built on this walk, then called a tree that had
+                // lost one IDENTICAL. Recording it may mean the transfer fails
+                // loudly on an entry copia cannot carry; that is the correct
+                // outcome and strictly better than a silent omission.
                 let rel = path.strip_prefix(root)?.to_path_buf();
                 files.push(rel);
             }
@@ -323,6 +330,92 @@ mod transfer_tests {
             !dirs.iter().any(|d| d.starts_with("link")),
             "walked THROUGH a symlink — that duplicates the tree and can loop \
              forever on a cycle: {dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// EXHAUSTIVE over entry kinds, not over the kinds someone remembered.
+    ///
+    /// The symlink fix in #47 added `symlink` to a list and left FIFOs, sockets
+    /// and devices dropped — so `copia sync -r` discarded a FIFO and
+    /// `copia verify`, sharing this walk, reported "trees are identical — the
+    /// source may safely be deleted". The defect was not fixed, it was moved to
+    /// a shape nobody had enumerated.
+    ///
+    /// So this test does not list shapes. It creates one of EVERY entry kind a
+    /// test can create without root and requires the walk to surface all of
+    /// them. Block and character devices need root and are named in the
+    /// assertion message rather than silently omitted — an untested kind that
+    /// nobody mentions is how this bug happened twice.
+    #[test]
+    #[cfg(unix)]
+    fn the_walk_surfaces_every_entry_kind_it_can_be_given() {
+        use std::os::unix::net::UnixListener;
+        // PID alone is not unique: a leftover from an earlier failed run in the
+        // same process collides, and the failure (`AlreadyExists` on a symlink)
+        // looks nothing like the thing under test.
+        let tmp = std::env::temp_dir().join(format!(
+            "copia-kinds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // regular file
+        std::fs::write(tmp.join("regular"), b"x").unwrap();
+        // directory containing a file (a bare dir is not an ENTRY in the file list)
+        std::fs::create_dir_all(tmp.join("dir")).unwrap();
+        std::fs::write(tmp.join("dir/inner"), b"y").unwrap();
+        // symlink to file, symlink to dir, dangling symlink
+        std::os::unix::fs::symlink("regular", tmp.join("link-file")).unwrap();
+        std::os::unix::fs::symlink("dir", tmp.join("link-dir")).unwrap();
+        std::os::unix::fs::symlink("nowhere", tmp.join("link-dangling")).unwrap();
+        // socket
+        let sock = UnixListener::bind(tmp.join("sock")).ok();
+        // FIFO — the kind that was silently dropped
+        let fifo = tmp.join("fifo");
+        let made_fifo = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        let files = discover_local_files(&tmp).unwrap();
+        let has = |n: &str| files.contains(&PathBuf::from(n));
+
+        let mut missing = Vec::new();
+        for name in [
+            "regular",
+            "dir/inner",
+            "link-file",
+            "link-dir",
+            "link-dangling",
+        ] {
+            if !has(name) {
+                missing.push(name);
+            }
+        }
+        if sock.is_some() && !has("sock") {
+            missing.push("sock");
+        }
+        if made_fifo && !has("fifo") {
+            missing.push("fifo");
+        }
+
+        assert!(
+            missing.is_empty(),
+            "the walk dropped {missing:?}. An entry it cannot REPRESENT must still be \
+             VISIBLE — omission reads as agreement to every comparison built on this \
+             walk, which is how a FIFO was lost and then certified as identical. \
+             (Block and character devices need root and are not covered here.)"
+        );
+        assert!(
+            !has("link-dir/inner"),
+            "followed a symlinked directory and duplicated its contents: {files:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

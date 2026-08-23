@@ -14,7 +14,7 @@ target
 **/mutants.out*/
 
 # PMAT analysis cache
-.pmat/
+.pmat/*
 pmat.toml
 
 # RustRover
@@ -24,3 +24,12 @@ pmat.toml
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .dogfood/
+
+# The coverage ratchet's baseline is DATA, not cache. `.pmat/` is ignored because
+# the dogfood protocol fills it with a context index and lint caches, but
+# sovereign-ci reads COVERAGE_BASELINE_FILE=.pmat/coverage-baseline.txt and its
+# own failure message says "if intentional, update .pmat/coverage-baseline.txt" —
+# advice that is impossible while the whole directory is ignored. Un-ignore just
+# the two files that must be committed.
+!.pmat/coverage-baseline.txt
+!.pmat/coverage-baseline.md

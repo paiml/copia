@@ -20,6 +20,21 @@ pub struct Fingerprint {
 pub enum FileType {
     File,
     Symlink,
+    /// A FIFO, socket, block or character device — anything that is neither a
+    /// regular file nor a symlink nor a directory.
+    ///
+    /// This variant exists because its ABSENCE lost data. The walk classified
+    /// entries as symlink / dir / file and silently dropped everything else, so
+    /// `copia sync -r` discarded a FIFO — and `copia verify`, sharing the walk,
+    /// reported "trees are identical — the source may safely be deleted" over
+    /// the loss. Exactly the defect #47 fixed for symlinks, in a shape that had
+    /// not been enumerated.
+    ///
+    /// The lesson is the general one: an entry the walk cannot REPRESENT must
+    /// still be VISIBLE. Omission reads as agreement to every comparison built
+    /// on the walk. Being unable to copy something is survivable; being unable
+    /// to see it is not.
+    Other,
 }
 
 impl Fingerprint {
