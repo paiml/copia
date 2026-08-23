@@ -50,10 +50,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # GLIBC FLOOR IS PINNED DELIBERATELY, NOT INHERITED.
+          #
+          # These were `ubuntu-latest`. When GitHub rolled that image from 22.04
+          # to 24.04 the glibc floor moved 2.35 -> 2.39 with no change on our
+          # side, and the nightly binary stopped running on most of the fleet.
+          # Measured 2026-08-23: lambda-labs 2.35 and intel 2.35 both give
+          # `libc.so.6: version GLIBC_2.39 not found`; only gx10 (2.39) could
+          # execute it. forjar apply would install that binary and report
+          # success, because installing works — only running does not.
+          #
+          # The whole requirement came from TWO symbols Rust std links
+          # opportunistically for process spawning: pidfd_getpid@GLIBC_2.39 and
+          # pidfd_spawnp@GLIBC_2.39. Everything else needed is <= 2.34.
+          #
+          # glibc is backward-compatible in the direction that matters: built
+          # against 2.35 it runs on 2.39; built against 2.39 it runs on neither
+          # of the two machines that most need this tool.
+          #
+          # The runner image is deliberately BACK to `-latest`. Pinning it to
+          # 22.04 would only re-inherit a floor from a different image and break
+          # again when that one retires. The Linux builds now go through
+          # cargo-zigbuild against an explicit `...-gnu.2.28`, so the floor is
+          # DECLARED by this repo and does not move when GitHub rolls an image.
+          # The glibc-floor step verifies the result against the artifact, so a
+          # future roll is loud instead of silent either way.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm               # native ARM64, GA + free for public repos
+            runner: ubuntu-24.04-arm               # image no longer sets the floor
           - target: x86_64-apple-darwin
             runner: macos-latest
           - target: aarch64-apple-darwin
@@ -94,9 +119,112 @@ jobs:
       - name: Ensure target is installed
         run: rustup target add ${{ matrix.target }}
 
-      - name: Build release binary
+      - name: Install zig + cargo-zigbuild (Linux targets only)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          pip install ziglang --quiet
+          cargo install cargo-zigbuild --locked
+
+      - name: Build release binary (Linux — declared glibc floor)
+        if: runner.os == 'Linux'
+        run: cargo zigbuild --release --features cli --target ${{ matrix.target }}.2.28
+
+      - name: Build release binary (macOS / Windows)
+        if: runner.os != 'Linux'
         run: cargo build --release --features cli --target ${{ matrix.target }}
 
+      - name: Glibc floor — the artifact must run on the FLEET, not just on the runner
+
+        # THE DEFECT THIS EXISTS FOR. The nightly was green for weeks while
+
+        # producing a Linux binary that could not execute on two of the three
+
+        # x86/ARM fleet machines, because `ubuntu-latest` rolled 22.04 -> 24.04
+
+        # and took the glibc floor with it. Nothing noticed: the build passed,
+
+        # the upload passed, and `forjar apply` would install the binary and
+
+        # report success — installing works, only running does not.
+
+        #
+
+        # So assert the property that actually matters, against the artifact
+
+        # itself rather than against the runner image name. FLEET_GLIBC_MAX is
+
+        # the OLDEST glibc any fleet machine runs (measured 2026-08-23:
+
+        # lambda-labs 2.35, intel 2.35, gx10 2.39). Raise it only when the
+
+        # oldest machine is upgraded — never to make a red build go green.
+
+        #
+
+        # FALSIFIABLE: set FLEET_GLIBC_MAX to 2.30 and this step must fail on a
+
+        # binary that is otherwise fine, because Rust std needs 2.34 regardless.
+
+        if: runner.os == 'Linux'
+
+        env:
+
+          FLEET_GLIBC_MAX: "2.35"
+
+        run: |
+
+          set -euo pipefail
+
+          BIN="target/${{ matrix.target }}/release/copia"
+
+          test -x "$BIN" || { echo "no binary at $BIN"; exit 1; }
+
+          # Every versioned glibc symbol the binary imports, highest last.
+
+          need=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
+
+                 | sed 's/GLIBC_//' | sort -uV | tail -1)
+
+          [ -n "$need" ] || { echo "could not read any GLIBC_ symbol — refusing to guess"; exit 1; }
+
+          echo "binary requires glibc $need; fleet floor is $FLEET_GLIBC_MAX"
+
+          highest=$(printf '%s\n%s\n' "$need" "$FLEET_GLIBC_MAX" | sort -V | tail -1)
+
+          if [ "$highest" != "$FLEET_GLIBC_MAX" ]; then
+
+            echo "::error::glibc floor rose to $need, above the fleet's $FLEET_GLIBC_MAX."
+
+            echo "This binary will not RUN on the machines that install it."
+
+            objdump -T "$BIN" | grep "GLIBC_$need" | awk '{print "  needs: " $NF}' | sort -u
+
+            exit 1
+
+          fi
+
+
+      # ── Declared glibc floor, not an inherited one ──────────────────────
+      #
+      # Linux targets build through cargo-zigbuild against an EXPLICIT glibc
+      # version. The previous form (`cargo build` on `ubuntu-latest`) inherited
+      # whatever floor the runner image happened to have, and when GitHub rolled
+      # that image 22.04 -> 24.04 the floor moved 2.35 -> 2.39 silently. The
+      # nightly stayed green while producing a binary that could not execute on
+      # lambda-labs or intel (both glibc 2.35).
+      #
+      # 2.28 is chosen with headroom below the fleet floor (oldest machine 2.35)
+      # so an older machine joining does not immediately break. It is NOT a
+      # number to tune when a build goes red — the glibc-floor step verifies the
+      # result and is the thing that should be believed.
+      #
+      # VERIFIED LOCALLY before this was written, on this hardware:
+      #   x86_64  ...gnu.2.28 -> highest symbol 2.34 (was 2.39), runs on 2.35
+      #   aarch64 ...gnu.2.28 -> highest symbol 2.28, cross-compiled from x86
+      #                          and executed on gx10, a real ARM box
+      # The pidfd_getpid/pidfd_spawnp@GLIBC_2.39 symbols disappear because zig
+      # supplies 2.28 stubs, so Rust std falls back to the older spawn path.
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
