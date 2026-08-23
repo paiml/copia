@@ -146,10 +146,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
+      # `id:` is load-bearing. The action does not export a token into the
+      # environment — it emits one as a STEP OUTPUT, and an output nothing reads
+      # is discarded. Without the id there is nothing to reference it by.
       - name: Authenticate to crates.io (OIDC)
+        id: auth
         uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe  # v1.0.4
 
       - name: Publish
+        # The failure this fixes reads as an auth failure and is not one:
+        #
+        #   Retrieved token successfully
+        #   error: no token found, please run `cargo login`
+        #
+        # OIDC worked. crates.io issued a token. Nothing handed it to cargo, and
+        # the run then dutifully revoked the token it had never used.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           CRATE="${{ needs.create-release.outputs.crate_name }}"
           if [ -n "$CRATE" ]; then
