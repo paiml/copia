@@ -78,26 +78,35 @@ pub fn needs_transfer(src: FileMeta, dst: Option<FileMeta>) -> bool {
 /// accepted as the same); a pattern containing `/` matches the whole relative
 /// path as a glob.
 pub fn is_excluded(rel: &Path, excludes: &[String]) -> bool {
-    for pat in excludes {
-        let pat = pat.trim_end_matches('/');
-        if pat.is_empty() {
-            continue;
-        }
-        if pat.contains('/') {
-            if glob_match(pat, &rel.to_string_lossy()) {
-                return true;
-            }
-        } else {
-            for comp in rel.components() {
-                if let Component::Normal(c) = comp {
-                    if glob_match(pat, &c.to_string_lossy()) {
-                        return true;
-                    }
-                }
-            }
-        }
+    excludes
+        .iter()
+        .any(|pat| pattern_matches(pat.trim_end_matches('/'), rel))
+}
+
+/// One pattern against one path. Split out of `is_excluded` because cognitive
+/// complexity punishes NESTING, not branch count: the original was
+/// `for -> if -> if/else -> for -> if -> if`, six levels deep, scoring 33
+/// against a threshold of 25 and blocking the v0.3.0 release gate. The branches
+/// are all still here — they are just no longer stacked inside one another.
+fn pattern_matches(pat: &str, rel: &Path) -> bool {
+    if pat.is_empty() {
+        return false;
     }
-    false
+    if pat.contains('/') {
+        // A pattern with a slash is matched against the WHOLE relative path.
+        return glob_match(pat, &rel.to_string_lossy());
+    }
+    matches_any_component(pat, rel)
+}
+
+/// A slashless pattern prunes anywhere in the tree, so it is matched against
+/// each path COMPONENT. Non-`Normal` components (`.`, `..`, root, prefix) can
+/// never match a user pattern and are skipped rather than stringified.
+fn matches_any_component(pat: &str, rel: &Path) -> bool {
+    rel.components().any(|comp| match comp {
+        Component::Normal(c) => glob_match(pat, &c.to_string_lossy()),
+        _ => false,
+    })
 }
 
 /// Classic wildcard match with backtracking: `*` matches any run of characters,
