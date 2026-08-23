@@ -6,12 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [0.3.0] - 2026-08-22
+## [0.3.0] - 2026-08-23
 
-Archival becomes sovereign. copia was the rsync replacement for **transfer** and
-not for **archival** — so the one operation where being wrong destroys data
-(move a tree, then delete the original) was still delegated to rsync. It no
-longer is.
+Archival becomes sovereign **for local trees**. copia was the rsync replacement
+for **transfer** and not for **archival** — the one operation where being wrong
+destroys data (move a tree, then delete the original) was still delegated to
+rsync. For a local→local move it no longer is.
+
+### Scope, stated plainly
+
+`copia verify` is proved against **local trees only**. The SSH and hub transports
+are NOT covered by this release and are measurably wrong today: SSH pull drops
+symlinks and empty directories while reporting `0 failed` and exiting 0; SSH push
+writes a symlink-to-directory out as a 0-byte regular file; the hub aborts a push
+on any symlink because the client fingerprints a link by hashing its target
+string and then sends the target's bytes, so the CAS check rejects its own
+client. Tracked in #49, which parameterises the differential harness over every
+transport rather than adding shapes to a local-only fixture.
+
+Do not use `copia verify` to authorise deleting a source that was moved over
+SSH or through the hub. It has not been proved there, and a guarantee asserted
+where it is cheapest to test is not a guarantee where it ships.
 
 ### Added
 
@@ -43,7 +58,39 @@ longer is.
 
 ### Fixed
 
-Three data-loss defects, all found by the differential harness on its first run.
+Four data-loss defects. Three were found by the differential harness on its first
+run; the fourth was found by a competitive research audit AFTER those three
+shipped, and it is the one worth reading.
+
+- **Every non-regular entry kind was silently dropped — and then certified.**
+  `FileType` had two variants, `File` and `Symlink`, for a filesystem with seven
+  entry kinds. A FIFO, socket or device was in neither the directory list nor
+  the file list and left the walk entirely, so:
+
+  ```
+  $ mkfifo src/pipe && copia sync -r src dst
+  $ ls -A dst                  # the FIFO is gone
+  $ copia verify src dst
+  trees are identical — the source may safely be deleted     exit 0
+  ```
+
+  That is the SAME defect the symlink fix below was written to fix, in a shape
+  nobody had enumerated. The harness could not see it because the contract
+  scoped its equivalence equation to `domain: "the fixture shapes in
+  tests/rsync_differential.rs"` — the oracle's domain was defined to be the
+  claim's domain, so the claim could not be falsified by anything outside the
+  eight shapes already thought of.
+
+  Fixed as a class, not a case: the walk classifies symlink → directory →
+  **everything else**; `fingerprint_path` fingerprints an unrepresentable entry
+  by KIND and never opens it (opening a FIFO for reading blocks until a writer
+  appears); the REMOTE walk went `find . -type f` → `find . ! -type d`, a
+  separate enumeration that had seen regular files only; and `deliver_local`
+  REFUSES what it cannot carry with a named reason rather than blocking on it.
+
+  The principle: **being unable to copy something is survivable; being unable to
+  see it is not.** Omission reads as agreement to every comparison built on the
+  walk.
 
 - **A symlink to a directory was silently dropped.** `discover_local_files`
   pushed onto the directory stack only when `is_dir() && !is_symlink()`, and
