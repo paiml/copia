@@ -52,7 +52,12 @@ jobs:
     name: benchmarks
     runs-on: [self-hosted, clean-room]
     steps:
-      - uses: actions/checkout@v5
+      # Pinned to a SHA like every other workflow in this repo. `@v5` is a
+      # MUTABLE tag: whoever controls the tag controls what runs here, and a
+      # repointed tag is indistinguishable from no change at all in a diff.
+      # Same SHA as the rest of the repo, so there is one version of checkout
+      # everywhere rather than two that drift apart.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Compile + smoke-run benchmarks
         run: cargo bench --features async -- --test
       - name: Validate provable contracts (schema)
