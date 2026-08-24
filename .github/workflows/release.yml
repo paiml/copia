@@ -41,7 +41,7 @@ jobs:
       has_binaries: ${{ steps.bincheck.outputs.has_binaries }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Parse tag and verify version
         id: parse
@@ -117,7 +117,7 @@ jobs:
     runs-on: [self-hosted, clean-room]
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Verify package tarball
         run: |
@@ -144,7 +144,7 @@ jobs:
     runs-on: [self-hosted, clean-room]
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # `id:` is load-bearing. The action does not export a token into the
       # environment — it emits one as a STEP OUTPUT, and an output nothing reads
@@ -192,7 +192,7 @@ jobs:
       CROSS_VERSION: v0.2.5
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install target prerequisites
         run: |
