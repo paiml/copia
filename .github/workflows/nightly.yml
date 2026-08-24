@@ -292,7 +292,7 @@ jobs:
           gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
 
       - name: Create nightly release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe  # v2.6.1
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
         with:
           tag_name: nightly
           name: Nightly Build
