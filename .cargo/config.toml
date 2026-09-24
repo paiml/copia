@@ -1,5 +1,9 @@
 [build]
 jobs = 8
 
+# Portable baseline, never `native`: a release built with target-cpu=native on
+# an AVX-512 host SIGILLs on AVX2-only fleet CPUs (copia#65). x86-64-v3 is
+# AVX2/FMA/BMI2, which every fleet x86 host has. tests/portable_target_cpu.rs
+# asserts on what the compiler enabled.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
