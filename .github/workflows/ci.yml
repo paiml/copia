@@ -50,7 +50,11 @@ jobs:
   # #[test]s (tests/contract_falsification.rs) run in the reusable `ci / test`.
   benchmarks:
     name: benchmarks
-    runs-on: [self-hosted, clean-room]
+    # #70: benches/rsync_comparison.rs runs the real rsync. [self-hosted, clean-room]
+    # also matches gx10-pool* and the yoga-build* containers, which have none, so
+    # the bench panicked and `gate` went red on every PR. `intel` is a hostname
+    # standing in for the capability, as in paiml/forjar#598.
+    runs-on: [self-hosted, clean-room, X64, intel]
     steps:
       # Pinned to a SHA like every other workflow in this repo. `@v5` is a
       # MUTABLE tag: whoever controls the tag controls what runs here, and a
@@ -58,6 +62,8 @@ jobs:
       # Same SHA as the rest of the repo, so there is one version of checkout
       # everywhere rather than two that drift apart.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Assert rsync is available
+        run: command -v rsync >/dev/null || { echo "::error::rsync missing on $RUNNER_NAME (benches/rsync_comparison.rs needs it; #70)"; exit 1; }
       - name: Compile + smoke-run benchmarks
         run: cargo bench --features async -- --test
       - name: Validate provable contracts (schema)
