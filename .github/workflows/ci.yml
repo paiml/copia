@@ -63,7 +63,10 @@ jobs:
       # everywhere rather than two that drift apart.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Assert rsync is available
-        run: command -v rsync >/dev/null || { echo "::error::rsync missing on $RUNNER_NAME (benches/rsync_comparison.rs needs it; #70)"; exit 1; }
+        # A block scalar: in a plain one, " #70" would start a YAML comment and
+        # truncate the script mid-quote (it did — bash exit 2 on intel-clean-room-11).
+        run: |
+          command -v rsync >/dev/null || { echo "::error::rsync missing on $RUNNER_NAME (benches/rsync_comparison.rs needs it; #70)"; exit 1; }
       - name: Compile + smoke-run benchmarks
         run: cargo bench --features async -- --test
       - name: Validate provable contracts (schema)
