@@ -65,13 +65,15 @@ fn run_blocks(src: &str) -> Vec<(usize, String)> {
             continue;
         }
         let key_indent = indent_of(line);
+        // `- run: |` sits at the dash; its sibling keys sit two columns right.
+        let sib_indent = if dashed { key_indent + 2 } else { key_indent };
         let start = i;
         let mut script = Vec::new();
         let mut indent = None;
         while i < lines.len() {
             let l = lines[i];
             let t = l.trim_start();
-            if !t.is_empty() && indent_of(l) <= key_indent {
+            if !t.is_empty() && indent_of(l) <= sib_indent {
                 break;
             }
             let ind = *indent.get_or_insert_with(|| indent_of(l));
@@ -82,7 +84,6 @@ fn run_blocks(src: &str) -> Vec<(usize, String)> {
             });
             i += 1;
         }
-        let sib_indent = if dashed { key_indent + 2 } else { key_indent };
         if matches!(
             step_shell(&lines, run_idx, sib_indent),
             None | Some("bash" | "sh")
@@ -111,11 +112,16 @@ fn strip_expressions(script: &str) -> String {
 }
 
 /// A `\` continuation whose next line is blank: the command ends there.
+///
+/// An odd run of trailing backslashes continues; an even run is literal. Not
+/// quote- or heredoc-aware: a `\`-then-blank inside one is a loud false
+/// positive, never a silent pass.
 fn broken_continuation(script: &str) -> Option<usize> {
     let lines: Vec<&str> = script.lines().collect();
-    lines
-        .windows(2)
-        .position(|w| w[0].ends_with('\\') && !w[0].ends_with("\\\\") && w[1].trim().is_empty())
+    lines.windows(2).position(|w| {
+        let tail = w[0].len() - w[0].trim_end_matches('\\').len();
+        tail % 2 == 1 && w[1].trim().is_empty()
+    })
 }
 
 fn bash_rejects(script: &str) -> Option<String> {
@@ -215,4 +221,18 @@ fn a_pwsh_step_is_not_read_as_bash() {
 fn expressions_do_not_break_the_parse() {
     let s = strip_expressions("echo \"${{ matrix.target }}\" ${{ github.sha }}");
     assert_eq!(s, "echo \"X\" X");
+}
+
+#[test]
+fn a_dashed_run_does_not_absorb_its_sibling_keys() {
+    let yaml = "      - run: |\n          echo ok\n        shell: pwsh\n      - run: |\n          echo a\n        env:\n          X: 1\n";
+    let blocks = run_blocks(yaml);
+    assert_eq!(blocks.len(), 1, "the pwsh step is skipped");
+    assert_eq!(blocks[0].1.trim_end(), "echo a", "env: is not script");
+}
+
+#[test]
+fn an_odd_run_of_backslashes_is_a_continuation() {
+    assert_eq!(broken_continuation("echo a \\\\\\\n\necho b"), Some(0));
+    assert_eq!(broken_continuation("echo a \\\\\n\necho b"), None);
 }
