@@ -80,7 +80,9 @@ required-features = ["cli"]
 [lints.rust]
 unsafe_code = "deny"
 # `cfg(kani)` is set by the Kani model checker (`cargo kani`), not by a feature.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+# `cfg(copia_release_cpu)` is set by .cargo/config.toml alongside target-cpu, so
+# it is present exactly when the repo's release codegen flags are (copia#65).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(copia_release_cpu)'] }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
