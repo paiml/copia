@@ -61,7 +61,7 @@ jobs:
       # repointed tag is indistinguishable from no change at all in a diff.
       # Same SHA as the rest of the repo, so there is one version of checkout
       # everywhere rather than two that drift apart.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Assert rsync is available
         # A block scalar: in a plain one, " #70" would start a YAML comment and
         # truncate the script mid-quote (it did — bash exit 2 on intel-clean-room-11).
