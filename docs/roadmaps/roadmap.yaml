@@ -1,0 +1,61 @@
+roadmap_version: '1.0'
+github_enabled: true
+github_repo: paiml/copia
+roadmap:
+- id: PMAT-084
+  github_issue: 84
+  item_type: task
+  title: README SHACL shape + census (pv-readme)
+  status: planned
+  priority: medium
+  assigned_to: null
+  created: 2026-11-13T14:38:41Z
+  updated: 2026-11-13T14:38:41Z
+  spec: null
+  acceptance_criteria:
+  - Add contracts/readme-root.yaml and regenerate census.json
+  phases: []
+  subtasks: []
+  estimated_effort: null
+  labels:
+  - kind:docs
+  notes: null
+  epic: 83
+- id: PMAT-085
+  github_issue: 85
+  item_type: task
+  title: 'README.md rewrite: frontmatter, fence triage, pv-readme Contract section'
+  status: planned
+  priority: medium
+  assigned_to: null
+  created: 2026-11-13T14:38:46Z
+  updated: 2026-11-13T14:38:46Z
+  spec: null
+  acceptance_criteria:
+  - Rewrite README.md for pv-readme SHACL conformance
+  phases: []
+  subtasks: []
+  estimated_effort: null
+  labels:
+  - kind:docs
+  notes: null
+  epic: 83
+- id: PMAT-086
+  github_issue: 86
+  item_type: task
+  title: readme-shape-falsifier.sh + readme-shape-lab.yml (LAB only)
+  status: planned
+  priority: medium
+  assigned_to: null
+  created: 2026-11-13T14:38:47Z
+  updated: 2026-11-13T14:38:47Z
+  spec: null
+  acceptance_criteria:
+  - Add falsifier and LAB-only CI workflow
+  phases: []
+  subtasks: []
+  estimated_effort: null
+  labels:
+  - kind:docs
+  notes: null
+  epic: 83

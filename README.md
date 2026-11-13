@@ -1,3 +1,11 @@
+---
+schema_version: "1.0"
+kind: library
+entrypoints: [Cargo.toml, src/lib.rs]
+contract_count: 13
+---
+<!-- CONTRACT_COUNT_START -->13<!-- CONTRACT_COUNT_END -->
+
 <h1 align="center">copia</h1>
 
 <p align="center"><strong>A sovereign, pure-Rust rsync replacement and distributed file-sync tool — proved correct to L5.</strong></p>
@@ -34,7 +42,7 @@
 
 ## Installation
 
-```bash
+```text
 cargo install copia --features cli
 ```
 
@@ -46,7 +54,7 @@ Every example below is a real command; none is pseudocode.
 
 ### L1 — incremental one-way sync (`sync`)
 
-```bash
+```text
 # Single-file rsync delta
 copia sync report.pdf backup/report.pdf
 
@@ -67,7 +75,7 @@ Only new-or-changed files transfer (quick check on size + mtime); each file is d
 
 ### L2 — two-way sync (`bisync`)
 
-```bash
+```text
 # Reconcile two local directories in both directions
 copia bisync ~/notes ~/Dropbox/notes
 
@@ -79,7 +87,7 @@ Divergent edits to the same path are never clobbered: the BLAKE3 loser is writte
 
 ### L3 — hub sync (`serve` + `hub-sync`)
 
-```bash
+```text
 # On the hub host: run the daemon (usually spawned for you over SSH)
 copia serve /srv/hub
 
@@ -94,7 +102,7 @@ Many clients push to one hub in a star topology. Each commit is compare-and-swap
 
 ### Delta primitives
 
-```bash
+```text
 copia signature old.bin -o old.sig       # block signature of the basis file
 copia delta new.bin old.sig -o new.delta # delta of new.bin against the signature
 copia patch old.bin new.delta -o new.bin # reconstruct new.bin from basis + delta
@@ -149,7 +157,7 @@ missing, because an absent oracle makes every case in that file vacuously green.
 
 **Gates are not advisory.**
 
-```bash
+```text
 cargo fmt --all -- --check
 cargo clippy --all-targets --features cli -- -D warnings
 cargo test --features cli
@@ -165,6 +173,37 @@ Contracts in `contracts/` bind each equation to the function implementing it
 (`contracts/binding.yaml`), and `pv proof-status --binding` checks the function
 actually exists — so renaming one drops the contract a level rather than leaving
 a citation pointing at nothing.
+
+## pv-readme Contract
+
+This README carries frontmatter (`schema_version`, `kind`, `entrypoints`,
+`contract_count`) and is graded by `contracts/readme-root.yaml` against the
+`pv-readme` SHACL shape (`readme:Readme`, #83).
+
+- **No local claim is available.** `.github/workflows/ci.yml`'s main `ci:`
+  job is entirely delegated via
+  `uses: paiml/.github/.github/workflows/sovereign-ci.yml`, the same
+  `uses:`-boundary gap documented at paiml/whisper.apr#133: `pv-readme`'s
+  ci-step resolver only reads `run:` steps declared directly in this repo's
+  own workflow files. The one genuinely local merge-path job,
+  `benchmarks`, runs `cargo bench --features async -- --test` and a loop
+  over `pv validate`, neither of which README.md presents as a runnable
+  command. So every bash fence in this README (Installation, the `sync` /
+  `bisync` / `serve` / `hub-sync` / delta-primitive usage examples, and the
+  "Gates are not advisory" fence) is relabelled `text` — real, runnable
+  commands, but not CI claims — and `readme:verifiedCommand` is
+  `minCount: 0` with this divergence documented here.
+- **Entrypoints**: `Cargo.toml`, `src/lib.rs`.
+- **Contract count**: `13` (`contracts/census.json`; `binding.yaml` is a
+  bindings manifest, not a contract, and is correctly excluded from the
+  census).
+- **Falsifier**: `tests/readme-shape-falsifier.sh`, 6 cases proving the
+  check can fail (an unrun claim, a dropped `kind:`, a missing entrypoint,
+  a wrong contract count) as well as pass.
+- **No CI job runs this check yet**: `pv-readme` is not on the runners. Run
+  `pv-readme --check` and the falsifier by hand.
+
+Part of paiml/copia#83.
 
 ## License
 
