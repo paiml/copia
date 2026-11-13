@@ -200,8 +200,8 @@ This README carries frontmatter (`schema_version`, `kind`, `entrypoints`,
 - **Falsifier**: `tests/readme-shape-falsifier.sh`, 6 cases proving the
   check can fail (an unrun claim, a dropped `kind:`, a missing entrypoint,
   a wrong contract count) as well as pass.
-- **LAB, not GATE** (C324): `.github/workflows/readme-shape-lab.yml` runs
-  nightly plus `workflow_dispatch`, never on the PR path.
+- **No CI job runs this check yet**: `pv-readme` is not on the runners. Run
+  `pv-readme --check` and the falsifier by hand.
 
 Part of paiml/copia#83.
 
