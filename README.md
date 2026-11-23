@@ -175,3 +175,7 @@ MIT License — see [LICENSE](LICENSE).
 - The rsync algorithm by Andrew Tridgell and Paul Mackerras.
 - The BLAKE3 team for the fast cryptographic hash.
 - The Rust community for excellent tooling.
+
+<!-- FUNNEL-001 footer: replace copia with the repo name -->
+---
+📚 **Learn this hands-on:** [Pragmatic AI Labs courses on Coursera](https://www.coursera.org/partners/pragmatic-ai-labs?utm_source=github&utm_medium=readme&utm_campaign=funnel_2026q4&utm_content=copia) · ✉ [Free newsletter](https://ds500.paiml.com/mailing?utm_source=github&utm_medium=readme&utm_campaign=funnel_2026q4&utm_content=copia)
