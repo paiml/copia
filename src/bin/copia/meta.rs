@@ -3,7 +3,7 @@
 
 use super::plan::{FileMeta, MetaMap};
 use super::reconcile::{FileType, Fingerprint, FpMap};
-use super::transfer::discover_local_files;
+use super::transfer::{discover_local_files, walk_local};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -85,33 +85,49 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 }
 
 /// Walk a local tree and stat every file into a `MetaMap` of relative paths.
-pub fn discover_local_with_meta(root: &Path) -> Result<MetaMap, Box<dyn std::error::Error>> {
+///
+/// Every entry that cannot be listed, stat-ed, or carried is pushed to
+/// `omitted` (issue #50). An entry is never silently left out of the map: an
+/// omitted source entry is what makes `--delete` unsafe.
+pub fn discover_local_with_meta(root: &Path, omitted: &mut Vec<String>) -> MetaMap {
     let mut out = MetaMap::new();
-    for rel in discover_local_files(root)? {
+    for rel in walk_local(root, omitted) {
+        let full = root.join(&rel);
         // symlink_metadata, not metadata: `metadata` FOLLOWS the link, so a
-        // DANGLING symlink errors and the `if let Ok` silently drops it from
-        // the plan — copia then omits a path rsync -a faithfully recreates.
-        // Caught by the rsync differential harness on the `dangling-symlink`
-        // shape. A symlink's own size/mtime is the right quick-check value
-        // anyway; `deliver_local` recreates it as a link regardless.
-        if let Ok(meta) = std::fs::symlink_metadata(root.join(&rel)) {
-            out.insert(
-                rel,
-                FileMeta {
-                    size: meta.len(),
-                    mtime: mtime_secs(&meta),
-                },
-            );
+        // DANGLING symlink errors and the entry would be dropped — copia then
+        // omits a path rsync -a faithfully recreates. Caught by the rsync
+        // differential harness on the `dangling-symlink` shape. A symlink's own
+        // size/mtime is the right quick-check value anyway; `deliver_local`
+        // recreates it as a link regardless.
+        match std::fs::symlink_metadata(&full) {
+            Ok(meta) => {
+                let ft = meta.file_type();
+                if !(ft.is_file() || ft.is_symlink()) {
+                    omitted.push(format!("cannot carry {} {}", kind_tag(ft), full.display()));
+                }
+                out.insert(
+                    rel,
+                    FileMeta {
+                        size: meta.len(),
+                        mtime: mtime_secs(&meta),
+                    },
+                );
+            }
+            Err(e) => omitted.push(format!("cannot stat {}: {e}", full.display())),
         }
     }
-    Ok(out)
+    out
 }
 
 /// List a remote tree with size+mtime in one `find -printf` over SSH.
+///
+/// A listing that cannot run or exits non-zero yields an empty map and an entry
+/// in `omitted`. It never reads as "the remote is empty".
 pub async fn discover_remote_with_meta(
     host: &str,
     remote_root: &str,
-) -> Result<MetaMap, Box<dyn std::error::Error>> {
+    omitted: &mut Vec<String>,
+) -> MetaMap {
     let escaped = remote_root.replace('\\', "\\\\").replace('\'', "\\'");
     // %s size, %T@ mtime (float secs), %p path — TAB-separated, NUL-terminated.
     let output = tokio::process::Command::new("ssh")
@@ -130,16 +146,30 @@ pub async fn discover_remote_with_meta(
             "cd $'{escaped}' && find . ! -type d -printf '%s\\t%T@\\t%p\\0'"
         ))
         .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to list {host}:{remote_root}: {stderr}").into());
+        .await;
+    match output {
+        Ok(output) if output.status.success() => parse_remote_meta_output(&output.stdout, omitted),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            omitted.push(format!(
+                "failed to list {host}:{remote_root} (exit {}): {}",
+                output.status,
+                stderr.trim()
+            ));
+            MetaMap::new()
+        }
+        Err(e) => {
+            omitted.push(format!(
+                "failed to start listing of {host}:{remote_root}: {e}"
+            ));
+            MetaMap::new()
+        }
     }
-    Ok(parse_remote_meta_output(&output.stdout))
 }
 
-/// Parse NUL-terminated `size\tmtime\t./path` records into a `MetaMap`.
-pub fn parse_remote_meta_output(stdout: &[u8]) -> MetaMap {
+/// Parse NUL-terminated `size\tmtime\t./path` records into a `MetaMap`. A record
+/// that does not parse is pushed to `omitted`, never dropped silently.
+pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> MetaMap {
     let mut out = MetaMap::new();
     for entry in stdout.split(|&b| b == 0) {
         if entry.is_empty() {
@@ -149,9 +179,11 @@ pub fn parse_remote_meta_output(stdout: &[u8]) -> MetaMap {
         let mut parts = s.splitn(3, '\t');
         let (Some(size), Some(mtime), Some(path)) = (parts.next(), parts.next(), parts.next())
         else {
+            omitted.push(format!("malformed remote record: {s}"));
             continue;
         };
         let Ok(size) = size.parse::<u64>() else {
+            omitted.push(format!("malformed remote size: {s}"));
             continue;
         };
         // %T@ is "secs.nanos" — truncate to whole seconds.
@@ -185,7 +217,7 @@ mod tests {
     #[test]
     fn parse_meta_reads_size_mtime_path_and_truncates_subsecond() {
         let raw = b"1024\t1700000000.500\t./a.txt\x00\t\t\x00512\t1699999999\t./sub/b.bin\0";
-        let m = parse_remote_meta_output(raw);
+        let m = parse_remote_meta_output(raw, &mut Vec::new());
         assert_eq!(m.len(), 2);
         assert_eq!(
             m[&PathBuf::from("a.txt")],
@@ -206,8 +238,91 @@ mod tests {
     #[test]
     fn parse_meta_skips_malformed_records() {
         // missing fields / non-numeric size are dropped, not panicked on
-        let m = parse_remote_meta_output(b"notanumber\t123\t./x\0\0only-one-field\0");
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(b"notanumber\t123\t./x\0\0only-one-field\0", &mut omitted);
         assert!(m.is_empty());
+        // ...and each one is an omission, so a sync can never delete on its strength.
+        assert_eq!(omitted.len(), 2, "{omitted:?}");
+    }
+
+    /// Issue #50: a remote listing that exits non-zero is an omission, and it
+    /// reads as an empty map, never as "the remote has nothing".
+    #[tokio::test]
+    async fn remote_listing_failure_is_an_omission() {
+        let mut omitted = Vec::new();
+        let m =
+            discover_remote_with_meta("no-such-host.invalid", "/nonexistent", &mut omitted).await;
+        assert!(m.is_empty());
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+    }
+
+    /// Issue #50: a directory whose entries cannot be lstat-ed is an omission,
+    /// and the entry is not silently absent from the map.
+    #[cfg(unix)]
+    #[test]
+    fn unstatable_entry_is_an_omission() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("copia-50-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("locked")).unwrap();
+        std::fs::write(base.join("locked/f"), b"x").unwrap();
+        std::fs::write(base.join("ok"), b"y").unwrap();
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o444))
+            .unwrap();
+        let mut omitted = Vec::new();
+        let m = discover_local_with_meta(&base, &mut omitted);
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(m.contains_key(&PathBuf::from("ok")));
+        assert!(!m.contains_key(&PathBuf::from("locked/f")));
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("cannot stat"), "{omitted:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #50: an entry kind copia cannot carry (a FIFO) is an omission.
+    #[cfg(unix)]
+    #[test]
+    fn uncarriable_entry_kind_is_an_omission() {
+        let base = std::env::temp_dir().join(format!("copia-50-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(base.join("pipe"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut omitted = Vec::new();
+        let _ = discover_local_with_meta(&base, &mut omitted);
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].starts_with("cannot carry fifo"), "{omitted:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #50: an unreadable subdirectory is named as an omission, and the
+    /// rest of the tree is still walked and returned.
+    #[cfg(unix)]
+    #[test]
+    fn walk_names_an_unreadable_subdirectory_and_keeps_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("copia-50-metawalk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("locked")).unwrap();
+        std::fs::write(base.join("locked/f"), b"x").unwrap();
+        std::fs::write(base.join("ok"), b"y").unwrap();
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let mut omitted = Vec::new();
+        let files = walk_local(&base, &mut omitted);
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(files, vec![PathBuf::from("ok")]);
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(
+            omitted[0].starts_with("unreadable directory"),
+            "{omitted:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -216,11 +331,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("d")).unwrap();
         std::fs::write(base.join("d/f"), b"hello").unwrap();
-        let m = discover_local_with_meta(&base).unwrap();
+        let m = discover_local_with_meta(&base, &mut Vec::new());
         assert_eq!(m[&PathBuf::from("d/f")].size, 5);
         // set + read back the mtime at 1s granularity
         set_local_mtime(&base.join("d/f"), 1_600_000_000).unwrap();
-        let m2 = discover_local_with_meta(&base).unwrap();
+        let m2 = discover_local_with_meta(&base, &mut Vec::new());
         assert_eq!(m2[&PathBuf::from("d/f")].mtime, 1_600_000_000);
         let _ = std::fs::remove_dir_all(&base);
     }

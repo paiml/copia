@@ -86,6 +86,8 @@ fn report(
     start: Instant,
     progress: &TransferProgress,
     plan: &SyncPlan,
+    deleted: usize,
+    omitted: &[String],
     src_desc: &str,
     dst_desc: &str,
     verbose: bool,
@@ -93,11 +95,12 @@ fn report(
     let elapsed = start.elapsed();
     let tx = progress.bytes();
     println!(
-        "\nComplete: {} sent, {} skipped, {} deleted, {} failed",
+        "\nComplete: {} sent, {} skipped, {} deleted, {} failed, {} omitted",
         progress.done(),
         plan.skipped,
-        plan.delete.len(),
-        progress.failed()
+        deleted,
+        progress.failed(),
+        omitted.len()
     );
     println!(
         "Transferred {} in {:.1}s ({}/s)",
@@ -111,7 +114,7 @@ fn report(
     if progress.failed() > 0 {
         return Err(format!("{} file(s) failed to transfer", progress.failed()).into());
     }
-    Ok(())
+    omission_error(omitted)
 }
 
 /// The `(source, destination)` labels for this direction, as an operator sees
@@ -140,25 +143,61 @@ fn endpoint_descriptions(
 /// (first sync) yields an empty map, so every source file is new.
 /// Resolve each `?` into a binding BEFORE any await so no error-carrying
 /// temporary is held across it (keeps the future `Send`).
+/// Both listings. Every omission from either side lands in `omitted`: an
+/// incomplete listing is never read as an empty tree (issue #50).
 async fn discover_both(
     dir: Dir,
     host: &str,
     remote_root: &str,
     local_root: &Path,
-) -> Result<(MetaMap, MetaMap), Box<dyn std::error::Error>> {
+    omitted: &mut Vec<String>,
+) -> (MetaMap, MetaMap) {
     match dir {
         Dir::Push => {
-            let local = discover_local_with_meta(local_root)?;
-            let remote = discover_remote_with_meta(host, remote_root)
-                .await
-                .unwrap_or_default();
-            Ok((local, remote))
+            let local = discover_local_with_meta(local_root, omitted);
+            let remote = discover_remote_with_meta(host, remote_root, omitted).await;
+            (local, remote)
         }
         Dir::Pull => {
-            let remote = discover_remote_with_meta(host, remote_root).await?;
-            let local = discover_local_with_meta(local_root).unwrap_or_default();
-            Ok((remote, local))
+            let remote = discover_remote_with_meta(host, remote_root, omitted).await;
+            let local = discover_local_with_meta(local_root, omitted);
+            (remote, local)
         }
+    }
+}
+
+/// The veto, stated once. An incomplete source (any omission) may not delete.
+/// The delete pass checks this flag itself, so the guarantee does not depend on
+/// how the plan was built.
+fn omission_error(omitted: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if omitted.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "run incomplete: {} source entr{} omitted (see OMITTED above)",
+        omitted.len(),
+        if omitted.len() == 1 { "y" } else { "ies" }
+    )
+    .into())
+}
+
+/// Print every omission, and say plainly when `--delete` is vetoed by them.
+fn veto_notice(omitted: &[String], plan: &SyncPlan) {
+    if omitted.is_empty() {
+        return;
+    }
+    eprintln!(
+        "OMITTED {} source entr(y/ies); the run is incomplete:",
+        omitted.len()
+    );
+    for line in omitted {
+        eprintln!("  {line}");
+    }
+    if !plan.delete.is_empty() {
+        eprintln!(
+            "VETOED: --delete skipped {} destination file(s) because the source is incomplete",
+            plan.delete.len()
+        );
     }
 }
 
@@ -236,21 +275,24 @@ async fn run_remote(
     let (src_desc, dst_desc) = endpoint_descriptions(dir, host, remote_root, local_root);
     eprintln!("Scanning {src_desc} and {dst_desc}...");
 
-    let (src_meta, dst_meta) = discover_both(dir, host, remote_root, local_root).await?;
+    let mut omitted = Vec::new();
+    let (src_meta, dst_meta) =
+        discover_both(dir, host, remote_root, local_root, &mut omitted).await;
     // Empty source short-circuits (unless mirroring, where empty source is a
     // legitimate "delete everything on the destination").
     if src_meta.is_empty() && !opts.delete {
         eprintln!("No files found.");
-        return Ok(());
+        return omission_error(&omitted);
     }
     let plan = build_plan(&src_meta, &dst_meta, &opts.excludes, opts.delete);
     print_plan(&plan, opts.dry_run);
+    veto_notice(&omitted, &plan);
     if opts.dry_run {
-        return Ok(());
+        return omission_error(&omitted);
     }
     if plan.transfer.is_empty() && plan.delete.is_empty() {
         println!("Already up to date ({} files).", src_meta.len());
-        return Ok(());
+        return omission_error(&omitted);
     }
 
     let dirs = collect_dirs(&plan.transfer);
@@ -267,10 +309,23 @@ async fn run_remote(
     );
     join_handles(handles).await;
 
-    if !plan.delete.is_empty() {
+    // The veto, enforced at the delete pass itself.
+    let deleted = if omitted.is_empty() && !plan.delete.is_empty() {
         apply_remote_deletes(dir, host, remote_root, local_root, &plan.delete).await;
-    }
-    report(start, &progress, &plan, &src_desc, &dst_desc, opts.verbose)
+        plan.delete.len()
+    } else {
+        0
+    };
+    report(
+        start,
+        &progress,
+        &plan,
+        deleted,
+        &omitted,
+        &src_desc,
+        &dst_desc,
+        opts.verbose,
+    )
 }
 
 /// Atomic pull: stream to a `.copia-tmp` sibling, rename into place, set mtime.
@@ -340,20 +395,25 @@ async fn run_local(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     eprintln!("Scanning {} and {}...", src.display(), dst.display());
-    let src_meta = discover_local_with_meta(src)?;
+    // Omissions from EITHER side land here. Only the source's omissions can
+    // matter to a delete, but an incomplete destination listing is equally an
+    // incomplete run, so it fails the exit code too.
+    let mut omitted = Vec::new();
+    let src_meta = discover_local_with_meta(src, &mut omitted);
     if src_meta.is_empty() && !opts.delete {
         eprintln!("No files found.");
-        return Ok(());
+        return omission_error(&omitted);
     }
-    let dst_meta = discover_local_with_meta(dst).unwrap_or_default();
+    let dst_meta = discover_local_with_meta(dst, &mut omitted);
     let plan = build_plan(&src_meta, &dst_meta, &opts.excludes, opts.delete);
     print_plan(&plan, opts.dry_run);
+    veto_notice(&omitted, &plan);
     if opts.dry_run {
-        return Ok(());
+        return omission_error(&omitted);
     }
     if plan.transfer.is_empty() && plan.delete.is_empty() {
         println!("Already up to date ({} files).", src_meta.len());
-        return Ok(());
+        return omission_error(&omitted);
     }
 
     // Create EVERY directory in the source, not only the ones that happen to
@@ -386,16 +446,22 @@ async fn run_local(
     }
     join_handles(handles).await;
 
-    if !plan.delete.is_empty() {
+    // The veto, enforced at the delete pass itself.
+    let deleted = if omitted.is_empty() && !plan.delete.is_empty() {
         for rel in &plan.delete {
             let _ = std::fs::remove_file(dst.join(rel));
         }
         eprintln!("Deleted {} stale file(s)", plan.delete.len());
-    }
+        plan.delete.len()
+    } else {
+        0
+    };
     report(
         start,
         &progress,
         &plan,
+        deleted,
+        &omitted,
         &src.display().to_string(),
         &dst.display().to_string(),
         opts.verbose,
@@ -621,8 +687,92 @@ mod tests {
         assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
         // no temp file left behind
         assert!(!tmp_path(&dst).exists());
-        let m = discover_local_with_meta(&base).unwrap();
+        let m = discover_local_with_meta(&base, &mut Vec::new());
         assert_eq!(m[&PathBuf::from("d")].mtime, 1_600_000_000);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 RED: a source entry whose stat fails is silently dropped from the
+    /// source map, so `--delete` removes its destination copy. A `0o444` directory
+    /// is listable but its entries cannot be lstat-ed (search bit missing).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_delete_is_vetoed_when_a_source_entry_cannot_be_statted() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("copia-50-stat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("s");
+        let dst = base.join("d");
+        std::fs::create_dir_all(src.join("locked")).unwrap();
+        std::fs::create_dir_all(dst.join("locked")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("locked/b.txt"), b"b").unwrap();
+        std::fs::write(dst.join("locked/b.txt"), b"b").unwrap();
+        std::fs::write(dst.join("stale.txt"), b"stale").unwrap();
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o444))
+            .unwrap();
+        let opts = SyncOptions {
+            jobs: 2,
+            verbose: false,
+            dry_run: false,
+            delete: true,
+            excludes: vec![],
+        };
+        let result = run_local(&src, &dst, &opts).await;
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(result.is_err(), "an omitted source entry must fail the run");
+        assert!(
+            dst.join("stale.txt").exists(),
+            "delete ran on an incomplete source"
+        );
+        assert!(
+            dst.join("locked/b.txt").exists(),
+            "omitted source entry's destination copy was deleted"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 acceptance: an unreadable subdirectory with `--delete` deletes
+    /// nothing and exits non-zero.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_delete_is_vetoed_by_an_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("copia-50-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("s");
+        let dst = base.join("d");
+        std::fs::create_dir_all(src.join("locked")).unwrap();
+        std::fs::create_dir_all(dst.join("locked")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("locked/b.txt"), b"b").unwrap();
+        std::fs::write(dst.join("locked/b.txt"), b"b").unwrap();
+        std::fs::write(dst.join("stale.txt"), b"stale").unwrap();
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let opts = SyncOptions {
+            jobs: 2,
+            verbose: false,
+            dry_run: false,
+            delete: true,
+            excludes: vec![],
+        };
+        let result = run_local(&src, &dst, &opts).await;
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "an unreadable subdirectory must exit non-zero"
+        );
+        assert!(
+            dst.join("stale.txt").exists(),
+            "delete ran on an incomplete source"
+        );
+        assert!(
+            dst.join("locked/b.txt").exists(),
+            "omitted entry was deleted"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 }

@@ -5,15 +5,46 @@ use std::path::{Path, PathBuf};
 use tracing::instrument;
 
 /// Discover all files under a directory recursively, returning paths relative to root.
+///
+/// Fails on the first walk error. `copia sync` uses [`walk_local`], which records
+/// the error as an omission and keeps walking.
 pub fn discover_local_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut omitted = Vec::new();
+    let files = walk_local(root, &mut omitted);
+    match omitted.into_iter().next() {
+        Some(first) => Err(first.into()),
+        None => Ok(files),
+    }
+}
+
+/// Walk `root` like [`discover_local_files`], but never drop an entry silently:
+/// every directory or entry the walk could not read is pushed to `omitted` and
+/// the rest of the tree is still returned (issue #50). The caller decides what an
+/// omission means; `sync` treats any omission as a veto on `--delete`.
+pub fn walk_local(root: &Path, omitted: &mut Vec<String>) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
 
     while let Some(dir) = dirs.pop() {
-        let entries = std::fs::read_dir(&dir)?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                omitted.push(format!("unreadable directory {}: {e}", dir.display()));
+                continue;
+            }
+        };
         for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => {
+                    omitted.push(format!("unreadable entry in {}: {e}", dir.display()));
+                    continue;
+                }
+            };
+            let Ok(rel) = path.strip_prefix(root).map(Path::to_path_buf) else {
+                omitted.push(format!("entry outside walk root: {}", path.display()));
+                continue;
+            };
             // ORDER MATTERS: a symlink is an ENTRY, never a door to walk
             // through, so it is classified before is_dir/is_file — both of
             // which FOLLOW links.
@@ -29,7 +60,6 @@ pub fn discover_local_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::er
             // authorises deleting a source reported success over data it had
             // just lost.
             if path.is_symlink() {
-                let rel = path.strip_prefix(root)?.to_path_buf();
                 files.push(rel);
             } else if path.is_dir() {
                 dirs.push(path);
@@ -41,14 +71,13 @@ pub fn discover_local_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::er
                 // lost one IDENTICAL. Recording it may mean the transfer fails
                 // loudly on an entry copia cannot carry; that is the correct
                 // outcome and strictly better than a silent omission.
-                let rel = path.strip_prefix(root)?.to_path_buf();
                 files.push(rel);
             }
         }
     }
 
     files.sort();
-    Ok(files)
+    files
 }
 
 /// Every directory under `root`, relative — INCLUDING ones that hold no files.
