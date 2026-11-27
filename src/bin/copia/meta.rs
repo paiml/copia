@@ -142,8 +142,9 @@ pub async fn discover_remote_with_meta(
     } else {
         String::new()
     };
-    // %y entry kind, %s size, %T@ mtime (float secs), %p path. TAB-separated,
-    // NUL-terminated.
+    // Kind = %y (the entry) followed by %Y (what it resolves to), e.g. `ff`,
+    // `lf` (symlink to a file), `lN` (dangling), `lp` (symlink to a FIFO).
+    // %s size, %T@ mtime (float secs), %p path. TAB-separated, NUL-terminated.
     let output = tokio::process::Command::new("ssh")
         .arg(host)
         .arg(format!(
@@ -157,7 +158,7 @@ pub async fn discover_remote_with_meta(
             // everything else is an ENTRY and must be visible even when copia
             // cannot carry it. `find` does not follow symlinks by default, so
             // %s/%T@ describe the link itself rather than its target.
-            "{absent_guard}cd {root_q} && find . ! -type d -printf '%y\\t%s\\t%T@\\t%p\\0'"
+            "{absent_guard}cd {root_q} && find . ! -type d -printf '%y%Y\\t%s\\t%T@\\t%p\\0'"
         ))
         .output()
         .await;
@@ -201,15 +202,37 @@ fn absent_root_guard(remote_root: &str) -> String {
     format!("[ -d {parent} ] && [ -x {parent} ] && [ ! -e {root} ] && [ ! -L {root} ] && exit 0; ")
 }
 
-/// A stable name for a remote entry kind, from `find -printf %y`.
-fn remote_kind_name(kind: &str) -> &'static str {
-    match kind {
-        "p" => "fifo",
-        "s" => "socket",
-        "c" => "char-device",
-        "b" => "block-device",
-        "D" => "door",
+/// Whether a remote record's kind (`%y%Y`) is one copia carries: a regular file,
+/// or a symlink that resolves to a regular file (its bytes are streamed by `cat`).
+/// A symlink to a FIFO, a directory, a socket or a device, and a dangling
+/// symlink (`N`) or loop (`L`), is not carried: `cat` would block on a FIFO or
+/// fail, and that failure must not be the only thing standing between a run and
+/// `--delete`.
+fn remote_kind_carried(kind: &str) -> bool {
+    matches!(kind, "ff" | "lf")
+}
+
+/// A stable name for a remote record kind (`%y%Y`), for the omission message.
+fn remote_entry_name(kind: &str) -> String {
+    let mut chars = kind.chars();
+    let (Some(entry), Some(target), None) = (chars.next(), chars.next(), chars.next()) else {
+        return "malformed-kind".to_owned();
+    };
+    let name = |k: char| match k {
+        'f' => "file",
+        'd' => "directory",
+        'p' => "fifo",
+        's' => "socket",
+        'c' => "char-device",
+        'b' => "block-device",
+        'D' => "door",
         _ => "unknown",
+    };
+    match (entry, target) {
+        ('l', 'N') => "dangling-symlink".to_owned(),
+        ('l', 'L') => "symlink-loop".to_owned(),
+        ('l', t) => format!("symlink-to-{}", name(t)),
+        (e, _) => name(e).to_owned(),
     }
 }
 
@@ -225,7 +248,16 @@ pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> Met
         if entry.is_empty() {
             continue;
         }
-        let s = String::from_utf8_lossy(entry);
+        // A name that is not UTF-8 cannot be carried faithfully: lossy decoding
+        // renamed it, so the plan transferred a different file and deleted the
+        // real one. It is an omission, never a guess.
+        let Ok(s) = std::str::from_utf8(entry) else {
+            omitted.push(format!(
+                "malformed remote record (path is not UTF-8): {}",
+                String::from_utf8_lossy(entry)
+            ));
+            continue;
+        };
         let mut parts = s.splitn(4, '\t');
         let (Some(kind), Some(size), Some(mtime), Some(path)) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -237,18 +269,20 @@ pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> Met
             omitted.push(format!("malformed remote size: {s}"));
             continue;
         };
-        // %T@ is "secs.nanos" — truncate to whole seconds.
-        let mtime = mtime
-            .split('.')
-            .next()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0);
+        // %T@ is "secs.nanos" — truncate to whole seconds. A bad mtime is an
+        // omission, not a default of 0: a 0 would read as "changed" and sit in
+        // the plan with a fabricated timestamp.
+        let Some(Ok(mtime)) = mtime.split('.').next().map(str::parse::<i64>) else {
+            omitted.push(format!("malformed remote mtime: {s}"));
+            continue;
+        };
         let rel = path.strip_prefix("./").unwrap_or(path);
         if rel.is_empty() {
+            omitted.push(format!("malformed remote record (empty path): {s}"));
             continue;
         }
-        if !matches!(kind, "f" | "l") {
-            omitted.push(format!("cannot carry {} {rel}", remote_kind_name(kind)));
+        if !remote_kind_carried(kind) {
+            omitted.push(format!("cannot carry {} {rel}", remote_entry_name(kind)));
             continue;
         }
         out.insert(PathBuf::from(rel), FileMeta { size, mtime });
@@ -272,7 +306,7 @@ mod tests {
 
     #[test]
     fn parse_meta_reads_size_mtime_path_and_truncates_subsecond() {
-        let raw = b"f\t1024\t1700000000.500\t./a.txt\x00f\t512\t1699999999\t./sub/b.bin\0";
+        let raw = b"ff\t1024\t1700000000.500\t./a.txt\x00ff\t512\t1699999999\t./sub/b.bin\0";
         let m = parse_remote_meta_output(raw, &mut Vec::new());
         assert_eq!(m.len(), 2);
         assert_eq!(
@@ -291,12 +325,34 @@ mod tests {
         );
     }
 
+    /// Issue #50 review finding 3 RED: a malformed record is an omission, never
+    /// dropped or defaulted. Three shapes: an empty path, a non-numeric mtime
+    /// (defaulted to 0 before), and a non-UTF-8 name (lossy-decoded before, so
+    /// the plan deleted the real file and transferred a renamed copy).
+    #[test]
+    fn malformed_remote_records_are_omissions() {
+        let cases: [&[u8]; 3] = [
+            b"ff\t3\t1700000000.0\t./\x00",
+            b"ff\t3\tabc\t./x\x00",
+            b"ff\t1\t1700000000.0\t./caf\xe9\x00",
+        ];
+        for raw in cases {
+            let mut omitted = Vec::new();
+            let m = parse_remote_meta_output(raw, &mut omitted);
+            assert!(m.is_empty(), "{raw:?} was planned: {m:?}");
+            assert_eq!(omitted.len(), 1, "{raw:?} was not omitted: {omitted:?}");
+            assert!(omitted[0].contains("malformed"), "{omitted:?}");
+        }
+    }
+
     #[test]
     fn parse_meta_skips_malformed_records() {
         // missing fields / non-numeric size are dropped, not panicked on
         let mut omitted = Vec::new();
-        let m =
-            parse_remote_meta_output(b"f\tnotanumber\t123\t./x\0\0only-one-field\0", &mut omitted);
+        let m = parse_remote_meta_output(
+            b"ff\tnotanumber\t123\t./x\0\0only-one-field\0",
+            &mut omitted,
+        );
         assert!(m.is_empty());
         // ...and each one is an omission, so a sync can never delete on its strength.
         assert_eq!(omitted.len(), 2, "{omitted:?}");
@@ -308,7 +364,7 @@ mod tests {
     fn remote_fifo_entry_is_an_omission_and_not_planned() {
         let mut omitted = Vec::new();
         let m = parse_remote_meta_output(
-            b"p\t0\t1700000000.0\t./pipe\x00f\t3\t1700000000.0\t./a.txt\x00",
+            b"pp\t0\t1700000000.0\t./pipe\x00ff\t3\t1700000000.0\t./a.txt\x00",
             &mut omitted,
         );
         assert_eq!(m.len(), 1, "{m:?}");

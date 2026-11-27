@@ -160,7 +160,13 @@ async fn discover_both(
         }
         Dir::Pull => {
             let remote = discover_remote_with_meta(host, remote_root, false, omitted).await;
-            let local = discover_local_with_meta(local_root, omitted);
+            // The local root is the DESTINATION: an absent one is a first sync,
+            // as it is for a push and for a local sync (`run_local`).
+            let local = if is_absent(local_root) {
+                MetaMap::new()
+            } else {
+                discover_local_with_meta(local_root, omitted)
+            };
             (remote, local)
         }
     }
@@ -179,6 +185,24 @@ fn omission_error(omitted: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         if omitted.len() == 1 { "y" } else { "ies" }
     )
     .into())
+}
+
+/// A transfer that failed leaves the destination as incomplete as an omitted
+/// source entry does. It sets the omitted flag, so `--delete` is vetoed by the
+/// same gate. Before this, the delete pass checked only the listing, and a
+/// file that failed in `cat` or `ssh` still let the delete run.
+fn veto_failed_transfers(progress: &TransferProgress, plan: &SyncPlan, omitted: &mut Vec<String>) {
+    let failed = progress.failed();
+    if failed == 0 {
+        return;
+    }
+    omitted.push(format!("{failed} transfer(s) failed"));
+    if !plan.delete.is_empty() {
+        eprintln!(
+            "VETOED: --delete skipped {} destination file(s) because transfers failed",
+            plan.delete.len()
+        );
+    }
 }
 
 /// Print every omission, and say plainly when `--delete` is vetoed by them.
@@ -308,6 +332,7 @@ async fn run_remote(
         opts.jobs,
     );
     join_handles(handles).await;
+    veto_failed_transfers(&progress, &plan, &mut omitted);
 
     // The veto, enforced at the delete pass itself.
     let deleted = if omitted.is_empty() && !plan.delete.is_empty() {
@@ -460,6 +485,7 @@ async fn run_local(
         }));
     }
     join_handles(handles).await;
+    veto_failed_transfers(&progress, &plan, &mut omitted);
 
     // The veto, enforced at the delete pass itself.
     let deleted = if omitted.is_empty() && !plan.delete.is_empty() {
@@ -993,6 +1019,128 @@ mod tests {
         assert!(
             local.join("stale.txt").exists(),
             "run_remote deleted on an incomplete remote listing"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding 1 RED: a remote symlink whose target is a FIFO
+    /// must be an omission on a pull. The listing carried it as a symlink, `cat`
+    /// followed it into the FIFO, and the run blocked forever.
+    #[cfg(unix)]
+    #[test]
+    fn remote_symlink_to_fifo_vetoes_pull_delete() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-link-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        // The FIFO sits OUTSIDE the listed root, so the link is the only entry
+        // that points at it.
+        let made = std::process::Command::new("mkfifo")
+            .arg(base.join("pipe"))
+            .status()
+            .expect("mkfifo")
+            .success();
+        assert!(made, "mkfifo failed");
+        std::os::unix::fs::symlink(base.join("pipe"), remote.join("link")).unwrap();
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        let err = res.expect_err("a symlink to a FIFO on the remote must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            local.join("stale.txt").exists(),
+            "delete ran past a remote symlink the listing could not carry"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding 1 RED: a dangling remote symlink on a pull must
+    /// veto --delete. Its transfer failed, and the delete ran anyway.
+    #[cfg(unix)]
+    #[test]
+    fn remote_dangling_symlink_vetoes_pull_delete() {
+        fake_ssh_on_path();
+        let base =
+            std::env::temp_dir().join(format!("copia-50-dangling-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink("nowhere", remote.join("dangling")).unwrap();
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        let err = res.expect_err("a dangling remote symlink must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            local.join("stale.txt").exists(),
+            "delete ran past a dangling remote symlink"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding 2 RED: a pull into a destination root that does
+    /// not exist is a first sync, as it is for a push and for a local sync.
+    #[cfg(unix)]
+    #[test]
+    fn pull_to_an_absent_local_root_is_a_first_sync() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-first-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local-absent");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        assert!(res.is_ok(), "first pull to an absent root failed: {res:?}");
+        assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"a");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding 4 RED: a file that fails to transfer must veto
+    /// --delete. The unreadable remote file failed in `cat`, the omitted flag
+    /// stayed clear, and the stale local file was deleted.
+    #[cfg(unix)]
+    #[test]
+    fn failed_pull_transfer_vetoes_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-xfer-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        std::fs::write(remote.join("secret.txt"), b"s").unwrap();
+        std::fs::set_permissions(
+            remote.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        std::fs::set_permissions(
+            remote.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(res.is_err(), "a failed transfer must fail the run");
+        assert!(
+            local.join("stale.txt").exists(),
+            "--delete ran although a transfer failed"
         );
         std::fs::remove_dir_all(&base).ok();
     }
