@@ -155,11 +155,11 @@ async fn discover_both(
     match dir {
         Dir::Push => {
             let local = discover_local_with_meta(local_root, omitted);
-            let remote = discover_remote_with_meta(host, remote_root, omitted).await;
+            let remote = discover_remote_with_meta(host, remote_root, true, omitted).await;
             (local, remote)
         }
         Dir::Pull => {
-            let remote = discover_remote_with_meta(host, remote_root, omitted).await;
+            let remote = discover_remote_with_meta(host, remote_root, false, omitted).await;
             let local = discover_local_with_meta(local_root, omitted);
             (remote, local)
         }
@@ -387,6 +387,14 @@ async fn apply_remote_deletes(
     eprintln!("Deleted {} stale file(s) on the destination", dels.len());
 }
 
+/// True when `path` does not exist at all. A dangling symlink exists.
+fn is_absent(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 #[allow(clippy::cast_possible_truncation)]
 async fn run_local(
     src: &Path,
@@ -404,7 +412,14 @@ async fn run_local(
         eprintln!("No files found.");
         return omission_error(&omitted);
     }
-    let dst_meta = discover_local_with_meta(dst, &mut omitted);
+    // A missing destination root is a first sync, not an omission: there is
+    // nothing on it to delete. The source keeps its omission (above), so a
+    // missing source under --delete still vetoes.
+    let dst_meta = if is_absent(dst) {
+        MetaMap::new()
+    } else {
+        discover_local_with_meta(dst, &mut omitted)
+    };
     let plan = build_plan(&src_meta, &dst_meta, &opts.excludes, opts.delete);
     print_plan(&plan, opts.dry_run);
     veto_notice(&omitted, &plan);
@@ -772,6 +787,178 @@ mod tests {
         assert!(
             dst.join("locked/b.txt").exists(),
             "omitted entry was deleted"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    fn delete_opts() -> SyncOptions {
+        SyncOptions {
+            jobs: 2,
+            verbose: false,
+            dry_run: false,
+            delete: true,
+            excludes: vec![],
+        }
+    }
+
+    /// Put an `ssh` shim first on PATH. It runs its command under bash on this
+    /// machine, so `run_remote` can be driven against a temp tree.
+    #[cfg(unix)]
+    fn fake_ssh_on_path() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("copia-fake-ssh-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let shim = dir.join("ssh");
+            std::fs::write(&shim, "#!/bin/sh\nshift\nexec bash -c \"$1\"\n").unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut paths = vec![dir];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        });
+    }
+
+    /// Run `run_remote` on its own thread with a deadline. A FIFO that reaches
+    /// `cat` blocks forever, so a regression must fail instead of hanging the suite.
+    #[cfg(unix)]
+    fn run_remote_with_deadline(
+        dir: Dir,
+        remote_root: &Path,
+        local_root: &Path,
+        opts: SyncOptions,
+    ) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let remote = remote_root.to_string_lossy().into_owned();
+        let local = local_root.to_path_buf();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let res = rt
+                .block_on(run_remote(dir, "shim.invalid", &remote, &local, &opts))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("run_remote BLOCKED: it hung instead of vetoing or refusing")
+    }
+
+    /// Issue #50 review finding A RED: a remote FIFO on a pull under --delete must
+    /// set the omitted flag and veto the delete. The remote listing carried no
+    /// entry kind, so the FIFO was planned for transfer and the stale local file
+    /// was deleted.
+    #[cfg(unix)]
+    #[test]
+    fn remote_pull_fifo_entry_vetoes_delete() {
+        fake_ssh_on_path();
+        let base =
+            std::env::temp_dir().join(format!("copia-50-remote-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(remote.join("pipe"))
+            .status()
+            .expect("mkfifo")
+            .success();
+        assert!(made, "mkfifo failed");
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        let err = res.expect_err("a FIFO on the remote must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            local.join("stale.txt").exists(),
+            "delete ran past a remote FIFO the listing could not carry"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding B: a nonexistent destination root with --delete is
+    /// a first sync. Nothing on the destination can be deleted, so the run must
+    /// deliver the source and succeed. The missing root was an omission, which
+    /// failed the run.
+    #[cfg(unix)]
+    #[test]
+    fn push_to_an_absent_remote_root_is_a_first_sync() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-first-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote-absent");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"b").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+
+        assert!(res.is_ok(), "first sync to an absent root failed: {res:?}");
+        assert_eq!(std::fs::read(remote.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(remote.join("sub/b.txt")).unwrap(), b"b");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding B, local side: an absent destination root with
+    /// --delete is a first sync and must succeed.
+    #[tokio::test]
+    async fn sync_to_an_absent_local_root_is_a_first_sync() {
+        let base =
+            std::env::temp_dir().join(format!("copia-50-first-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst-absent");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+
+        let res = run_local(&src, &dst, &delete_opts()).await;
+
+        assert!(res.is_ok(), "first sync to an absent root failed: {res:?}");
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding C: `run_remote`'s delete veto. A remote listing
+    /// that exits non-zero reads as an empty source. With --delete that would plan
+    /// every local file for deletion, so the run must delete nothing and fail.
+    #[cfg(unix)]
+    #[test]
+    fn remote_listing_failure_vetoes_run_remote_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-veto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(remote.join("locked")).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        std::fs::write(remote.join("locked/b.txt"), b"b").unwrap();
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+        std::fs::set_permissions(
+            remote.join("locked"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        std::fs::set_permissions(
+            remote.join("locked"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(res.is_err(), "a failed remote listing must fail the run");
+        assert!(
+            local.join("stale.txt").exists(),
+            "run_remote deleted on an incomplete remote listing"
         );
         std::fs::remove_dir_all(&base).ok();
     }

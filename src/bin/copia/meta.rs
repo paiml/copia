@@ -126,10 +126,21 @@ pub fn discover_local_with_meta(root: &Path, omitted: &mut Vec<String>) -> MetaM
 pub async fn discover_remote_with_meta(
     host: &str,
     remote_root: &str,
+    absent_root_is_empty: bool,
     omitted: &mut Vec<String>,
 ) -> MetaMap {
     let escaped = remote_root.replace('\\', "\\\\").replace('\'', "\\'");
-    // %s size, %T@ mtime (float secs), %p path — TAB-separated, NUL-terminated.
+    // A destination root that does not exist is a first sync: an empty listing,
+    // with nothing to delete. Only the destination passes `absent_root_is_empty`.
+    // The source must still read an absent root as an omission, or a mistyped
+    // source path under --delete would empty the destination.
+    let absent_guard = if absent_root_is_empty {
+        format!("[ -e $'{escaped}' ] || [ -L $'{escaped}' ] || exit 0; ")
+    } else {
+        String::new()
+    };
+    // %y entry kind, %s size, %T@ mtime (float secs), %p path. TAB-separated,
+    // NUL-terminated.
     let output = tokio::process::Command::new("ssh")
         .arg(host)
         .arg(format!(
@@ -143,7 +154,7 @@ pub async fn discover_remote_with_meta(
             // everything else is an ENTRY and must be visible even when copia
             // cannot carry it. `find` does not follow symlinks by default, so
             // %s/%T@ describe the link itself rather than its target.
-            "cd $'{escaped}' && find . ! -type d -printf '%s\\t%T@\\t%p\\0'"
+            "{absent_guard}cd $'{escaped}' && find . ! -type d -printf '%y\\t%s\\t%T@\\t%p\\0'"
         ))
         .output()
         .await;
@@ -167,8 +178,24 @@ pub async fn discover_remote_with_meta(
     }
 }
 
-/// Parse NUL-terminated `size\tmtime\t./path` records into a `MetaMap`. A record
-/// that does not parse is pushed to `omitted`, never dropped silently.
+/// A stable name for a remote entry kind, from `find -printf %y`.
+fn remote_kind_name(kind: &str) -> &'static str {
+    match kind {
+        "p" => "fifo",
+        "s" => "socket",
+        "c" => "char-device",
+        "b" => "block-device",
+        "D" => "door",
+        _ => "unknown",
+    }
+}
+
+/// Parse NUL-terminated `kind\tsize\tmtime\t./path` records into a `MetaMap`.
+/// A record that does not parse is pushed to `omitted`, never dropped silently.
+///
+/// An entry whose kind copia cannot carry (anything but a regular file or a
+/// symlink) is an omission and is NOT entered in the map. It must not be planned,
+/// because `cat` on a remote FIFO blocks forever.
 pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> MetaMap {
     let mut out = MetaMap::new();
     for entry in stdout.split(|&b| b == 0) {
@@ -176,8 +203,9 @@ pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> Met
             continue;
         }
         let s = String::from_utf8_lossy(entry);
-        let mut parts = s.splitn(3, '\t');
-        let (Some(size), Some(mtime), Some(path)) = (parts.next(), parts.next(), parts.next())
+        let mut parts = s.splitn(4, '\t');
+        let (Some(kind), Some(size), Some(mtime), Some(path)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
         else {
             omitted.push(format!("malformed remote record: {s}"));
             continue;
@@ -193,9 +221,14 @@ pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> Met
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
         let rel = path.strip_prefix("./").unwrap_or(path);
-        if !rel.is_empty() {
-            out.insert(PathBuf::from(rel), FileMeta { size, mtime });
+        if rel.is_empty() {
+            continue;
         }
+        if !matches!(kind, "f" | "l") {
+            omitted.push(format!("cannot carry {} {rel}", remote_kind_name(kind)));
+            continue;
+        }
+        out.insert(PathBuf::from(rel), FileMeta { size, mtime });
     }
     out
 }
@@ -216,7 +249,7 @@ mod tests {
 
     #[test]
     fn parse_meta_reads_size_mtime_path_and_truncates_subsecond() {
-        let raw = b"1024\t1700000000.500\t./a.txt\x00\t\t\x00512\t1699999999\t./sub/b.bin\0";
+        let raw = b"f\t1024\t1700000000.500\t./a.txt\x00f\t512\t1699999999\t./sub/b.bin\0";
         let m = parse_remote_meta_output(raw, &mut Vec::new());
         assert_eq!(m.len(), 2);
         assert_eq!(
@@ -239,19 +272,39 @@ mod tests {
     fn parse_meta_skips_malformed_records() {
         // missing fields / non-numeric size are dropped, not panicked on
         let mut omitted = Vec::new();
-        let m = parse_remote_meta_output(b"notanumber\t123\t./x\0\0only-one-field\0", &mut omitted);
+        let m =
+            parse_remote_meta_output(b"f\tnotanumber\t123\t./x\0\0only-one-field\0", &mut omitted);
         assert!(m.is_empty());
         // ...and each one is an omission, so a sync can never delete on its strength.
         assert_eq!(omitted.len(), 2, "{omitted:?}");
+    }
+
+    /// Review finding A: a FIFO on a remote tree must name its kind and become an
+    /// omission. It is not planned for transfer, because `cat` on a FIFO blocks.
+    #[test]
+    fn remote_fifo_entry_is_an_omission_and_not_planned() {
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(
+            b"p\t0\t1700000000.0\t./pipe\x00f\t3\t1700000000.0\t./a.txt\x00",
+            &mut omitted,
+        );
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m.contains_key(&PathBuf::from("a.txt")));
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("fifo"), "{omitted:?}");
     }
 
     /// Issue #50: a remote listing that exits non-zero is an omission, and it
     /// reads as an empty map, never as "the remote has nothing".
     #[tokio::test]
     async fn remote_listing_failure_is_an_omission() {
+        // A root that cannot exist. The test may run with the ssh shim on PATH
+        // (see incremental.rs), which runs the listing here, so a real path such
+        // as /nonexistent would be listed instead of failing.
+        let absent = format!("/copia-no-such-root-{}", std::process::id());
         let mut omitted = Vec::new();
         let m =
-            discover_remote_with_meta("no-such-host.invalid", "/nonexistent", &mut omitted).await;
+            discover_remote_with_meta("no-such-host.invalid", &absent, false, &mut omitted).await;
         assert!(m.is_empty());
         assert_eq!(omitted.len(), 1, "{omitted:?}");
     }
