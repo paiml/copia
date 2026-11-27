@@ -193,6 +193,13 @@ fn posix_quote(s: &str) -> String {
 /// path. Any other stat failure (EACCES, ENOTDIR, ELOOP) falls through to the
 /// listing, which then fails and is an omission. It never takes the exit 0 path.
 fn absent_root_guard(remote_root: &str) -> String {
+    // A trailing slash makes `-e` and `-L` fail with ENOTDIR on an existing file,
+    // which read it as absent. Test the path itself. "/" always exists.
+    let trimmed = remote_root.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let remote_root = trimmed;
     let parent = match Path::new(remote_root).parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_string_lossy().into_owned(),
         _ if remote_root.starts_with('/') => "/".to_owned(),
@@ -248,46 +255,55 @@ pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> Met
         if entry.is_empty() {
             continue;
         }
-        // A name that is not UTF-8 cannot be carried faithfully: lossy decoding
-        // renamed it, so the plan transferred a different file and deleted the
-        // real one. It is an omission, never a guess.
-        let Ok(s) = std::str::from_utf8(entry) else {
-            omitted.push(format!(
-                "malformed remote record (path is not UTF-8): {}",
-                String::from_utf8_lossy(entry)
-            ));
-            continue;
-        };
-        let mut parts = s.splitn(4, '\t');
-        let (Some(kind), Some(size), Some(mtime), Some(path)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            omitted.push(format!("malformed remote record: {s}"));
-            continue;
-        };
-        let Ok(size) = size.parse::<u64>() else {
-            omitted.push(format!("malformed remote size: {s}"));
-            continue;
-        };
-        // %T@ is "secs.nanos" — truncate to whole seconds. A bad mtime is an
-        // omission, not a default of 0: a 0 would read as "changed" and sit in
-        // the plan with a fabricated timestamp.
-        let Some(Ok(mtime)) = mtime.split('.').next().map(str::parse::<i64>) else {
-            omitted.push(format!("malformed remote mtime: {s}"));
-            continue;
-        };
-        let rel = path.strip_prefix("./").unwrap_or(path);
-        if rel.is_empty() {
-            omitted.push(format!("malformed remote record (empty path): {s}"));
-            continue;
+        match parse_remote_record(entry) {
+            Ok((rel, meta)) => {
+                out.insert(rel, meta);
+            }
+            Err(reason) => omitted.push(reason),
         }
-        if !remote_kind_carried(kind) {
-            omitted.push(format!("cannot carry {} {rel}", remote_entry_name(kind)));
-            continue;
-        }
-        out.insert(PathBuf::from(rel), FileMeta { size, mtime });
     }
     out
+}
+
+/// Parse one `kind\tsize\tmtime\t./path` record. Every failure is returned as
+/// the omission message: nothing is dropped or defaulted.
+fn parse_remote_record(entry: &[u8]) -> Result<(PathBuf, FileMeta), String> {
+    // A name that is not UTF-8 cannot be carried faithfully: lossy decoding
+    // renamed it, so the plan transferred a different file and deleted the
+    // real one. It is an omission, never a guess.
+    let s = std::str::from_utf8(entry).map_err(|_| {
+        format!(
+            "malformed remote record (path is not UTF-8): {}",
+            String::from_utf8_lossy(entry)
+        )
+    })?;
+    let mut parts = s.splitn(4, '\t');
+    let (Some(kind), Some(size), Some(mtime), Some(path)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(format!("malformed remote record: {s}"));
+    };
+    let size = size
+        .parse::<u64>()
+        .map_err(|_| format!("malformed remote size: {s}"))?;
+    let mtime = parse_remote_mtime(mtime).ok_or_else(|| format!("malformed remote mtime: {s}"))?;
+    let rel = path.strip_prefix("./").unwrap_or(path);
+    if rel.is_empty() || rel == "." {
+        return Err(format!("malformed remote record (empty path): {s}"));
+    }
+    if !remote_kind_carried(kind) {
+        return Err(format!("cannot carry {} {rel}", remote_entry_name(kind)));
+    }
+    Ok((PathBuf::from(rel), FileMeta { size, mtime }))
+}
+
+/// `%T@` is "secs.nanos". Truncate to whole seconds. Anything else after the
+/// dot, or a non-integer before it, is malformed: a default of 0 would read as
+/// "changed" and put a fabricated timestamp in the plan.
+fn parse_remote_mtime(raw: &str) -> Option<i64> {
+    let (whole, frac) = raw.split_once('.').unwrap_or((raw, "0"));
+    let frac_ok = !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit());
+    whole.parse::<i64>().ok().filter(|_| frac_ok)
 }
 
 /// Set a local file's mtime to `secs` epoch seconds (best-effort).
@@ -331,10 +347,12 @@ mod tests {
     /// the plan deleted the real file and transferred a renamed copy).
     #[test]
     fn malformed_remote_records_are_omissions() {
-        let cases: [&[u8]; 3] = [
+        let cases: [&[u8]; 5] = [
             b"ff\t3\t1700000000.0\t./\x00",
             b"ff\t3\tabc\t./x\x00",
             b"ff\t1\t1700000000.0\t./caf\xe9\x00",
+            b"ff\t3\t1700000000.abc\t./x\x00",
+            b"ff\t1\t1700000000.0\t.\x00",
         ];
         for raw in cases {
             let mut omitted = Vec::new();
@@ -343,6 +361,30 @@ mod tests {
             assert_eq!(omitted.len(), 1, "{raw:?} was not omitted: {omitted:?}");
             assert!(omitted[0].contains("malformed"), "{omitted:?}");
         }
+    }
+
+    /// Review finding (lane 2) RED: a destination root written with a trailing
+    /// slash that names an existing regular file is not absent. The guard exited 0.
+    #[cfg(unix)]
+    #[test]
+    fn absent_root_guard_never_reads_an_existing_file_as_absent() {
+        let base = std::env::temp_dir().join(format!("copia-50-guard-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("regfile");
+        std::fs::write(&file, b"x").unwrap();
+        let root = format!("{}/", file.display());
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{}echo LISTING", absent_root_guard(&root)))
+            .output()
+            .expect("sh");
+        std::fs::remove_dir_all(&base).ok();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("LISTING"),
+            "guard exited as absent: {stdout:?}"
+        );
     }
 
     #[test]

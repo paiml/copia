@@ -110,6 +110,11 @@ impl TransferProgress {
     pub fn done(&self) -> u64 {
         self.files_done.load(Ordering::Relaxed)
     }
+    /// Transfers that have not reported success or failure: a task that panicked
+    /// or was cancelled before it recorded anything.
+    pub fn unfinished(&self) -> u64 {
+        self.total_files.saturating_sub(self.done() + self.failed())
+    }
     pub fn failed(&self) -> u64 {
         self.files_failed.load(Ordering::Relaxed)
     }

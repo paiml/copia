@@ -154,7 +154,35 @@ async fn discover_both(
 ) -> (MetaMap, MetaMap) {
     match dir {
         Dir::Push => {
-            let local = discover_local_with_meta(local_root, omitted);
+            let mut local = discover_local_with_meta(local_root, omitted);
+            // A name that is not UTF-8 has no spelling on the wire: it cannot be
+            // sent under its own name, so it is an omission, never renamed.
+            local.retain(|rel, _| {
+                if rel.to_str().is_some() {
+                    return true;
+                }
+                omitted.push(format!(
+                    "non-UTF-8 name cannot be sent to {host}:{remote_root}: {}",
+                    rel.display()
+                ));
+                false
+            });
+            // A symlink whose target is not a regular file cannot be carried. It
+            // is checked here, not left to the transfer: the quick check can skip
+            // an entry whose size and mtime match, and then no transfer fails.
+            local.retain(|rel, _| {
+                let full = local_root.join(rel);
+                let is_link =
+                    std::fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink());
+                if !is_link || std::fs::metadata(&full).is_ok_and(|m| m.is_file()) {
+                    return true;
+                }
+                omitted.push(format!(
+                    "cannot carry symlink {} (target is not a regular file)",
+                    full.display()
+                ));
+                false
+            });
             let remote = discover_remote_with_meta(host, remote_root, true, omitted).await;
             (local, remote)
         }
@@ -193,10 +221,18 @@ fn omission_error(omitted: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 /// file that failed in `cat` or `ssh` still let the delete run.
 fn veto_failed_transfers(progress: &TransferProgress, plan: &SyncPlan, omitted: &mut Vec<String>) {
     let failed = progress.failed();
-    if failed == 0 {
+    let unfinished = progress.unfinished();
+    if failed == 0 && unfinished == 0 {
         return;
     }
-    omitted.push(format!("{failed} transfer(s) failed"));
+    if failed > 0 {
+        omitted.push(format!("{failed} transfer(s) failed"));
+    }
+    // A task that panicked or was cancelled never reports to the counters. It is
+    // neither done nor failed, and the run is no more complete for it.
+    if unfinished > 0 {
+        omitted.push(format!("{unfinished} transfer(s) did not finish"));
+    }
     if !plan.delete.is_empty() {
         eprintln!(
             "VETOED: --delete skipped {} destination file(s) because transfers failed",
@@ -1052,6 +1088,7 @@ mod tests {
 
         let err = res.expect_err("a symlink to a FIFO on the remote must fail the run");
         assert!(err.contains("omitted"), "{err}");
+        assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"a");
         assert!(
             local.join("stale.txt").exists(),
             "delete ran past a remote symlink the listing could not carry"
@@ -1080,6 +1117,7 @@ mod tests {
 
         let err = res.expect_err("a dangling remote symlink must fail the run");
         assert!(err.contains("omitted"), "{err}");
+        assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"a");
         assert!(
             local.join("stale.txt").exists(),
             "delete ran past a dangling remote symlink"
@@ -1143,5 +1181,128 @@ mod tests {
             "--delete ran although a transfer failed"
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding (both lanes) RED: a local source name that is not UTF-8 has
+    /// no spelling on the wire. Lossy naming wrote `caf\u{FFFD}` and let --delete
+    /// remove the stale remote file.
+    #[cfg(unix)]
+    #[test]
+    fn push_of_a_non_utf8_source_name_is_an_omission() {
+        use std::os::unix::ffi::OsStrExt;
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-nonutf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(src.join(std::ffi::OsStr::from_bytes(b"caf\xe9")), b"one").unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(remote.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+
+        let err = res.expect_err("a non-UTF-8 source name must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            remote.join("stale.txt").exists(),
+            "--delete ran on a source whose non-UTF-8 name could not be carried"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding (both lanes) RED: a dangling local symlink on a push must veto
+    /// --delete even when the destination already holds a regular file with the
+    /// link's lstat size and mtime. The quick check then skips the entry, so the
+    /// transfer that would have failed never runs.
+    #[cfg(unix)]
+    #[test]
+    fn push_of_a_dangling_symlink_vetoes_delete_even_when_quick_check_matches() {
+        fake_ssh_on_path();
+        let base =
+            std::env::temp_dir().join(format!("copia-50-dangling-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink("nowhere", src.join("dangling")).unwrap();
+        let link = std::fs::symlink_metadata(src.join("dangling")).unwrap();
+        let mtime = link
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(remote.join("dangling"), b"nowhere").unwrap();
+        set_local_mtime(&remote.join("dangling"), i64::try_from(mtime).unwrap()).unwrap();
+        std::fs::write(remote.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+
+        let err = res.expect_err("a dangling local symlink must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            remote.join("stale.txt").exists(),
+            "--delete ran past a local symlink that cannot be carried"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding 4, local side RED: a failed local transfer must veto --delete.
+    /// `run_local` had no test for this path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_local_transfer_vetoes_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("copia-50-local-xfer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("secret.txt"), b"s").unwrap();
+        std::fs::set_permissions(
+            src.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        std::fs::write(dst.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_local(&src, &dst, &delete_opts()).await;
+
+        std::fs::set_permissions(
+            src.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(res.is_err(), "a failed local transfer must fail the run");
+        assert!(
+            dst.join("stale.txt").exists(),
+            "--delete ran although a local transfer failed"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding 3 RED: a transfer that never reports back (a panicked or
+    /// cancelled task) is neither done nor failed. It must still veto --delete.
+    #[test]
+    fn a_transfer_that_never_reports_vetoes_delete() {
+        let progress = TransferProgress::new(2);
+        progress.record_ok(1);
+        let plan = SyncPlan {
+            transfer: vec![PathBuf::from("a"), PathBuf::from("b")],
+            skipped: 0,
+            delete: vec![PathBuf::from("stale")],
+        };
+        let mut omitted = Vec::new();
+        veto_failed_transfers(&progress, &plan, &mut omitted);
+        assert!(
+            !omitted.is_empty(),
+            "an unfinished transfer did not veto the delete"
+        );
     }
 }
