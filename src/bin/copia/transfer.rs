@@ -199,6 +199,14 @@ pub async fn transfer_file_to_remote(
     let metadata = tokio::fs::metadata(local_path)
         .await
         .map_err(|e| format!("{}: {e}", local_path.display()))?;
+    // Refuse before `ssh` spawns or the file is opened: `File::open` on a FIFO,
+    // socket or device blocks (or is meaningless), and copia cannot carry it.
+    if !metadata.is_file() {
+        return Err(format!(
+            "cannot carry {}: not a regular file",
+            local_path.display()
+        ));
+    }
     let file_size = metadata.len();
 
     // Use $'...' quoting with backslash escapes for paths with special chars.

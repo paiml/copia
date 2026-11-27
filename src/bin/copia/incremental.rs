@@ -882,6 +882,40 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// Issue #50 review finding A RED: a local FIFO in a push source under
+    /// --delete must set the omitted flag and veto the delete. The FIFO was
+    /// planned for transfer, and `File::open` on it blocked until a writer
+    /// appeared, so the run hung instead of failing.
+    #[cfg(unix)]
+    #[test]
+    fn local_push_fifo_entry_vetoes_delete() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-push-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(src.join("pipe"))
+            .status()
+            .expect("mkfifo")
+            .success();
+        assert!(made, "mkfifo failed");
+        std::fs::write(remote.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+
+        let err = res.expect_err("a FIFO in the local source must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            remote.join("stale.txt").exists(),
+            "delete ran past a local FIFO the source could not carry"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// Issue #50 review finding B: a nonexistent destination root with --delete is
     /// a first sync. Nothing on the destination can be deleted, so the run must
     /// deliver the source and succeed. The missing root was an omission, which

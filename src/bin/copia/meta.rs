@@ -103,7 +103,10 @@ pub fn discover_local_with_meta(root: &Path, omitted: &mut Vec<String>) -> MetaM
             Ok(meta) => {
                 let ft = meta.file_type();
                 if !(ft.is_file() || ft.is_symlink()) {
+                    // Not planned: `File::open` on a FIFO blocks until a writer
+                    // appears, so the entry must never reach the transfer.
                     omitted.push(format!("cannot carry {} {}", kind_tag(ft), full.display()));
+                    continue;
                 }
                 out.insert(
                     rel,
@@ -129,13 +132,13 @@ pub async fn discover_remote_with_meta(
     absent_root_is_empty: bool,
     omitted: &mut Vec<String>,
 ) -> MetaMap {
-    let escaped = remote_root.replace('\\', "\\\\").replace('\'', "\\'");
+    let root_q = posix_quote(remote_root);
     // A destination root that does not exist is a first sync: an empty listing,
     // with nothing to delete. Only the destination passes `absent_root_is_empty`.
     // The source must still read an absent root as an omission, or a mistyped
     // source path under --delete would empty the destination.
     let absent_guard = if absent_root_is_empty {
-        format!("[ -e $'{escaped}' ] || [ -L $'{escaped}' ] || exit 0; ")
+        absent_root_guard(remote_root)
     } else {
         String::new()
     };
@@ -154,7 +157,7 @@ pub async fn discover_remote_with_meta(
             // everything else is an ENTRY and must be visible even when copia
             // cannot carry it. `find` does not follow symlinks by default, so
             // %s/%T@ describe the link itself rather than its target.
-            "{absent_guard}cd $'{escaped}' && find . ! -type d -printf '%y\\t%s\\t%T@\\t%p\\0'"
+            "{absent_guard}cd {root_q} && find . ! -type d -printf '%y\\t%s\\t%T@\\t%p\\0'"
         ))
         .output()
         .await;
@@ -176,6 +179,26 @@ pub async fn discover_remote_with_meta(
             MetaMap::new()
         }
     }
+}
+
+/// Quote a path for POSIX sh (dash and bash alike). `$'...'` is bash-only: dash
+/// reads it as a literal string, which made an existing root look absent.
+fn posix_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Shell prefix that exits 0 only for a destination root that is definitively
+/// absent: its parent is a searchable directory and nothing is at the root
+/// path. Any other stat failure (EACCES, ENOTDIR, ELOOP) falls through to the
+/// listing, which then fails and is an omission. It never takes the exit 0 path.
+fn absent_root_guard(remote_root: &str) -> String {
+    let parent = match Path::new(remote_root).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_string_lossy().into_owned(),
+        _ if remote_root.starts_with('/') => "/".to_owned(),
+        _ => ".".to_owned(),
+    };
+    let (root, parent) = (posix_quote(remote_root), posix_quote(&parent));
+    format!("[ -d {parent} ] && [ -x {parent} ] && [ ! -e {root} ] && [ ! -L {root} ] && exit 0; ")
 }
 
 /// A stable name for a remote entry kind, from `find -printf %y`.
@@ -330,6 +353,71 @@ mod tests {
         assert!(!m.contains_key(&PathBuf::from("locked/f")));
         assert_eq!(omitted.len(), 1, "{omitted:?}");
         assert!(omitted[0].contains("cannot stat"), "{omitted:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #50 review finding B RED: the absent-root guard runs under the remote
+    /// login shell, which is POSIX sh (dash) on many hosts. There `$'...'` is a
+    /// literal string, so an existing root read as absent and the listing exited 0.
+    #[cfg(unix)]
+    #[test]
+    fn absent_root_guard_is_posix_sh_safe() {
+        let base = std::env::temp_dir().join(format!("copia-50-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let present = base.join("present");
+        let absent = base.join("absent");
+        std::fs::create_dir_all(&present).unwrap();
+        let run = |root: &Path| {
+            let script = format!("{}echo REACHED", absent_root_guard(&root.to_string_lossy()));
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .unwrap()
+        };
+        // An existing root must not take the early exit.
+        let out = run(&present);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "REACHED",
+            "{out:?}"
+        );
+        // A definitively absent root takes it: exit 0, nothing else runs.
+        let out = run(&absent);
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #50 review finding B: a stat failure is not "absent". A root whose
+    /// parent cannot be searched must not take the early exit.
+    #[cfg(unix)]
+    #[test]
+    fn absent_root_guard_does_not_exit_on_a_stat_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("copia-50-guard-eacces-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let locked = base.join("locked");
+        std::fs::create_dir_all(locked.join("child")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let script = format!(
+            "{}echo REACHED",
+            absent_root_guard(&locked.join("child").to_string_lossy())
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Not absent, only unreadable: the guard must fall through to the listing
+        // (which then fails and is an omission), never take the exit 0 path.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "REACHED",
+            "{out:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
