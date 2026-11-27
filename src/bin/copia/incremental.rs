@@ -242,7 +242,7 @@ fn veto_failed_transfers(progress: &TransferProgress, plan: &SyncPlan, omitted: 
 }
 
 /// Print every omission, and say plainly when `--delete` is vetoed by them.
-fn veto_notice(omitted: &[String], plan: &SyncPlan) {
+fn print_omissions(omitted: &[String]) {
     if omitted.is_empty() {
         return;
     }
@@ -253,6 +253,10 @@ fn veto_notice(omitted: &[String], plan: &SyncPlan) {
     for line in omitted {
         eprintln!("  {line}");
     }
+}
+
+fn veto_notice(omitted: &[String], plan: &SyncPlan) {
+    print_omissions(omitted);
     if !plan.delete.is_empty() {
         eprintln!(
             "VETOED: --delete skipped {} destination file(s) because the source is incomplete",
@@ -342,6 +346,7 @@ async fn run_remote(
     // legitimate "delete everything on the destination").
     if src_meta.is_empty() && !opts.delete {
         eprintln!("No files found.");
+        print_omissions(&omitted);
         return omission_error(&omitted);
     }
     let plan = build_plan(&src_meta, &dst_meta, &opts.excludes, opts.delete);
@@ -448,10 +453,17 @@ async fn apply_remote_deletes(
     eprintln!("Deleted {} stale file(s) on the destination", dels.len());
 }
 
-/// True when `path` does not exist at all. A dangling symlink exists.
+/// True when `path` does not exist at all. A dangling symlink exists. A trailing
+/// slash is trimmed first: `lstat("link/")` follows the link, so a dangling one
+/// would read as absent.
 fn is_absent(path: &Path) -> bool {
+    let trimmed = path
+        .to_str()
+        .map(|s| s.trim_end_matches('/'))
+        .filter(|s| !s.is_empty());
+    let target = trimmed.map_or(path, Path::new);
     matches!(
-        std::fs::symlink_metadata(path),
+        std::fs::symlink_metadata(target),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound
     )
 }
@@ -471,6 +483,7 @@ async fn run_local(
     let src_meta = discover_local_with_meta(src, &mut omitted);
     if src_meta.is_empty() && !opts.delete {
         eprintln!("No files found.");
+        print_omissions(&omitted);
         return omission_error(&omitted);
     }
     // A missing destination root is a first sync, not an omission: there is
@@ -1176,6 +1189,11 @@ mod tests {
         )
         .unwrap();
         assert!(res.is_err(), "a failed transfer must fail the run");
+        assert_eq!(
+            std::fs::read(local.join("a.txt")).unwrap(),
+            b"a",
+            "the healthy sibling must still transfer"
+        );
         assert!(
             local.join("stale.txt").exists(),
             "--delete ran although a transfer failed"
@@ -1205,6 +1223,15 @@ mod tests {
 
         let err = res.expect_err("a non-UTF-8 source name must fail the run");
         assert!(err.contains("omitted"), "{err}");
+        assert_eq!(
+            std::fs::read(remote.join("a.txt")).unwrap(),
+            b"a",
+            "the healthy sibling must still transfer"
+        );
+        assert!(
+            !remote.join("caf\u{FFFD}").exists(),
+            "the non-UTF-8 name was lossy-renamed and written"
+        );
         assert!(
             remote.join("stale.txt").exists(),
             "--delete ran on a source whose non-UTF-8 name could not be carried"
@@ -1244,6 +1271,11 @@ mod tests {
 
         let err = res.expect_err("a dangling local symlink must fail the run");
         assert!(err.contains("omitted"), "{err}");
+        assert_eq!(
+            std::fs::read(remote.join("a.txt")).unwrap(),
+            b"a",
+            "the healthy sibling must still transfer"
+        );
         assert!(
             remote.join("stale.txt").exists(),
             "--delete ran past a local symlink that cannot be carried"
@@ -1280,10 +1312,31 @@ mod tests {
         )
         .unwrap();
         assert!(res.is_err(), "a failed local transfer must fail the run");
+        assert_eq!(
+            std::fs::read(dst.join("a.txt")).unwrap(),
+            b"a",
+            "the healthy sibling must still transfer"
+        );
         assert!(
             dst.join("stale.txt").exists(),
             "--delete ran although a local transfer failed"
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding (round 3, minor) RED: a dangling symlink named with a trailing
+    /// slash exists. `lstat("link/")` follows the link, so it read as absent and a
+    /// local destination was treated as a first sync.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_with_trailing_slash_is_not_absent() {
+        let base = std::env::temp_dir().join(format!("copia-50-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink("nowhere", base.join("dangling")).unwrap();
+        assert!(!is_absent(&base.join("dangling/")));
+        assert!(!is_absent(&base.join("dangling")));
+        assert!(is_absent(&base.join("missing/")));
         std::fs::remove_dir_all(&base).ok();
     }
 
