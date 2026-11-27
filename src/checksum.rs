@@ -74,20 +74,22 @@ impl RollingChecksum {
     #[cfg_attr(feature = "contracts", ensures(ret.b < Self::MOD, "b < MOD"))]
     #[cfg_attr(feature = "contracts", ensures(ret.count == data.len(), "count == input len"))]
     pub fn new(data: &[u8]) -> Self {
-        let mut a: u32 = 0;
-        let mut b: u32 = 0;
+        // #44: accumulate in u64. With u32 the weighted sum b wraps once block_size >= 16 KiB,
+        // so this digest stops matching FastRollingChecksum and the delta matches nothing.
+        let mut a: u64 = 0;
+        let mut b: u64 = 0;
         let len = data.len();
 
         for (i, &byte) in data.iter().enumerate() {
-            a = a.wrapping_add(u32::from(byte));
+            a = a.wrapping_add(u64::from(byte));
             // Weight is (len - i) so first byte has highest weight
-            // Truncation is intentional: checksum uses 32-bit arithmetic
-            b = b.wrapping_add((len - i) as u32 * u32::from(byte));
+            b = b.wrapping_add((len - i) as u64 * u64::from(byte));
         }
 
+        // Reduce in u64, then narrow: the result is < MOD, which fits in u32.
         let result = Self {
-            a: a % Self::MOD,
-            b: b % Self::MOD,
+            a: (a % u64::from(Self::MOD)) as u32,
+            b: (b % u64::from(Self::MOD)) as u32,
             count: len,
         };
         debug_assert!(result.a < Self::MOD, "a must be < MOD after init");
