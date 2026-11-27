@@ -349,6 +349,21 @@ impl Default for RollingChecksum {
 mod tests {
     use super::*;
 
+    /// #44: the signature side (`RollingChecksum`) and the delta side
+    /// (`FastRollingChecksum`) must produce the same weak hash for every block size,
+    /// or the matcher never finds a block. The strict u32 accumulator wrapped from 16 KiB.
+    #[test]
+    fn strict_and_fast_rolling_checksums_agree_for_all_block_sizes() {
+        for &bs in &[512usize, 1024, 4096, 8192, 16384, 32768, 65536] {
+            let data: Vec<u8> = (0..bs).map(|i| (i * 31 % 251) as u8).collect();
+            assert_eq!(
+                RollingChecksum::new(&data).digest(),
+                FastRollingChecksum::new(&data).digest(),
+                "strict/fast weak-hash disagreement at block_size {bs}"
+            );
+        }
+    }
+
     // ==========================================================================
     // UNIT TESTS - Basic functionality
     // ==========================================================================
