@@ -195,8 +195,6 @@ pub async fn transfer_file_to_remote(
     remote_path: &str,
     mtime: Option<i64>,
 ) -> Result<u64, String> {
-    use tokio::io::AsyncReadExt;
-
     // `symlink_metadata`, not `metadata`: the latter FOLLOWS a link, so a symlink
     // to a regular file passed the regular-file test and its target's bytes were
     // sent under the link's name. A link is refused, loudly.
@@ -222,59 +220,108 @@ pub async fn transfer_file_to_remote(
     // Open the source BEFORE `ssh` runs. `cat >` truncates the remote target as
     // soon as it starts, so a source that cannot be read (EACCES) must fail here,
     // while the remote file is still untouched.
-    let mut file = tokio::fs::File::open(local_path)
+    let file = tokio::fs::File::open(local_path)
         .await
         .map_err(|e| format!("open {}: {e}", local_path.display()))?;
 
+    stream_to_remote(file, file_size, host, remote_path, mtime)
+        .await
+        .map_err(|e| match e {
+            StreamError::Read(msg) | StreamError::Remote(msg) => {
+                format!("{}: {msg}", local_path.display())
+            }
+        })
+}
+
+/// Why a stream to the remote failed. `Read` is a local read error; the remote
+/// command was already told to abort, so nothing was committed.
+#[derive(Debug)]
+pub(crate) enum StreamError {
+    Read(String),
+    Remote(String),
+}
+
+/// Stream `reader` (exactly `size` bytes expected) to `host:remote_path`.
+pub(crate) async fn stream_to_remote<R>(
+    mut reader: R,
+    size: u64,
+    host: &str,
+    remote_path: &str,
+    mtime: Option<i64>,
+) -> Result<u64, StreamError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
     let mut child = tokio::process::Command::new("ssh")
         .arg(host)
-        .arg(push_command(remote_path, mtime))
+        .arg(push_command(remote_path, size, mtime))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("ssh spawn: {e}"))?;
+        .map_err(|e| StreamError::Remote(format!("ssh spawn: {e}")))?;
 
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| "Failed to open SSH stdin".to_string())?;
+        .ok_or_else(|| StreamError::Remote("Failed to open SSH stdin".to_string()))?;
 
-    // Stream file in chunks instead of reading all into memory
+    // Stream in chunks instead of reading all into memory. A failure stops the
+    // loop, but the child is still waited on, so the remote side has finished
+    // deciding before this returns.
     let mut buf = vec![0u8; 256 * 1024]; // 256KB chunks
+    let mut sent: u64 = 0;
+    let mut local_err: Option<StreamError> = None;
     loop {
-        let n = file
-            .read(&mut buf)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                // Closing stdin after exactly `size` bytes would look complete to
+                // the remote count check, so one extra byte forces a mismatch.
+                if sent == size {
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, b"\0").await;
+                }
+                local_err = Some(StreamError::Read(format!("read: {e}")));
+                break;
+            }
+        };
+        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut stdin, &buf[..n]).await {
+            local_err = Some(StreamError::Remote(format!("write: {e}")));
             break;
         }
-        tokio::io::AsyncWriteExt::write_all(&mut stdin, &buf[..n])
-            .await
-            .map_err(|e| format!("write: {e}"))?;
+        sent += n as u64;
     }
     drop(stdin);
 
     let result = child
         .wait_with_output()
         .await
-        .map_err(|e| format!("ssh wait: {e}"))?;
+        .map_err(|e| StreamError::Remote(format!("ssh wait: {e}")))?;
+    if let Some(e) = local_err {
+        return Err(e);
+    }
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(format!("SSH failed for {}: {stderr}", local_path.display()));
+        return Err(StreamError::Remote(format!("SSH failed: {stderr}")));
     }
 
-    Ok(file_size)
+    Ok(size)
 }
 
 /// The remote POSIX shell command that streams stdin into `remote_path`
 /// atomically: `cat` into a `.copia-tmp` sibling, then `mv` over the target.
 ///
+/// The `mv` runs only if the staged file holds exactly `expected` bytes, the size
+/// recorded before the stream. A short stream (a failed local read) or a long one
+/// (the file grew) is removed and never committed.
+///
 /// Plain POSIX quoting only (`'...'` with `'\''`), so it runs under dash as well
-/// as bash. `--` ends the options of `mv` and `touch`, so a path that begins with
-/// `-` is a path.
-pub(crate) fn push_command(remote_path: &str, mtime: Option<i64>) -> String {
+/// as bash. `--` ends the options of `mv`, `rm` and `touch`, so a path that begins
+/// with `-` is a path.
+pub(crate) fn push_command(remote_path: &str, expected: u64, mtime: Option<i64>) -> String {
     let tmp_q = posix_quote(&format!("{remote_path}.copia-tmp"));
     let dst_q = posix_quote(remote_path);
     // The staging name must be absent, or a regular file that is not a link.
@@ -286,7 +333,11 @@ pub(crate) fn push_command(remote_path: &str, mtime: Option<i64>) -> String {
          {{ echo 'copia: staging path is not a regular file' >&2; exit 1; }}; "
     );
     let touch = mtime.map_or(String::new(), |t| format!(" && touch -d @{t} -- {dst_q}"));
-    format!("{staging_check}cat > {tmp_q} && mv -f -- {tmp_q} {dst_q}{touch}")
+    let verify = format!(
+        "[ \"$(wc -c < {tmp_q} | tr -d ' ')\" = \"{expected}\" ] || \
+         {{ rm -f -- {tmp_q}; echo 'copia: received bytes differ from the source size; not committed' >&2; exit 1; }}"
+    );
+    format!("{staging_check}cat > {tmp_q} && {{ {verify}; }} && mv -f -- {tmp_q} {dst_q}{touch}")
 }
 
 /// The remote POSIX shell command that prints `remote_path`'s bytes.
@@ -408,7 +459,11 @@ mod r93_transfer {
     fn push_and_pull_round_trip_a_quote_and_newline_name_under_dash() {
         let base = scratch("posix-roundtrip");
         let name = "it's\nname.txt";
-        let out = run_posix(&push_command(name, Some(1_600_000_000)), &base, b"payload");
+        let out = run_posix(
+            &push_command(name, 7, Some(1_600_000_000)),
+            &base,
+            b"payload",
+        );
         assert!(
             out.status.success(),
             "push under dash failed: {}",
@@ -432,7 +487,7 @@ mod r93_transfer {
     fn push_refuses_a_dangling_staging_symlink_without_writing_through_it() {
         let base = scratch("dangling-stage");
         std::os::unix::fs::symlink("nowhere", base.join("a.txt.copia-tmp")).unwrap();
-        let out = run_bash(&push_command("a.txt", None), &base, b"payload");
+        let out = run_bash(&push_command("a.txt", 7, None), &base, b"payload");
         let created = base.join("nowhere").exists();
         assert!(
             !out.status.success(),
@@ -465,7 +520,7 @@ mod r93_transfer {
         let base = scratch("dash-path");
         std::fs::create_dir_all(base.join("-root")).unwrap();
         let out = run_bash(
-            &push_command("-root/a.txt", Some(1_600_000_000)),
+            &push_command("-root/a.txt", 7, Some(1_600_000_000)),
             &base,
             b"payload",
         );

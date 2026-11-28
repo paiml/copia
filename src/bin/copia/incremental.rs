@@ -1401,6 +1401,7 @@ mod tests {
 mod r93_incremental {
     use super::tests::{delete_opts, fake_ssh_on_path, run_remote_with_deadline};
     use super::*;
+    use crate::transfer::stream_to_remote;
 
     /// Finding 2 (HIGH): a remote file whose name holds a newline is deleted by its
     /// own name. A newline-delimited xargs split it into two wrong names.
@@ -1585,6 +1586,75 @@ mod r93_incremental {
         assert_eq!(veto_line(&["x".to_owned()], 0), None);
         let line = veto_line(&["x".to_owned()], 3).expect("an omission with deletes must veto");
         assert!(line.starts_with("VETOED: --delete skipped 3"), "{line}");
+    }
+
+    /// A reader that yields `good` bytes, then fails: a local read that dies
+    /// mid-stream, after the remote command has already started.
+    struct FailsMidStream {
+        given: usize,
+        good: usize,
+    }
+
+    impl tokio::io::AsyncRead for FailsMidStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.given >= this.good {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected read failure",
+                )));
+            }
+            let n = (this.good - this.given).min(buf.remaining());
+            buf.put_slice(&vec![b'N'; n]);
+            this.given += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Residual RED: a local read that fails after the stream has started must
+    /// never commit the bytes already sent. The remote `mv` ran on a partial file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mid_stream_local_read_failure_never_commits_a_partial_file() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-midstream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("remote")).unwrap();
+        let remote_file = base.join("remote/data.bin");
+        std::fs::write(&remote_file, b"remote-original").unwrap();
+
+        let res = stream_to_remote(
+            FailsMidStream {
+                given: 0,
+                good: 1000,
+            },
+            4000,
+            "shim.invalid",
+            &remote_file.to_string_lossy(),
+            None,
+        )
+        .await;
+        // Give a detached `ssh` shim time to finish before the remote is read.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        assert!(
+            res.is_err(),
+            "an injected read failure reported success: {res:?}"
+        );
+        assert_eq!(
+            std::fs::read(&remote_file).unwrap(),
+            b"remote-original",
+            "a partial file was committed after a mid-stream local read failure"
+        );
+        assert!(
+            !base.join("remote/data.bin.copia-tmp").exists(),
+            "the staging file was left behind"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Finding 2 RED: a local source that cannot be read must fail BEFORE the
