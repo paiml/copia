@@ -3,7 +3,7 @@
 
 use super::plan::{FileMeta, MetaMap};
 use super::reconcile::{FileType, Fingerprint, FpMap};
-use super::transfer::discover_local_files;
+use super::transfer::{discover_local_files, walk_local};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -85,87 +85,310 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 }
 
 /// Walk a local tree and stat every file into a `MetaMap` of relative paths.
-pub fn discover_local_with_meta(root: &Path) -> Result<MetaMap, Box<dyn std::error::Error>> {
+///
+/// Every entry that cannot be listed, stat-ed, or carried is pushed to
+/// `omitted` (issue #50). An entry is never silently left out of the map: an
+/// omitted source entry is what makes `--delete` unsafe.
+pub fn discover_local_with_meta(root: &Path, omitted: &mut Vec<String>) -> MetaMap {
     let mut out = MetaMap::new();
-    for rel in discover_local_files(root)? {
+    for rel in walk_local(root, omitted) {
+        let full = root.join(&rel);
         // symlink_metadata, not metadata: `metadata` FOLLOWS the link, so a
-        // DANGLING symlink errors and the `if let Ok` silently drops it from
-        // the plan — copia then omits a path rsync -a faithfully recreates.
-        // Caught by the rsync differential harness on the `dangling-symlink`
-        // shape. A symlink's own size/mtime is the right quick-check value
-        // anyway; `deliver_local` recreates it as a link regardless.
-        if let Ok(meta) = std::fs::symlink_metadata(root.join(&rel)) {
-            out.insert(
-                rel,
-                FileMeta {
-                    size: meta.len(),
-                    mtime: mtime_secs(&meta),
-                },
-            );
-        }
-    }
-    Ok(out)
-}
-
-/// List a remote tree with size+mtime in one `find -printf` over SSH.
-pub async fn discover_remote_with_meta(
-    host: &str,
-    remote_root: &str,
-) -> Result<MetaMap, Box<dyn std::error::Error>> {
-    let escaped = remote_root.replace('\\', "\\\\").replace('\'', "\\'");
-    // %s size, %T@ mtime (float secs), %p path — TAB-separated, NUL-terminated.
-    let output = tokio::process::Command::new("ssh")
-        .arg(host)
-        .arg(format!(
-            // `! -type d`, NOT `-type f`. The previous form enumerated regular
-            // files ONLY, so a symlink, FIFO, socket or device on a remote tree
-            // was invisible to every plan built from this listing — and a
-            // destination missing one read as agreement, the same omission that
-            // made `copia verify` certify a lost FIFO locally.
-            //
-            // Directories are excluded because they are handled separately;
-            // everything else is an ENTRY and must be visible even when copia
-            // cannot carry it. `find` does not follow symlinks by default, so
-            // %s/%T@ describe the link itself rather than its target.
-            "cd $'{escaped}' && find . ! -type d -printf '%s\\t%T@\\t%p\\0'"
-        ))
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to list {host}:{remote_root}: {stderr}").into());
-    }
-    Ok(parse_remote_meta_output(&output.stdout))
-}
-
-/// Parse NUL-terminated `size\tmtime\t./path` records into a `MetaMap`.
-pub fn parse_remote_meta_output(stdout: &[u8]) -> MetaMap {
-    let mut out = MetaMap::new();
-    for entry in stdout.split(|&b| b == 0) {
-        if entry.is_empty() {
-            continue;
-        }
-        let s = String::from_utf8_lossy(entry);
-        let mut parts = s.splitn(3, '\t');
-        let (Some(size), Some(mtime), Some(path)) = (parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        let Ok(size) = size.parse::<u64>() else {
-            continue;
-        };
-        // %T@ is "secs.nanos" — truncate to whole seconds.
-        let mtime = mtime
-            .split('.')
-            .next()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0);
-        let rel = path.strip_prefix("./").unwrap_or(path);
-        if !rel.is_empty() {
-            out.insert(PathBuf::from(rel), FileMeta { size, mtime });
+        // DANGLING symlink errors and the entry would be dropped — copia then
+        // omits a path rsync -a faithfully recreates. Caught by the rsync
+        // differential harness on the `dangling-symlink` shape. A symlink's own
+        // size/mtime is the right quick-check value anyway; `deliver_local`
+        // recreates it as a link regardless.
+        match std::fs::symlink_metadata(&full) {
+            Ok(meta) => {
+                let ft = meta.file_type();
+                if !(ft.is_file() || ft.is_symlink()) {
+                    // Not planned: `File::open` on a FIFO blocks until a writer
+                    // appears, so the entry must never reach the transfer.
+                    omitted.push(format!("cannot carry {} {}", kind_tag(ft), full.display()));
+                    continue;
+                }
+                if is_staging_name(&rel) {
+                    omitted.push(format!("staging-named entry {}", full.display()));
+                    continue;
+                }
+                out.insert(
+                    rel,
+                    FileMeta {
+                        size: meta.len(),
+                        mtime: mtime_secs(&meta),
+                    },
+                );
+            }
+            Err(e) => omitted.push(format!("cannot stat {}: {e}", full.display())),
         }
     }
     out
+}
+
+/// List a remote tree with size+mtime in one `find -printf` over SSH.
+///
+/// A listing that cannot run or exits non-zero yields an empty map and an entry
+/// in `omitted`. It never reads as "the remote is empty".
+pub async fn discover_remote_with_meta(
+    host: &str,
+    remote_root: &str,
+    absent_root_is_empty: bool,
+    omitted: &mut Vec<String>,
+) -> MetaMap {
+    // A destination root that does not exist is a first sync: an empty listing,
+    // with nothing to delete. Only the destination passes `absent_root_is_empty`.
+    // The source must still read an absent root as an omission, or a mistyped
+    // source path under --delete would empty the destination.
+    let absent_guard = if absent_root_is_empty {
+        absent_root_guard(remote_root)
+    } else {
+        String::new()
+    };
+    let output = tokio::process::Command::new("ssh")
+        .arg(host)
+        .arg(remote_listing_command(&absent_guard, remote_root))
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => parse_remote_meta_output(&output.stdout, omitted),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            omitted.push(format!(
+                "failed to list {host}:{remote_root} (exit {}): {}",
+                output.status,
+                stderr.trim()
+            ));
+            MetaMap::new()
+        }
+        Err(e) => {
+            omitted.push(format!(
+                "failed to start listing of {host}:{remote_root}: {e}"
+            ));
+            MetaMap::new()
+        }
+    }
+}
+
+/// Quote a path for POSIX sh (dash and bash alike). `$'...'` is bash-only: dash
+/// reads it as a literal string, which made an existing root look absent.
+pub(crate) fn posix_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The full remote command that lists a tree: the optional absent-root guard,
+/// then `find` under `remote_root`. `cd --` so a root that begins with `-` is a
+/// path, not an option.
+pub(crate) fn remote_listing_command(absent_guard: &str, remote_root: &str) -> String {
+    let root_q = cd_operand(remote_root);
+    // `! -type d`, NOT `-type f`. The previous form enumerated regular files
+    // ONLY, so a symlink, FIFO, socket or device on a remote tree was invisible
+    // to every plan built from this listing. Directories are handled separately;
+    // everything else is an ENTRY and must be visible even when copia cannot
+    // carry it. `find` does not follow symlinks, so %s/%T@ describe the link.
+    // Kind = %y then %Y, e.g. `ff`, `lf` (symlink to a file), `lN` (dangling).
+    format!("{absent_guard}cd -- {root_q} && find . ! -type d -printf '%y%Y\\t%s\\t%T@\\t%p\\0'")
+}
+
+/// Shell prefix that exits 0 only for a destination root that is definitively
+/// absent. Every component is tested only after its parent is confirmed a
+/// searchable directory, so `-e` can fail only with ENOENT; an EACCES, ENOTDIR
+/// or ELOOP anywhere on the way falls through to the listing, which then fails
+/// and is an omission. A root with a `.` or `..` component is never classified:
+/// `x/.` on an unreadable or non-directory `x` fails `-e` for another reason.
+fn absent_root_guard(remote_root: &str) -> String {
+    // The length is judged on the path as sent, which is the `cd` operand: a relative
+    // root gains a "./" prefix. Trailing slashes count toward PATH_MAX for the kernel,
+    // so a root padded past it is refused even when its trimmed form is short.
+    // Normalizing first would have hidden that.
+    if sent_root(remote_root).len() >= 4096 {
+        return String::new();
+    }
+    let trimmed = remote_root.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let components: Vec<&str> = trimmed.split('/').filter(|c| !c.is_empty()).collect();
+    if components.iter().any(|c| *c == "." || *c == "..") {
+        return String::new();
+    }
+    // ENAMETOOLONG makes `-e` false exactly as ENOENT does. A component over
+    // NAME_MAX (255) is not classified: the listing runs, fails, and is an omission.
+    if components.iter().any(|c| c.len() > 255) {
+        return String::new();
+    }
+    let base = if trimmed.starts_with('/') { "/" } else { "." };
+    // One loop over the quoted components, so each level costs its name plus a few
+    // bytes, not a copy of the checks. The name is expanded inside double quotes and
+    // never re-read as shell text. Runs in a subshell: `exit 0` there means absent,
+    // `exit 1` means "not classified", and only the former short-circuits the listing.
+    // Every component is tested only after `cd` confirmed its parent is a searchable
+    // directory, so `-e` can fail only with ENOENT.
+    let names: Vec<String> = components.iter().map(|c| posix_quote(c)).collect();
+    let checks = format!(
+        "cd -- {} || exit 1; for c in {}; do [ -e \"./$c\" ] || [ -L \"./$c\" ] || exit 0; [ -d \"./$c\" ] && [ -x \"./$c\" ] || exit 1; cd -- \"./$c\" || exit 1; done; exit 1",
+        posix_quote(base),
+        names.join(" ")
+    );
+    // The guard travels as one ssh argument, capped at about 128 KiB (MAX_ARG_STRLEN).
+    // The kernel's PATH_MAX (checked above) bounds the names, so this cap is never the
+    // binding one. It stays as a backstop: past it the root is not classified.
+    if checks.len() > 96 * 1024 {
+        return String::new();
+    }
+    format!("( {checks} ) && exit 0; ")
+}
+
+/// The `cd` operand for a remote root. A bare `-` is POSIX `cd -` (the previous
+/// directory), so a relative root is always written with a `./` prefix. The prefix
+/// also keeps `CDPATH` out of the lookup.
+fn cd_operand(remote_root: &str) -> String {
+    posix_quote(&sent_root(remote_root))
+}
+
+/// The unquoted path copia sends to `cd` for a remote root. Its length is what
+/// the kernel's PATH_MAX judges, so the absent-root guard measures this value.
+fn sent_root(remote_root: &str) -> String {
+    if remote_root.starts_with('/') {
+        remote_root.to_owned()
+    } else {
+        format!("./{remote_root}")
+    }
+}
+
+/// Whether a remote record's kind (`%y%Y`) is one copia carries: a regular file
+/// and nothing else. A symlink is not carried, whatever it points at: copia
+/// streams bytes, and `cat` would print the target's bytes under the link's name.
+/// A symlink is an omission, so `--delete` is vetoed by it.
+fn remote_kind_carried(kind: &str) -> bool {
+    matches!(kind, "ff")
+}
+
+/// A stable name for a remote record kind (`%y%Y`), for the omission message.
+fn remote_entry_name(kind: &str) -> String {
+    let mut chars = kind.chars();
+    let (Some(entry), Some(target), None) = (chars.next(), chars.next(), chars.next()) else {
+        return "malformed-kind".to_owned();
+    };
+    let name = |k: char| match k {
+        'f' => "file",
+        'd' => "directory",
+        'p' => "fifo",
+        's' => "socket",
+        'c' => "char-device",
+        'b' => "block-device",
+        'D' => "door",
+        _ => "unknown",
+    };
+    match (entry, target) {
+        ('l', 'N') => "dangling-symlink".to_owned(),
+        ('l', 'L') => "symlink-loop".to_owned(),
+        ('l', t) => format!("symlink-to-{}", name(t)),
+        (e, _) => name(e).to_owned(),
+    }
+}
+
+/// Parse NUL-terminated `kind\tsize\tmtime\t./path` records into a `MetaMap`.
+/// A record that does not parse is pushed to `omitted`, never dropped silently.
+///
+/// An entry whose kind copia cannot carry (anything but a regular file or a
+/// symlink) is an omission and is NOT entered in the map. It must not be planned,
+/// because `cat` on a remote FIFO blocks forever.
+pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> MetaMap {
+    let mut out = MetaMap::new();
+    if stdout.is_empty() {
+        return out;
+    }
+    // Every record ends in a NUL. Bytes after the last NUL are a record the
+    // listing never finished: an omission, never parsed. An empty record between
+    // two NULs is malformed too. Neither is dropped silently.
+    let Some(last) = stdout.iter().rposition(|&b| b == 0) else {
+        omitted.push(format!(
+            "truncated remote record (no terminating NUL): {}",
+            String::from_utf8_lossy(stdout)
+        ));
+        return out;
+    };
+    if last + 1 < stdout.len() {
+        omitted.push(format!(
+            "truncated remote record (no terminating NUL): {}",
+            String::from_utf8_lossy(&stdout[last + 1..])
+        ));
+    }
+    for entry in stdout[..last].split(|&b| b == 0) {
+        if entry.is_empty() {
+            omitted.push("empty remote record (between NUL terminators)".to_owned());
+            continue;
+        }
+        match parse_remote_record(entry) {
+            Ok((rel, _)) if is_staging_name(&rel) => {
+                omitted.push(format!("staging-named remote entry {}", rel.display()));
+            }
+            Ok((rel, meta)) => {
+                out.insert(rel, meta);
+            }
+            Err(reason) => omitted.push(reason),
+        }
+    }
+    out
+}
+
+/// A name ending in the staging suffix. Its transfer stages into `<name>.copia-tmp`,
+/// so a source entry with this name would be written by two transfers at once.
+fn is_staging_name(rel: &Path) -> bool {
+    rel.file_name()
+        .is_some_and(|n| n.to_string_lossy().ends_with(".copia-tmp"))
+}
+
+/// Parse one `kind\tsize\tmtime\t./path` record. Every failure is returned as
+/// the omission message: nothing is dropped or defaulted.
+fn parse_remote_record(entry: &[u8]) -> Result<(PathBuf, FileMeta), String> {
+    // A name that is not UTF-8 cannot be carried faithfully: lossy decoding
+    // renamed it, so the plan transferred a different file and deleted the
+    // real one. It is an omission, never a guess.
+    let s = std::str::from_utf8(entry).map_err(|_| {
+        format!(
+            "malformed remote record (path is not UTF-8): {}",
+            String::from_utf8_lossy(entry)
+        )
+    })?;
+    let mut parts = s.splitn(4, '\t');
+    let (Some(kind), Some(size), Some(mtime), Some(path)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(format!("malformed remote record: {s}"));
+    };
+    let size = size
+        .parse::<u64>()
+        .map_err(|_| format!("malformed remote size: {s}"))?;
+    let mtime = parse_remote_mtime(mtime).ok_or_else(|| format!("malformed remote mtime: {s}"))?;
+    let rel = path.strip_prefix("./").unwrap_or(path);
+    if rel.is_empty() || rel == "." {
+        return Err(format!("malformed remote record (empty path): {s}"));
+    }
+    // The path is a name under the remote root. An absolute path, or any empty,
+    // `.` or `..` segment, would escape local_root on a pull. Refused, not carried.
+    if rel
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(format!(
+            "unsafe remote path (absolute or contains . or ..): {s}"
+        ));
+    }
+    if !remote_kind_carried(kind) {
+        return Err(format!("cannot carry {} {rel}", remote_entry_name(kind)));
+    }
+    Ok((PathBuf::from(rel), FileMeta { size, mtime }))
+}
+
+/// `%T@` is "secs.nanos". Truncate to whole seconds. Anything else after the
+/// dot, or a non-integer before it, is malformed: a default of 0 would read as
+/// "changed" and put a fabricated timestamp in the plan.
+fn parse_remote_mtime(raw: &str) -> Option<i64> {
+    let (whole, frac) = raw.split_once('.').unwrap_or((raw, "0"));
+    let frac_ok = !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit());
+    whole.parse::<i64>().ok().filter(|_| frac_ok)
 }
 
 /// Set a local file's mtime to `secs` epoch seconds (best-effort).
@@ -184,8 +407,8 @@ mod tests {
 
     #[test]
     fn parse_meta_reads_size_mtime_path_and_truncates_subsecond() {
-        let raw = b"1024\t1700000000.500\t./a.txt\x00\t\t\x00512\t1699999999\t./sub/b.bin\0";
-        let m = parse_remote_meta_output(raw);
+        let raw = b"ff\t1024\t1700000000.500\t./a.txt\x00ff\t512\t1699999999\t./sub/b.bin\0";
+        let m = parse_remote_meta_output(raw, &mut Vec::new());
         assert_eq!(m.len(), 2);
         assert_eq!(
             m[&PathBuf::from("a.txt")],
@@ -203,11 +426,228 @@ mod tests {
         );
     }
 
+    /// Issue #50 review finding 3 RED: a malformed record is an omission, never
+    /// dropped or defaulted. Three shapes: an empty path, a non-numeric mtime
+    /// (defaulted to 0 before), and a non-UTF-8 name (lossy-decoded before, so
+    /// the plan deleted the real file and transferred a renamed copy).
+    #[test]
+    fn malformed_remote_records_are_omissions() {
+        let cases: [&[u8]; 5] = [
+            b"ff\t3\t1700000000.0\t./\x00",
+            b"ff\t3\tabc\t./x\x00",
+            b"ff\t1\t1700000000.0\t./caf\xe9\x00",
+            b"ff\t3\t1700000000.abc\t./x\x00",
+            b"ff\t1\t1700000000.0\t.\x00",
+        ];
+        for raw in cases {
+            let mut omitted = Vec::new();
+            let m = parse_remote_meta_output(raw, &mut omitted);
+            assert!(m.is_empty(), "{raw:?} was planned: {m:?}");
+            assert_eq!(omitted.len(), 1, "{raw:?} was not omitted: {omitted:?}");
+            assert!(omitted[0].contains("malformed"), "{omitted:?}");
+        }
+    }
+
+    /// Review finding (lane 2) RED: a destination root written with a trailing
+    /// slash that names an existing regular file is not absent. The guard exited 0.
+    #[cfg(unix)]
+    #[test]
+    fn absent_root_guard_never_reads_an_existing_file_as_absent() {
+        let base = std::env::temp_dir().join(format!("copia-50-guard-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("regfile");
+        std::fs::write(&file, b"x").unwrap();
+        let root = format!("{}/", file.display());
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{}echo LISTING", absent_root_guard(&root)))
+            .output()
+            .expect("sh");
+        std::fs::remove_dir_all(&base).ok();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("LISTING"),
+            "guard exited as absent: {stdout:?}"
+        );
+    }
+
     #[test]
     fn parse_meta_skips_malformed_records() {
         // missing fields / non-numeric size are dropped, not panicked on
-        let m = parse_remote_meta_output(b"notanumber\t123\t./x\0\0only-one-field\0");
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(
+            b"ff\tnotanumber\t123\t./x\0\0only-one-field\0",
+            &mut omitted,
+        );
         assert!(m.is_empty());
+        // ...and each one is an omission, so a sync can never delete on its strength.
+        // Three: the bad size, the empty record between the NULs (finding 5), and the one-field record.
+        assert_eq!(omitted.len(), 3, "{omitted:?}");
+    }
+
+    /// Review finding A: a FIFO on a remote tree must name its kind and become an
+    /// omission. It is not planned for transfer, because `cat` on a FIFO blocks.
+    #[test]
+    fn remote_fifo_entry_is_an_omission_and_not_planned() {
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(
+            b"pp\t0\t1700000000.0\t./pipe\x00ff\t3\t1700000000.0\t./a.txt\x00",
+            &mut omitted,
+        );
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m.contains_key(&PathBuf::from("a.txt")));
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("fifo"), "{omitted:?}");
+    }
+
+    /// Issue #50: a remote listing that exits non-zero is an omission, and it
+    /// reads as an empty map, never as "the remote has nothing".
+    #[tokio::test]
+    async fn remote_listing_failure_is_an_omission() {
+        // A root that cannot exist. The test may run with the ssh shim on PATH
+        // (see incremental.rs), which runs the listing here, so a real path such
+        // as /nonexistent would be listed instead of failing.
+        let absent = format!("/copia-no-such-root-{}", std::process::id());
+        let mut omitted = Vec::new();
+        let m =
+            discover_remote_with_meta("no-such-host.invalid", &absent, false, &mut omitted).await;
+        assert!(m.is_empty());
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+    }
+
+    /// Issue #50: a directory whose entries cannot be lstat-ed is an omission,
+    /// and the entry is not silently absent from the map.
+    #[cfg(unix)]
+    #[test]
+    fn unstatable_entry_is_an_omission() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("copia-50-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("locked")).unwrap();
+        std::fs::write(base.join("locked/f"), b"x").unwrap();
+        std::fs::write(base.join("ok"), b"y").unwrap();
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o444))
+            .unwrap();
+        let mut omitted = Vec::new();
+        let m = discover_local_with_meta(&base, &mut omitted);
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(m.contains_key(&PathBuf::from("ok")));
+        assert!(!m.contains_key(&PathBuf::from("locked/f")));
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("cannot stat"), "{omitted:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #50 review finding B RED: the absent-root guard runs under the remote
+    /// login shell, which is POSIX sh (dash) on many hosts. There `$'...'` is a
+    /// literal string, so an existing root read as absent and the listing exited 0.
+    #[cfg(unix)]
+    #[test]
+    fn absent_root_guard_is_posix_sh_safe() {
+        let base = std::env::temp_dir().join(format!("copia-50-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let present = base.join("present");
+        let absent = base.join("absent");
+        std::fs::create_dir_all(&present).unwrap();
+        let run = |root: &Path| {
+            let script = format!("{}echo REACHED", absent_root_guard(&root.to_string_lossy()));
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .unwrap()
+        };
+        // An existing root must not take the early exit.
+        let out = run(&present);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "REACHED",
+            "{out:?}"
+        );
+        // A definitively absent root takes it: exit 0, nothing else runs.
+        let out = run(&absent);
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #50 review finding B: a stat failure is not "absent". A root whose
+    /// parent cannot be searched must not take the early exit.
+    #[cfg(unix)]
+    #[test]
+    fn absent_root_guard_does_not_exit_on_a_stat_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("copia-50-guard-eacces-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let locked = base.join("locked");
+        std::fs::create_dir_all(locked.join("child")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let script = format!(
+            "{}echo REACHED",
+            absent_root_guard(&locked.join("child").to_string_lossy())
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Not absent, only unreadable: the guard must fall through to the listing
+        // (which then fails and is an omission), never take the exit 0 path.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "REACHED",
+            "{out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #50: an entry kind copia cannot carry (a FIFO) is an omission.
+    #[cfg(unix)]
+    #[test]
+    fn uncarriable_entry_kind_is_an_omission() {
+        let base = std::env::temp_dir().join(format!("copia-50-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(base.join("pipe"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut omitted = Vec::new();
+        let _ = discover_local_with_meta(&base, &mut omitted);
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].starts_with("cannot carry fifo"), "{omitted:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #50: an unreadable subdirectory is named as an omission, and the
+    /// rest of the tree is still walked and returned.
+    #[cfg(unix)]
+    #[test]
+    fn walk_names_an_unreadable_subdirectory_and_keeps_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("copia-50-metawalk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("locked")).unwrap();
+        std::fs::write(base.join("locked/f"), b"x").unwrap();
+        std::fs::write(base.join("ok"), b"y").unwrap();
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let mut omitted = Vec::new();
+        let files = walk_local(&base, &mut omitted);
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(files, vec![PathBuf::from("ok")]);
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(
+            omitted[0].starts_with("unreadable directory"),
+            "{omitted:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -216,11 +656,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("d")).unwrap();
         std::fs::write(base.join("d/f"), b"hello").unwrap();
-        let m = discover_local_with_meta(&base).unwrap();
+        let m = discover_local_with_meta(&base, &mut Vec::new());
         assert_eq!(m[&PathBuf::from("d/f")].size, 5);
         // set + read back the mtime at 1s granularity
         set_local_mtime(&base.join("d/f"), 1_600_000_000).unwrap();
-        let m2 = discover_local_with_meta(&base).unwrap();
+        let m2 = discover_local_with_meta(&base, &mut Vec::new());
         assert_eq!(m2[&PathBuf::from("d/f")].mtime, 1_600_000_000);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -307,5 +747,341 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+// Review regressions for copia #50 round 4 (findings 1, 3, 4, 5).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod r93_meta {
+    use super::*;
+
+    /// Finding 1 (CRITICAL): a remote path that escapes the root is refused.
+    #[test]
+    fn remote_paths_that_escape_the_root_are_refused() {
+        let cases: [&[u8]; 5] = [
+            b"ff\t1\t1700000000.0\t/etc/passwd\x00",
+            b"ff\t1\t1700000000.0\t./../x\x00",
+            b"ff\t1\t1700000000.0\t./a/../../x\x00",
+            b"ff\t1\t1700000000.0\t./a/./b\x00",
+            b"ff\t1\t1700000000.0\t.//x\x00",
+        ];
+        for raw in cases {
+            let mut omitted = Vec::new();
+            let m = parse_remote_meta_output(raw, &mut omitted);
+            assert!(m.is_empty(), "{raw:?} was planned: {m:?}");
+            assert_eq!(omitted.len(), 1, "{raw:?} was not refused: {omitted:?}");
+            assert!(omitted[0].contains("unsafe"), "{omitted:?}");
+        }
+    }
+
+    /// Finding 5 (MEDIUM): a truncated trailing record and an empty NUL record are
+    /// omissions, never silently dropped.
+    #[test]
+    fn truncated_and_empty_records_are_omissions() {
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(b"ff\t1\t1700000000.0\t./a", &mut omitted);
+        assert!(m.is_empty(), "{m:?}");
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("truncated"), "{omitted:?}");
+
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(
+            b"ff\t1\t1700000000.0\t./a\x00ff\t1\t1700000000.0\t./b",
+            &mut omitted,
+        );
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m.contains_key(&PathBuf::from("a")));
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("truncated"), "{omitted:?}");
+
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(b"\x00ff\t1\t1700000000.0\t./b\x00", &mut omitted);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("empty"), "{omitted:?}");
+    }
+
+    #[cfg(unix)]
+    fn run_guard(root: &str) -> std::process::Output {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{}echo REACHED", absent_root_guard(root)))
+            .output()
+            .unwrap()
+    }
+
+    /// Finding 3 (HIGH): a root ending in `/.`, or a dangling link, an unsearchable
+    /// dir or a regular file under it, must never take the absent exit. Only a true
+    /// ENOENT may. Each case must fall through to the listing.
+    #[cfg(unix)]
+    #[test]
+    fn dot_suffixed_roots_are_never_read_as_absent() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let base = std::env::temp_dir().join(format!("copia-93-dot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let child = base.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o000)).unwrap();
+        symlink("nowhere", base.join("dangling")).unwrap();
+        std::fs::write(base.join("file"), b"x").unwrap();
+        let roots = [
+            format!("{}/.", child.display()),
+            format!("{}/./", child.display()),
+            format!("{}/dangling/.", base.display()),
+            format!("{}/file/.", base.display()),
+        ];
+        let results: Vec<_> = roots.iter().map(|r| (r.clone(), run_guard(r))).collect();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&base).ok();
+        for (root, out) in results {
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "REACHED",
+                "{root} was read as absent: {out:?}"
+            );
+        }
+    }
+
+    /// Finding 4 (MEDIUM-HIGH): a multi-level absent destination is a first sync.
+    /// A missing level under an existing directory is absent; a file in the middle is not.
+    #[cfg(unix)]
+    #[test]
+    fn multi_level_absent_root_takes_the_early_exit() {
+        let base = std::env::temp_dir().join(format!("copia-93-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("present")).unwrap();
+        let root = base.join("present/missing-a/missing-b/remote");
+        let out = run_guard(&root.to_string_lossy());
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "absent deep root fell through: {out:?}"
+        );
+
+        std::fs::write(base.join("present/file"), b"x").unwrap();
+        let out = run_guard(&base.join("present/file/x/y").to_string_lossy());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "REACHED",
+            "{out:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 6 RED: `-e` is false on ENAMETOOLONG as well as ENOENT, so an
+    /// over-long component read as absent and a first sync was run into a root
+    /// the listing could never reach. Only ENOENT may take the early exit.
+    #[cfg(unix)]
+    #[test]
+    fn enametoolong_remote_root_is_never_read_as_absent() {
+        let base = std::env::temp_dir().join(format!("copia-93-long-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("a".repeat(300));
+        let out = run_guard(&root.to_string_lossy());
+        std::fs::remove_dir_all(&base).ok();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "REACHED",
+            "an ENAMETOOLONG root was read as absent: {out:?}"
+        );
+    }
+
+    /// Finding 3 RED: a remote symlink to a regular file is not carried. `cat`
+    /// follows the link, so the listing must make it an omission, not a transfer.
+    #[test]
+    fn remote_symlink_to_file_is_an_omission_not_planned() {
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(b"lf\t1\t1700000000.0\t./link\x00", &mut omitted);
+        assert!(m.is_empty(), "a symlink to a file was planned: {m:?}");
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("symlink-to-file"), "{omitted:?}");
+    }
+}
+
+#[cfg(test)]
+mod r93_round3 {
+    use super::*;
+
+    /// Round 3, item 6 RED: the guard repeats every prefix, so its size grows with
+    /// the square of the depth and a deep root overflows the command line (E2BIG).
+    #[test]
+    fn absent_root_guard_stays_linear_on_a_deep_root() {
+        let deep = vec!["d"; 1000].join("/");
+        let guard = absent_root_guard(&deep);
+        assert!(
+            guard.len() < 16 * 1024,
+            "the guard is {} bytes for a depth-1000 root",
+            guard.len()
+        );
+    }
+
+    /// Round 3, item 7 RED: trailing slashes pad the raw root past PATH_MAX, while
+    /// the trimmed root is short. The kernel refuses the raw path (ENAMETOOLONG),
+    /// so the guard must not read it as absent.
+    #[test]
+    fn a_root_over_path_max_with_trailing_slashes_is_never_absent() {
+        let root = format!("absent{}", "/".repeat(5000));
+        assert!(
+            absent_root_guard(&root).is_empty(),
+            "an over-PATH_MAX root was classified through its trimmed form"
+        );
+    }
+
+    /// Round 3, item 8 RED: `cd -- -` is POSIX `cd -` (the previous directory), so a
+    /// root named "-" listed $OLDPWD instead of ./-.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_root_named_dash_lists_that_directory() {
+        let base = std::env::temp_dir().join(format!("copia-r3-dash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("-")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        std::fs::write(base.join("-/inside"), b"x").unwrap();
+        std::fs::write(base.join("other/outside"), b"x").unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(remote_listing_command("", "-"))
+            .current_dir(&base)
+            .env("OLDPWD", base.join("other"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("./inside"),
+            "the root \"-\" was not listed: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains("./outside"),
+            "the root \"-\" listed $OLDPWD: {stdout:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod r93_staging_collision {
+    use super::*;
+
+    /// Review finding 5 (3dcc68e, lane B 2): a source entry named `<x>.copia-tmp`
+    /// is the staging path of `<x>`. Both planned in one run, the two transfers
+    /// write the same file and the other's data is lost while the run exits 0. Such
+    /// an entry is an omission (which also vetoes `--delete`), never planned.
+    #[test]
+    fn a_source_entry_named_like_a_staging_file_is_an_omission_not_planned() {
+        let base = std::env::temp_dir().join(format!("copia-93-stage-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.txt"), b"big").unwrap();
+        std::fs::write(base.join("a.txt.copia-tmp"), b"small").unwrap();
+        let mut omitted = Vec::new();
+        let map = discover_local_with_meta(&base, &mut omitted);
+        assert!(map.contains_key(Path::new("a.txt")));
+        assert!(
+            !map.contains_key(Path::new("a.txt.copia-tmp")),
+            "a staging-named entry was planned"
+        );
+        assert!(omitted.iter().any(|o| o.contains("a.txt.copia-tmp")));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The same rule for a remote listing record.
+    #[test]
+    fn a_remote_entry_named_like_a_staging_file_is_an_omission() {
+        let stdout = b"ff\t3\t1700000000.0\t./a.txt.copia-tmp\0";
+        let mut omitted = Vec::new();
+        let map = parse_remote_meta_output(stdout, &mut omitted);
+        assert!(map.is_empty(), "a remote staging-named entry was planned");
+        assert_eq!(omitted.len(), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod r93_deep_guard {
+    use super::absent_root_guard;
+
+    /// Review finding 3 (3dcc68e, lane A 3C): the guard is dropped above a 16 KiB
+    /// inline bound, and each level costs about 130 bytes, so a valid absent root
+    /// around depth 160 was never classified and its first sync failed. A root of
+    /// depth 200 (well inside PATH_MAX and one argument) must still be absent.
+    #[test]
+    fn a_valid_absent_root_at_depth_200_is_classified_absent() {
+        // Its own directory name: the multi-level test uses `copia-93-deep-<pid>`, and
+        // the two race on one tree (measured 8 failures in 15 runs before this).
+        let base = std::env::temp_dir().join(format!("copia-93-deep200-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut root = base.clone();
+        for _ in 0..200 {
+            root.push("d");
+        }
+        let root_s = root.display().to_string();
+        let guard = absent_root_guard(&root_s);
+        assert!(
+            !guard.is_empty(),
+            "a depth-200 absent root was not classified"
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{guard}exit 7"))
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "the guard did not report absence");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding (2) on 39e7293: the PATH_MAX check ran on the raw root, but a
+    /// relative root is sent to `cd` as "./" + root. A raw root of 4094 or 4095
+    /// bytes sends a 4096 or 4097 byte operand, which the kernel refuses with
+    /// ENAMETOOLONG, yet the guard still classified it absent. Components stay
+    /// within NAME_MAX (200 bytes each).
+    #[test]
+    fn a_relative_root_whose_sent_operand_is_over_path_max_is_never_absent() {
+        for raw_len in [4094usize, 4095] {
+            let mut root = vec!["x".repeat(200); 20].join("/");
+            root.push('/');
+            root.push_str(&"y".repeat(raw_len - root.len()));
+            assert_eq!(root.len(), raw_len);
+            assert!(
+                absent_root_guard(&root).is_empty(),
+                "a {raw_len}-byte root (sent as {} bytes) was classified absent",
+                raw_len + 2
+            );
+        }
+    }
+
+    /// Review finding (3) on 3dcc68e, lane A: the inline guard spends about 130 bytes
+    /// per level, so a valid absent root deeper than about 750 levels lost its guard
+    /// and its first sync failed as an omission. Every level is now one entry of a
+    /// single quoted loop, so a depth-1000 absent root (2000 bytes, inside PATH_MAX)
+    /// must still be classified absent and its guard must stay well under one argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_depth_1000_absent_root_is_classified_absent() {
+        use super::{absent_root_guard, remote_listing_command};
+        let root = vec!["d"; 1000].join("/");
+        let guard = absent_root_guard(&root);
+        assert!(
+            !guard.is_empty(),
+            "a depth-1000 absent root was not classified"
+        );
+        assert!(
+            guard.len() < 32 * 1024,
+            "the guard is {} bytes",
+            guard.len()
+        );
+        let command = remote_listing_command(&guard, &root);
+        let dir = std::env::temp_dir().join(format!("copia-93-depth1000-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            out.status.success() && out.stdout.is_empty(),
+            "an absent depth-1000 root was not read as absent: {out:?}"
+        );
     }
 }

@@ -16,7 +16,7 @@ use super::transfer::{
     transfer_speed,
 };
 use super::FileLocation;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -86,6 +86,8 @@ fn report(
     start: Instant,
     progress: &TransferProgress,
     plan: &SyncPlan,
+    deleted: usize,
+    omitted: &[String],
     src_desc: &str,
     dst_desc: &str,
     verbose: bool,
@@ -93,11 +95,12 @@ fn report(
     let elapsed = start.elapsed();
     let tx = progress.bytes();
     println!(
-        "\nComplete: {} sent, {} skipped, {} deleted, {} failed",
+        "\nComplete: {} sent, {} skipped, {} deleted, {} failed, {} omitted",
         progress.done(),
         plan.skipped,
-        plan.delete.len(),
-        progress.failed()
+        deleted,
+        progress.failed(),
+        omitted.len()
     );
     println!(
         "Transferred {} in {:.1}s ({}/s)",
@@ -111,7 +114,7 @@ fn report(
     if progress.failed() > 0 {
         return Err(format!("{} file(s) failed to transfer", progress.failed()).into());
     }
-    Ok(())
+    omission_error(omitted)
 }
 
 /// The `(source, destination)` labels for this direction, as an operator sees
@@ -140,25 +143,130 @@ fn endpoint_descriptions(
 /// (first sync) yields an empty map, so every source file is new.
 /// Resolve each `?` into a binding BEFORE any await so no error-carrying
 /// temporary is held across it (keeps the future `Send`).
+/// Both listings. Every omission from either side lands in `omitted`: an
+/// incomplete listing is never read as an empty tree (issue #50).
 async fn discover_both(
     dir: Dir,
     host: &str,
     remote_root: &str,
     local_root: &Path,
-) -> Result<(MetaMap, MetaMap), Box<dyn std::error::Error>> {
+    omitted: &mut Vec<String>,
+) -> (MetaMap, MetaMap) {
     match dir {
         Dir::Push => {
-            let local = discover_local_with_meta(local_root)?;
-            let remote = discover_remote_with_meta(host, remote_root)
-                .await
-                .unwrap_or_default();
-            Ok((local, remote))
+            let mut local = discover_local_with_meta(local_root, omitted);
+            // A name that is not UTF-8 has no spelling on the wire: it cannot be
+            // sent under its own name, so it is an omission, never renamed.
+            local.retain(|rel, _| {
+                if rel.to_str().is_some() {
+                    return true;
+                }
+                omitted.push(format!(
+                    "non-UTF-8 name cannot be sent to {host}:{remote_root}: {}",
+                    rel.display()
+                ));
+                false
+            });
+            // A symlink cannot be carried, whatever its target: copia sends bytes,
+            // and a link's target is not the link. It is checked here, not left to
+            // the transfer, because the quick check can skip an entry whose size
+            // and mtime match, and then no transfer runs to fail. The transfer
+            // refuses a link too, as a second line of defence.
+            local.retain(|rel, _| {
+                let full = local_root.join(rel);
+                if !std::fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return true;
+                }
+                omitted.push(format!("cannot carry symlink {}", full.display()));
+                false
+            });
+            let remote = discover_remote_with_meta(host, remote_root, true, omitted).await;
+            (local, remote)
         }
         Dir::Pull => {
-            let remote = discover_remote_with_meta(host, remote_root).await?;
-            let local = discover_local_with_meta(local_root).unwrap_or_default();
-            Ok((remote, local))
+            let remote = discover_remote_with_meta(host, remote_root, false, omitted).await;
+            // The local root is the DESTINATION: an absent one is a first sync,
+            // as it is for a push and for a local sync (`run_local`).
+            let local = if is_absent(local_root) {
+                MetaMap::new()
+            } else {
+                discover_local_with_meta(local_root, omitted)
+            };
+            (remote, local)
         }
+    }
+}
+
+/// The veto, stated once. An incomplete source (any omission) may not delete.
+/// The delete pass checks this flag itself, so the guarantee does not depend on
+/// how the plan was built.
+fn omission_error(omitted: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if omitted.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "run incomplete: {} source entr{} omitted (see OMITTED above)",
+        omitted.len(),
+        if omitted.len() == 1 { "y" } else { "ies" }
+    )
+    .into())
+}
+
+/// A transfer that failed leaves the destination as incomplete as an omitted
+/// source entry does. It sets the omitted flag, so `--delete` is vetoed by the
+/// same gate. Before this, the delete pass checked only the listing, and a
+/// file that failed in `cat` or `ssh` still let the delete run.
+fn veto_failed_transfers(progress: &TransferProgress, plan: &SyncPlan, omitted: &mut Vec<String>) {
+    let failed = progress.failed();
+    let unfinished = progress.unfinished();
+    if failed == 0 && unfinished == 0 {
+        return;
+    }
+    if failed > 0 {
+        omitted.push(format!("{failed} transfer(s) failed"));
+    }
+    // A task that panicked or was cancelled never reports to the counters. It is
+    // neither done nor failed, and the run is no more complete for it.
+    if unfinished > 0 {
+        omitted.push(format!("{unfinished} transfer(s) did not finish"));
+    }
+    if !plan.delete.is_empty() {
+        eprintln!(
+            "VETOED: --delete skipped {} destination file(s) because transfers failed",
+            plan.delete.len()
+        );
+    }
+}
+
+/// Print every omission, and say plainly when `--delete` is vetoed by them.
+fn print_omissions(omitted: &[String]) {
+    if omitted.is_empty() {
+        return;
+    }
+    eprintln!(
+        "OMITTED {} source entr(y/ies); the run is incomplete:",
+        omitted.len()
+    );
+    for line in omitted {
+        eprintln!("  {line}");
+    }
+}
+
+/// The veto line for `--delete`, or `None` when nothing is vetoed. A run with no
+/// omissions vetoes nothing, and a run with nothing to delete has nothing to veto.
+fn veto_line(omitted: &[String], delete_count: usize) -> Option<String> {
+    if omitted.is_empty() || delete_count == 0 {
+        return None;
+    }
+    Some(format!(
+        "VETOED: --delete skipped {delete_count} destination file(s) because the source is incomplete"
+    ))
+}
+
+fn veto_notice(omitted: &[String], plan: &SyncPlan) {
+    print_omissions(omitted);
+    if let Some(line) = veto_line(omitted, plan.delete.len()) {
+        eprintln!("{line}");
     }
 }
 
@@ -236,21 +344,25 @@ async fn run_remote(
     let (src_desc, dst_desc) = endpoint_descriptions(dir, host, remote_root, local_root);
     eprintln!("Scanning {src_desc} and {dst_desc}...");
 
-    let (src_meta, dst_meta) = discover_both(dir, host, remote_root, local_root).await?;
+    let mut omitted = Vec::new();
+    let (src_meta, dst_meta) =
+        discover_both(dir, host, remote_root, local_root, &mut omitted).await;
     // Empty source short-circuits (unless mirroring, where empty source is a
     // legitimate "delete everything on the destination").
     if src_meta.is_empty() && !opts.delete {
         eprintln!("No files found.");
-        return Ok(());
+        print_omissions(&omitted);
+        return omission_error(&omitted);
     }
     let plan = build_plan(&src_meta, &dst_meta, &opts.excludes, opts.delete);
     print_plan(&plan, opts.dry_run);
+    veto_notice(&omitted, &plan);
     if opts.dry_run {
-        return Ok(());
+        return omission_error(&omitted);
     }
     if plan.transfer.is_empty() && plan.delete.is_empty() {
         println!("Already up to date ({} files).", src_meta.len());
-        return Ok(());
+        return omission_error(&omitted);
     }
 
     let dirs = collect_dirs(&plan.transfer);
@@ -266,11 +378,25 @@ async fn run_remote(
         opts.jobs,
     );
     join_handles(handles).await;
+    veto_failed_transfers(&progress, &plan, &mut omitted);
 
-    if !plan.delete.is_empty() {
-        apply_remote_deletes(dir, host, remote_root, local_root, &plan.delete).await;
-    }
-    report(start, &progress, &plan, &src_desc, &dst_desc, opts.verbose)
+    // The veto, enforced at the delete pass itself.
+    let deleted = if omitted.is_empty() && !plan.delete.is_empty() {
+        apply_remote_deletes(dir, host, remote_root, local_root, &plan.delete).await?;
+        plan.delete.len()
+    } else {
+        0
+    };
+    report(
+        start,
+        &progress,
+        &plan,
+        deleted,
+        &omitted,
+        &src_desc,
+        &dst_desc,
+        opts.verbose,
+    )
 }
 
 /// Atomic pull: stream to a `.copia-tmp` sibling, rename into place, set mtime.
@@ -281,6 +407,7 @@ async fn deliver_pull(
     mtime: Option<i64>,
 ) -> Result<u64, String> {
     let tmp = tmp_path(local_dest);
+    check_staging_slot(&tmp)?;
     let size = transfer_file_from_remote(host, remote_file, &tmp).await?;
     tokio::fs::rename(&tmp, local_dest)
         .await
@@ -293,43 +420,131 @@ async fn deliver_pull(
 
 /// Delete the mirror's stale files. Pull deletes locally; push batches one
 /// `xargs rm` over SSH.
+///
+/// A failed delete is an error, never a silent success: the run exits non-zero.
 async fn apply_remote_deletes(
     dir: Dir,
     host: &str,
     remote_root: &str,
     local_root: &Path,
     dels: &[PathBuf],
-) {
+) -> Result<(), String> {
     match dir {
-        Dir::Pull => {
-            for rel in dels {
-                let _ = std::fs::remove_file(local_root.join(rel));
-            }
-        }
+        Dir::Pull => remove_local_files(local_root, dels)?,
         Dir::Push => {
             use std::fmt::Write as _;
             use tokio::io::AsyncWriteExt;
+            // NUL-terminated: a newline is a legal file-name byte, and a
+            // newline-delimited list deleted the wrong names.
             let mut list = String::new();
             for rel in dels {
-                let _ = writeln!(list, "{}/{}", remote_root, rel.display());
+                let _ = write!(list, "{}/{}\0", remote_root, rel.display());
             }
-            if let Ok(mut child) = tokio::process::Command::new("ssh")
+            let mut child = tokio::process::Command::new("ssh")
                 .arg(host)
-                .arg("xargs -d '\\n' rm -f --")
+                .arg("xargs -0 rm -f --")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
-            {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(list.as_bytes()).await;
-                    drop(stdin);
-                }
-                let _ = child.wait_with_output().await;
+                .map_err(|e| format!("remote delete: ssh spawn: {e}"))?;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "remote delete: no ssh stdin".to_string())?;
+            stdin
+                .write_all(list.as_bytes())
+                .await
+                .map_err(|e| format!("remote delete: write: {e}"))?;
+            drop(stdin);
+            let out = child
+                .wait_with_output()
+                .await
+                .map_err(|e| format!("remote delete: ssh wait: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "remote delete failed ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
             }
         }
     }
     eprintln!("Deleted {} stale file(s) on the destination", dels.len());
+    Ok(())
+}
+
+/// True when `path` does not exist at all. A dangling symlink exists. A trailing
+/// slash is trimmed first: `lstat("link/")` follows the link, so a dangling one
+/// would read as absent.
+fn is_absent(path: &Path) -> bool {
+    // `..` is not resolved lexically, so a path through it is never read as absent.
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    // Judged as sent: trailing slashes count toward PATH_MAX for the kernel, so a
+    // path padded past it is refused, not read as absent after normalizing.
+    if path.as_os_str().len() >= 4096 {
+        return false;
+    }
+    // Rebuilt from components, which drops a trailing slash and `.` segments on
+    // any platform. The old code trimmed only UTF-8 names, so a non-UTF-8 link
+    // with a trailing slash was lstat-ed through the link and read as absent.
+    let normal: PathBuf = path.components().collect();
+    // A DANGLING link on the way is not absence. `lstat("dangling/child")` fails
+    // with ENOENT because the link's target is missing, not because `child` is.
+    let dangling_ancestor = normal.ancestors().skip(1).any(|a| {
+        !a.as_os_str().is_empty()
+            && std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::metadata(a).is_err()
+    });
+    if dangling_ancestor {
+        return false;
+    }
+    matches!(
+        std::fs::symlink_metadata(&normal),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// The staging name `.copia-tmp` must NOT exist at all. Anything there may be synced
+/// data that happens to carry the name, and `File::create` would truncate it. So the
+/// slot is refused, never overwritten: the user removes the entry and retries.
+fn check_staging_slot(tmp: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(tmp) {
+        Ok(_) => Err(format!(
+            "{}: staging path already exists; not overwriting it; remove it and retry",
+            tmp.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "{}: cannot inspect staging path: {e}",
+            tmp.display()
+        )),
+    }
+}
+
+/// Remove local files. A file already gone is not an error; any other failure is,
+/// so a stale file that survives is reported and the run fails.
+fn remove_local_files(root: &Path, rels: &[PathBuf]) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for rel in rels {
+        let path = root.join(rel);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failures.push(format!("{}: {e}", path.display())),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to delete {} file(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -340,20 +555,33 @@ async fn run_local(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     eprintln!("Scanning {} and {}...", src.display(), dst.display());
-    let src_meta = discover_local_with_meta(src)?;
+    // Omissions from EITHER side land here. Only the source's omissions can
+    // matter to a delete, but an incomplete destination listing is equally an
+    // incomplete run, so it fails the exit code too.
+    let mut omitted = Vec::new();
+    let src_meta = discover_local_with_meta(src, &mut omitted);
     if src_meta.is_empty() && !opts.delete {
         eprintln!("No files found.");
-        return Ok(());
+        print_omissions(&omitted);
+        return omission_error(&omitted);
     }
-    let dst_meta = discover_local_with_meta(dst).unwrap_or_default();
+    // A missing destination root is a first sync, not an omission: there is
+    // nothing on it to delete. The source keeps its omission (above), so a
+    // missing source under --delete still vetoes.
+    let dst_meta = if is_absent(dst) {
+        MetaMap::new()
+    } else {
+        discover_local_with_meta(dst, &mut omitted)
+    };
     let plan = build_plan(&src_meta, &dst_meta, &opts.excludes, opts.delete);
     print_plan(&plan, opts.dry_run);
+    veto_notice(&omitted, &plan);
     if opts.dry_run {
-        return Ok(());
+        return omission_error(&omitted);
     }
     if plan.transfer.is_empty() && plan.delete.is_empty() {
         println!("Already up to date ({} files).", src_meta.len());
-        return Ok(());
+        return omission_error(&omitted);
     }
 
     // Create EVERY directory in the source, not only the ones that happen to
@@ -385,17 +613,22 @@ async fn run_local(
         }));
     }
     join_handles(handles).await;
+    veto_failed_transfers(&progress, &plan, &mut omitted);
 
-    if !plan.delete.is_empty() {
-        for rel in &plan.delete {
-            let _ = std::fs::remove_file(dst.join(rel));
-        }
+    // The veto, enforced at the delete pass itself.
+    let deleted = if omitted.is_empty() && !plan.delete.is_empty() {
+        remove_local_files(dst, &plan.delete)?;
         eprintln!("Deleted {} stale file(s)", plan.delete.len());
-    }
+        plan.delete.len()
+    } else {
+        0
+    };
     report(
         start,
         &progress,
         &plan,
+        deleted,
+        &omitted,
         &src.display().to_string(),
         &dst.display().to_string(),
         opts.verbose,
@@ -455,12 +688,20 @@ async fn deliver_local(src: &Path, dst: &Path, mtime: Option<i64>) -> Result<u64
         }
     }
     let tmp = tmp_path(dst);
-    let size = tokio::fs::copy(src, &tmp)
-        .await
-        .map_err(|e| format!("copy {}: {e}", src.display()))?;
-    tokio::fs::rename(&tmp, dst)
-        .await
-        .map_err(|e| format!("rename {}: {e}", dst.display()))?;
+    check_staging_slot(&tmp)?;
+    // B5: a failure after the staging copy must not leave `tmp` behind, or every
+    // retry is refused at the staging check. A missing `tmp` is not an error here.
+    let size = match tokio::fs::copy(src, &tmp).await {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(format!("copy {}: {e}", src.display()));
+        }
+    };
+    if let Err(e) = tokio::fs::rename(&tmp, dst).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!("rename {}: {e}", dst.display()));
+    }
     if let Some(t) = mtime {
         let _ = set_local_mtime(dst, t);
     }
@@ -528,6 +769,33 @@ mod tests {
         assert!(
             !dst.exists(),
             "a refused entry must leave nothing behind at the destination"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// B5 RED: a rename that fails after the staging copy must leave no
+    /// `.copia-tmp`. A directory at the destination makes the rename fail (EISDIR)
+    /// after the copy has written the staging file; before the fix that file stayed
+    /// and blocked every retry at the staging check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deliver_local_leaves_no_staging_file_when_rename_fails() {
+        let base = std::env::temp_dir().join(format!("copia-dl-b5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let src = base.join("src.bin");
+        std::fs::write(&src, b"payload").unwrap();
+        let dst = base.join("delivered");
+        std::fs::create_dir(&dst).unwrap();
+
+        let res = deliver_local(&src, &dst, None).await;
+
+        assert!(res.is_err(), "a rename onto a directory must fail");
+        let tmp = tmp_path(&dst);
+        assert!(
+            !tmp.exists(),
+            "a failed delivery must not leave the staging file {}",
+            tmp.display()
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -621,8 +889,1178 @@ mod tests {
         assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
         // no temp file left behind
         assert!(!tmp_path(&dst).exists());
-        let m = discover_local_with_meta(&base).unwrap();
+        let m = discover_local_with_meta(&base, &mut Vec::new());
         assert_eq!(m[&PathBuf::from("d")].mtime, 1_600_000_000);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 RED: a source entry whose stat fails is silently dropped from the
+    /// source map, so `--delete` removes its destination copy. A `0o444` directory
+    /// is listable but its entries cannot be lstat-ed (search bit missing).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_delete_is_vetoed_when_a_source_entry_cannot_be_statted() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("copia-50-stat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("s");
+        let dst = base.join("d");
+        std::fs::create_dir_all(src.join("locked")).unwrap();
+        std::fs::create_dir_all(dst.join("locked")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("locked/b.txt"), b"b").unwrap();
+        std::fs::write(dst.join("locked/b.txt"), b"b").unwrap();
+        std::fs::write(dst.join("stale.txt"), b"stale").unwrap();
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o444))
+            .unwrap();
+        let opts = SyncOptions {
+            jobs: 2,
+            verbose: false,
+            dry_run: false,
+            delete: true,
+            excludes: vec![],
+        };
+        let result = run_local(&src, &dst, &opts).await;
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(result.is_err(), "an omitted source entry must fail the run");
+        assert!(
+            dst.join("stale.txt").exists(),
+            "delete ran on an incomplete source"
+        );
+        assert!(
+            dst.join("locked/b.txt").exists(),
+            "omitted source entry's destination copy was deleted"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 acceptance: an unreadable subdirectory with `--delete` deletes
+    /// nothing and exits non-zero.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_delete_is_vetoed_by_an_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("copia-50-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("s");
+        let dst = base.join("d");
+        std::fs::create_dir_all(src.join("locked")).unwrap();
+        std::fs::create_dir_all(dst.join("locked")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("locked/b.txt"), b"b").unwrap();
+        std::fs::write(dst.join("locked/b.txt"), b"b").unwrap();
+        std::fs::write(dst.join("stale.txt"), b"stale").unwrap();
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let opts = SyncOptions {
+            jobs: 2,
+            verbose: false,
+            dry_run: false,
+            delete: true,
+            excludes: vec![],
+        };
+        let result = run_local(&src, &dst, &opts).await;
+        std::fs::set_permissions(src.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "an unreadable subdirectory must exit non-zero"
+        );
+        assert!(
+            dst.join("stale.txt").exists(),
+            "delete ran on an incomplete source"
+        );
+        assert!(
+            dst.join("locked/b.txt").exists(),
+            "omitted entry was deleted"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    pub(super) fn delete_opts() -> SyncOptions {
+        SyncOptions {
+            jobs: 2,
+            verbose: false,
+            dry_run: false,
+            delete: true,
+            excludes: vec![],
+        }
+    }
+
+    /// Put an `ssh` shim first on PATH. It runs its command under bash on this
+    /// machine, so `run_remote` can be driven against a temp tree.
+    #[cfg(unix)]
+    pub(super) fn fake_ssh_on_path() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("copia-fake-ssh-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let shim = dir.join("ssh");
+            std::fs::write(&shim, "#!/bin/sh\nshift\nexec bash -c \"$1\"\n").unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut paths = vec![dir];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        });
+    }
+
+    /// Run `run_remote` on its own thread with a deadline. A FIFO that reaches
+    /// `cat` blocks forever, so a regression must fail instead of hanging the suite.
+    #[cfg(unix)]
+    pub(super) fn run_remote_with_deadline(
+        dir: Dir,
+        remote_root: &Path,
+        local_root: &Path,
+        opts: SyncOptions,
+    ) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let remote = remote_root.to_string_lossy().into_owned();
+        let local = local_root.to_path_buf();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let res = rt
+                .block_on(run_remote(dir, "shim.invalid", &remote, &local, &opts))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("run_remote BLOCKED: it hung instead of vetoing or refusing")
+    }
+
+    /// Issue #50 review finding A RED: a remote FIFO on a pull under --delete must
+    /// set the omitted flag and veto the delete. The remote listing carried no
+    /// entry kind, so the FIFO was planned for transfer and the stale local file
+    /// was deleted.
+    #[cfg(unix)]
+    #[test]
+    fn remote_pull_fifo_entry_vetoes_delete() {
+        fake_ssh_on_path();
+        let base =
+            std::env::temp_dir().join(format!("copia-50-remote-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(remote.join("pipe"))
+            .status()
+            .expect("mkfifo")
+            .success();
+        assert!(made, "mkfifo failed");
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        let err = res.expect_err("a FIFO on the remote must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            local.join("stale.txt").exists(),
+            "delete ran past a remote FIFO the listing could not carry"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding A RED: a local FIFO in a push source under
+    /// --delete must set the omitted flag and veto the delete. The FIFO was
+    /// planned for transfer, and `File::open` on it blocked until a writer
+    /// appeared, so the run hung instead of failing.
+    #[cfg(unix)]
+    #[test]
+    fn local_push_fifo_entry_vetoes_delete() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-push-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(src.join("pipe"))
+            .status()
+            .expect("mkfifo")
+            .success();
+        assert!(made, "mkfifo failed");
+        std::fs::write(remote.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+
+        let err = res.expect_err("a FIFO in the local source must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            remote.join("stale.txt").exists(),
+            "delete ran past a local FIFO the source could not carry"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding B: a nonexistent destination root with --delete is
+    /// a first sync. Nothing on the destination can be deleted, so the run must
+    /// deliver the source and succeed. The missing root was an omission, which
+    /// failed the run.
+    #[cfg(unix)]
+    #[test]
+    fn push_to_an_absent_remote_root_is_a_first_sync() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-first-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote-absent");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"b").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+
+        assert!(res.is_ok(), "first sync to an absent root failed: {res:?}");
+        assert_eq!(std::fs::read(remote.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(remote.join("sub/b.txt")).unwrap(), b"b");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding B, local side: an absent destination root with
+    /// --delete is a first sync and must succeed.
+    #[tokio::test]
+    async fn sync_to_an_absent_local_root_is_a_first_sync() {
+        let base =
+            std::env::temp_dir().join(format!("copia-50-first-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst-absent");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+
+        let res = run_local(&src, &dst, &delete_opts()).await;
+
+        assert!(res.is_ok(), "first sync to an absent root failed: {res:?}");
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding C: `run_remote`'s delete veto. A remote listing
+    /// that exits non-zero reads as an empty source. With --delete that would plan
+    /// every local file for deletion, so the run must delete nothing and fail.
+    #[cfg(unix)]
+    #[test]
+    fn remote_listing_failure_vetoes_run_remote_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-veto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(remote.join("locked")).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        std::fs::write(remote.join("locked/b.txt"), b"b").unwrap();
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+        std::fs::set_permissions(
+            remote.join("locked"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        std::fs::set_permissions(
+            remote.join("locked"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(res.is_err(), "a failed remote listing must fail the run");
+        assert!(
+            local.join("stale.txt").exists(),
+            "run_remote deleted on an incomplete remote listing"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding 1 RED: a remote symlink whose target is a FIFO
+    /// must be an omission on a pull. The listing carried it as a symlink, `cat`
+    /// followed it into the FIFO, and the run blocked forever.
+    #[cfg(unix)]
+    #[test]
+    fn remote_symlink_to_fifo_vetoes_pull_delete() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-link-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        // The FIFO sits OUTSIDE the listed root, so the link is the only entry
+        // that points at it.
+        let made = std::process::Command::new("mkfifo")
+            .arg(base.join("pipe"))
+            .status()
+            .expect("mkfifo")
+            .success();
+        assert!(made, "mkfifo failed");
+        std::os::unix::fs::symlink(base.join("pipe"), remote.join("link")).unwrap();
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        let err = res.expect_err("a symlink to a FIFO on the remote must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"a");
+        assert!(
+            local.join("stale.txt").exists(),
+            "delete ran past a remote symlink the listing could not carry"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding 1 RED: a dangling remote symlink on a pull must
+    /// veto --delete. Its transfer failed, and the delete ran anyway.
+    #[cfg(unix)]
+    #[test]
+    fn remote_dangling_symlink_vetoes_pull_delete() {
+        fake_ssh_on_path();
+        let base =
+            std::env::temp_dir().join(format!("copia-50-dangling-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink("nowhere", remote.join("dangling")).unwrap();
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        let err = res.expect_err("a dangling remote symlink must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"a");
+        assert!(
+            local.join("stale.txt").exists(),
+            "delete ran past a dangling remote symlink"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding 2 RED: a pull into a destination root that does
+    /// not exist is a first sync, as it is for a push and for a local sync.
+    #[cfg(unix)]
+    #[test]
+    fn pull_to_an_absent_local_root_is_a_first_sync() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-first-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local-absent");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        assert!(res.is_ok(), "first pull to an absent root failed: {res:?}");
+        assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"a");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Issue #50 review finding 4 RED: a file that fails to transfer must veto
+    /// --delete. The unreadable remote file failed in `cat`, the omitted flag
+    /// stayed clear, and the stale local file was deleted.
+    #[cfg(unix)]
+    #[test]
+    fn failed_pull_transfer_vetoes_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-xfer-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        std::fs::write(remote.join("secret.txt"), b"s").unwrap();
+        std::fs::set_permissions(
+            remote.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        std::fs::set_permissions(
+            remote.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(res.is_err(), "a failed transfer must fail the run");
+        assert_eq!(
+            std::fs::read(local.join("a.txt")).unwrap(),
+            b"a",
+            "the healthy sibling must still transfer"
+        );
+        assert!(
+            local.join("stale.txt").exists(),
+            "--delete ran although a transfer failed"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding (both lanes) RED: a local source name that is not UTF-8 has
+    /// no spelling on the wire. Lossy naming wrote `caf\u{FFFD}` and let --delete
+    /// remove the stale remote file.
+    #[cfg(unix)]
+    #[test]
+    fn push_of_a_non_utf8_source_name_is_an_omission() {
+        use std::os::unix::ffi::OsStrExt;
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-50-nonutf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(src.join(std::ffi::OsStr::from_bytes(b"caf\xe9")), b"one").unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(remote.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+
+        let err = res.expect_err("a non-UTF-8 source name must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert_eq!(
+            std::fs::read(remote.join("a.txt")).unwrap(),
+            b"a",
+            "the healthy sibling must still transfer"
+        );
+        assert!(
+            !remote.join("caf\u{FFFD}").exists(),
+            "the non-UTF-8 name was lossy-renamed and written"
+        );
+        assert!(
+            remote.join("stale.txt").exists(),
+            "--delete ran on a source whose non-UTF-8 name could not be carried"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding (both lanes) RED: a dangling local symlink on a push must veto
+    /// --delete even when the destination already holds a regular file with the
+    /// link's lstat size and mtime. The quick check then skips the entry, so the
+    /// transfer that would have failed never runs.
+    #[cfg(unix)]
+    #[test]
+    fn push_of_a_dangling_symlink_vetoes_delete_even_when_quick_check_matches() {
+        fake_ssh_on_path();
+        let base =
+            std::env::temp_dir().join(format!("copia-50-dangling-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink("nowhere", src.join("dangling")).unwrap();
+        let link = std::fs::symlink_metadata(src.join("dangling")).unwrap();
+        let mtime = link
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(remote.join("dangling"), b"nowhere").unwrap();
+        set_local_mtime(&remote.join("dangling"), i64::try_from(mtime).unwrap()).unwrap();
+        std::fs::write(remote.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+
+        let err = res.expect_err("a dangling local symlink must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert_eq!(
+            std::fs::read(remote.join("a.txt")).unwrap(),
+            b"a",
+            "the healthy sibling must still transfer"
+        );
+        assert!(
+            remote.join("stale.txt").exists(),
+            "--delete ran past a local symlink that cannot be carried"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding 4, local side RED: a failed local transfer must veto --delete.
+    /// `run_local` had no test for this path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_local_transfer_vetoes_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("copia-50-local-xfer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("secret.txt"), b"s").unwrap();
+        std::fs::set_permissions(
+            src.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        std::fs::write(dst.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_local(&src, &dst, &delete_opts()).await;
+
+        std::fs::set_permissions(
+            src.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(res.is_err(), "a failed local transfer must fail the run");
+        assert_eq!(
+            std::fs::read(dst.join("a.txt")).unwrap(),
+            b"a",
+            "the healthy sibling must still transfer"
+        );
+        assert!(
+            dst.join("stale.txt").exists(),
+            "--delete ran although a local transfer failed"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding (round 3, minor) RED: a dangling symlink named with a trailing
+    /// slash exists. `lstat("link/")` follows the link, so it read as absent and a
+    /// local destination was treated as a first sync.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_with_trailing_slash_is_not_absent() {
+        let base = std::env::temp_dir().join(format!("copia-50-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink("nowhere", base.join("dangling")).unwrap();
+        assert!(!is_absent(&base.join("dangling/")));
+        assert!(!is_absent(&base.join("dangling")));
+        assert!(is_absent(&base.join("missing/")));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding 3 RED: a transfer that never reports back (a panicked or
+    /// cancelled task) is neither done nor failed. It must still veto --delete.
+    #[test]
+    fn a_transfer_that_never_reports_vetoes_delete() {
+        let progress = TransferProgress::new(2);
+        progress.record_ok(1);
+        let plan = SyncPlan {
+            transfer: vec![PathBuf::from("a"), PathBuf::from("b")],
+            skipped: 0,
+            delete: vec![PathBuf::from("stale")],
+        };
+        let mut omitted = Vec::new();
+        veto_failed_transfers(&progress, &plan, &mut omitted);
+        assert!(
+            !omitted.is_empty(),
+            "an unfinished transfer did not veto the delete"
+        );
+    }
+}
+
+// Review regressions for copia #50 round 4 (findings 2, 4, 6, 7, lane-2 FIFO).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod r93_incremental {
+    use super::tests::{delete_opts, fake_ssh_on_path, run_remote_with_deadline};
+    use super::*;
+    use crate::transfer::stream_to_remote;
+
+    /// Finding 2 (HIGH): a remote file whose name holds a newline is deleted by its
+    /// own name. A newline-delimited xargs split it into two wrong names.
+    #[cfg(unix)]
+    #[test]
+    fn remote_delete_removes_a_file_whose_name_contains_a_newline() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-nl-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(remote.join("stale\nname.txt"), b"stale").unwrap();
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+        assert!(res.is_ok(), "{res:?}");
+        assert!(
+            !remote.join("stale\nname.txt").exists(),
+            "the newline-named stale file survived --delete"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 2 (HIGH): a remote directory whose name holds a newline is created
+    /// under its own name. The dir name ends in a newline so a split never creates a
+    /// stray directory outside the test tree.
+    #[cfg(unix)]
+    #[test]
+    fn push_creates_a_directory_whose_name_contains_a_newline() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-nl-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(src.join("ab\n")).unwrap();
+        std::fs::write(src.join("ab\n/f.txt"), b"f").unwrap();
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(std::fs::read(remote.join("ab\n/f.txt")).unwrap(), b"f");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 4 (MEDIUM-HIGH): a push to a multi-level absent root is a first sync.
+    #[cfg(unix)]
+    #[test]
+    fn push_to_a_multi_level_absent_remote_root_is_a_first_sync() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-deep-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("a/b/remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(std::fs::read(remote.join("a.txt")).unwrap(), b"a");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Lane-2 (LOW-MEDIUM): a leading-dash remote root is a path, not an option, to
+    /// `cd`. The root is relative and lives in the test's working directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_listing_accepts_a_root_that_begins_with_a_dash() {
+        fake_ssh_on_path();
+        let root = format!("-copia-93-dash-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(format!("{root}/f.txt"), b"x").unwrap();
+        let mut omitted = Vec::new();
+        let m = discover_remote_with_meta("shim.invalid", &root, false, &mut omitted).await;
+        std::fs::remove_dir_all(&root).ok();
+        assert!(omitted.is_empty(), "{omitted:?}");
+        assert!(m.contains_key(&PathBuf::from("f.txt")), "{m:?}");
+    }
+
+    /// Lane-2 (LOW): a non-UTF-8 dangling link with a trailing slash is not absent.
+    #[cfg(unix)]
+    #[test]
+    fn is_absent_does_not_read_a_non_utf8_dangling_link_as_absent() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = std::env::temp_dir().join(format!("copia-93-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"link\xff");
+        std::os::unix::fs::symlink("nowhere", base.join(name)).unwrap();
+        let mut with_slash = base.join(name).into_os_string();
+        with_slash.push("/");
+        assert!(
+            !is_absent(Path::new(&with_slash)),
+            "dangling link read as absent"
+        );
+        assert!(!is_absent(&base.join(name)));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Lane-2 (hang): a pre-existing `.copia-tmp` FIFO at the local pull destination
+    /// is refused by name. `File::create` on it would block with no reader.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_refuses_a_fifo_at_the_staging_name() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-pull-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(local.join("a.txt.copia-tmp"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(made, "mkfifo failed");
+        let dst = local.join("a.txt");
+        let res = deliver_pull(
+            "shim.invalid",
+            &remote.join("a.txt").to_string_lossy(),
+            &dst,
+            None,
+        )
+        .await;
+        assert!(res.is_err(), "a FIFO staging path was used: {res:?}");
+        assert!(!dst.exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Lane-2 (hang): the same refusal on a local-to-local delivery.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_delivery_refuses_a_fifo_at_the_staging_name() {
+        let base = std::env::temp_dir().join(format!("copia-93-local-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let src = base.join("s");
+        std::fs::write(&src, b"payload").unwrap();
+        let dst = base.join("d");
+        let made = std::process::Command::new("mkfifo")
+            .arg(tmp_path(&dst))
+            .status()
+            .unwrap()
+            .success();
+        assert!(made, "mkfifo failed");
+        let res = deliver_local(&src, &dst, None).await;
+        assert!(res.is_err(), "a FIFO staging path was used: {res:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Lane-2 (hang): a push whose remote staging name is a FIFO is refused on the
+    /// remote, before `cat` can block on it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_refuses_a_fifo_at_the_remote_staging_name() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-push-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("remote")).unwrap();
+        let local = base.join("a.txt");
+        std::fs::write(&local, b"a").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(base.join("remote/a.txt.copia-tmp"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(made, "mkfifo failed");
+        let remote_file = base.join("remote/a.txt").to_string_lossy().into_owned();
+        let res = transfer_file_to_remote(&local, "shim.invalid", &remote_file, None).await;
+        assert!(res.is_err(), "a FIFO staging path was written to: {res:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 6 (MEDIUM): VETOED is printed only when omissions veto deletes.
+    #[test]
+    fn veto_line_is_printed_only_when_something_is_vetoed() {
+        assert_eq!(
+            veto_line(&[], 3),
+            None,
+            "a healthy --delete run printed VETOED"
+        );
+        assert_eq!(veto_line(&["x".to_owned()], 0), None);
+        let line = veto_line(&["x".to_owned()], 3).expect("an omission with deletes must veto");
+        assert!(line.starts_with("VETOED: --delete skipped 3"), "{line}");
+    }
+
+    /// A reader that yields `good` bytes, then fails: a local read that dies
+    /// mid-stream, after the remote command has already started.
+    struct FailsMidStream {
+        given: usize,
+        good: usize,
+    }
+
+    impl tokio::io::AsyncRead for FailsMidStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.given >= this.good {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected read failure",
+                )));
+            }
+            let n = (this.good - this.given).min(buf.remaining());
+            buf.put_slice(&vec![b'N'; n]);
+            this.given += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Residual RED: a local read that fails after the stream has started must
+    /// never commit the bytes already sent. The remote `mv` ran on a partial file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mid_stream_local_read_failure_never_commits_a_partial_file() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-midstream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("remote")).unwrap();
+        let remote_file = base.join("remote/data.bin");
+        std::fs::write(&remote_file, b"remote-original").unwrap();
+
+        let res = stream_to_remote(
+            FailsMidStream {
+                given: 0,
+                good: 1000,
+            },
+            4000,
+            "shim.invalid",
+            &remote_file.to_string_lossy(),
+            None,
+        )
+        .await;
+        // Give a detached `ssh` shim time to finish before the remote is read.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        assert!(
+            res.is_err(),
+            "an injected read failure reported success: {res:?}"
+        );
+        assert_eq!(
+            std::fs::read(&remote_file).unwrap(),
+            b"remote-original",
+            "a partial file was committed after a mid-stream local read failure"
+        );
+        assert!(
+            !base.join("remote/data.bin.copia-tmp").exists(),
+            "the staging file was left behind"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 2 RED: a local source that cannot be read must fail BEFORE the
+    /// remote target is opened. `cat >` truncates on start, so the remote file
+    /// was emptied by a push whose local open had already failed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_refuses_an_unreadable_local_source_without_touching_the_remote() {
+        use std::os::unix::fs::PermissionsExt;
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-eacces-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("remote")).unwrap();
+        let local = base.join("secret.txt");
+        std::fs::write(&local, b"new").unwrap();
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let remote_file = base.join("remote/secret.txt");
+        std::fs::write(&remote_file, b"remote-original").unwrap();
+
+        let res =
+            transfer_file_to_remote(&local, "shim.invalid", &remote_file.to_string_lossy(), None)
+                .await;
+        // The remote write is detached once spawned; give a spawned `cat >` time
+        // to truncate before the remote file is read.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(res.is_err(), "an unreadable source was sent: {res:?}");
+        assert_eq!(
+            std::fs::read(&remote_file).unwrap(),
+            b"remote-original",
+            "the remote file was truncated by a push that never read its source"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 3 (push) RED: a symlink to a regular file must not be streamed as
+    /// its target's bytes. `File::open` followed the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_refuses_a_symlink_source_and_never_sends_its_target() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-link-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("remote")).unwrap();
+        std::fs::write(base.join("real.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink("real.txt", base.join("link")).unwrap();
+        let remote_file = base.join("remote/link");
+
+        let res = transfer_file_to_remote(
+            &base.join("link"),
+            "shim.invalid",
+            &remote_file.to_string_lossy(),
+            None,
+        )
+        .await;
+
+        assert!(res.is_err(), "a symlink source was sent: {res:?}");
+        assert!(
+            !remote_file.exists(),
+            "the target's bytes were written under the link's name"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 3 (push, run level) RED: a symlink to a regular file in the source
+    /// is an omission, so `--delete` is vetoed, and no bytes reach the remote.
+    #[cfg(unix)]
+    #[test]
+    fn push_omits_a_symlink_source_and_vetoes_delete() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-link-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("real.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink("real.txt", src.join("link")).unwrap();
+        std::fs::write(remote.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+
+        let err = res.expect_err("a symlink source must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            remote.join("stale.txt").exists(),
+            "--delete ran past a symlink the source could not carry"
+        );
+        assert!(
+            !remote.join("link").exists(),
+            "the symlink's target was sent under the link's name"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 3 (pull, run level) RED: a remote symlink to a regular file is an
+    /// omission. `cat` used to follow it and the link arrived as a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn remote_symlink_to_file_is_an_omission_not_carried_bytes() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-link-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink("a.txt", remote.join("link")).unwrap();
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        let err = res.expect_err("a remote symlink to a file must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            local.join("stale.txt").exists(),
+            "--delete ran past a remote symlink"
+        );
+        assert!(
+            !local.join("link").exists(),
+            "the remote link's target was written under the link's name"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 7 RED: a path UNDER a dangling symlink is not absent. Its ancestor
+    /// is a link that exists, and `lstat` reports ENOENT only through the dangle.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_under_a_dangling_symlink_is_not_absent() {
+        let base = std::env::temp_dir().join(format!("copia-93-dangle-anc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink("nowhere", base.join("dangling")).unwrap();
+        assert!(
+            !is_absent(&base.join("dangling/child")),
+            "a path under a dangling symlink was read as absent"
+        );
+        assert!(is_absent(&base.join("missing/child")));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 6, local side: ENAMETOOLONG is not NotFound, so a local path with an
+    /// over-long component is never classified absent. (Already true; kept as a
+    /// regression guard.)
+    #[cfg(unix)]
+    #[test]
+    fn an_enametoolong_local_path_is_not_absent() {
+        let base = std::env::temp_dir().join(format!("copia-93-long-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let long = base.join("a".repeat(300));
+        assert!(!is_absent(&long), "ENAMETOOLONG was read as absent");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding 1 (3dcc68e, lane A 3A): trailing slashes are trimmed before
+    /// lstat, so a path over PATH_MAX as sent collapses to a short, missing name and
+    /// is read as absent. The kernel would refuse the path with ENAMETOOLONG, so it
+    /// must never be classified absent.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_root_over_path_max_with_trailing_slashes_is_not_absent() {
+        let base = std::env::temp_dir().join(format!("copia-93-pmax-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let padded = format!("{}{}", base.join("missing").display(), "/".repeat(4200));
+        assert!(padded.len() >= 4096);
+        assert!(
+            !is_absent(Path::new(&padded)),
+            "an over-PATH_MAX root with trailing slashes was read as absent"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding 4 (3dcc68e, lane A 5B / lane B 1): a destination whose
+    /// directory is a symlink out of the tree. The sync must refuse before writing
+    /// anything, so nothing lands outside the destination and the run fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_sync_refuses_a_destination_symlink_ancestor_and_writes_nothing_outside() {
+        let base = std::env::temp_dir().join(format!("copia-93-symanc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(src.join("sub/deep")).unwrap();
+        std::fs::write(src.join("sub/evil.txt"), b"PWNED").unwrap();
+        std::fs::write(src.join("sub/deep/nested.txt"), b"DEEP").unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dst.join("sub")).unwrap();
+
+        let res = run_local(&src, &dst, &delete_opts()).await;
+
+        assert!(res.is_err(), "a symlinked destination ancestor exited 0");
+        assert!(
+            !outside.join("evil.txt").exists(),
+            "wrote through the symlink"
+        );
+        assert!(
+            !outside.join("deep").exists(),
+            "created dirs through the symlink"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod r93_round3 {
+    use super::tests::{delete_opts, fake_ssh_on_path, run_remote_with_deadline};
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("copia-r3-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// Round 3, item 5 RED: a pull reuses the staging name and overwrites a file
+    /// that is synced data. It must refuse.
+    #[tokio::test]
+    async fn pull_refuses_to_overwrite_an_existing_staging_file() {
+        fake_ssh_on_path();
+        let base = scratch("pull-stage");
+        std::fs::create_dir_all(base.join("remote")).unwrap();
+        std::fs::create_dir_all(base.join("local")).unwrap();
+        std::fs::write(base.join("remote/data.txt"), b"remote").unwrap();
+        let dst = base.join("local/data.txt");
+        let tmp = tmp_path(&dst);
+        std::fs::write(&tmp, b"synced").unwrap();
+
+        let res = deliver_pull(
+            "shim.invalid",
+            &base.join("remote/data.txt").to_string_lossy(),
+            &dst,
+            None,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a pull reused an existing staging file: {res:?}"
+        );
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"synced",
+            "the synced file was overwritten"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Round 3, item 3 RED (push): a failed remote delete exits 0 today.
+    #[test]
+    fn push_delete_failure_fails_the_run() {
+        fake_ssh_on_path();
+        let base = scratch("push-del");
+        let local = base.join("local");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(remote.join("sub")).unwrap();
+        std::fs::write(local.join("keep.txt"), b"new").unwrap();
+        std::fs::write(remote.join("sub/stale.txt"), b"old").unwrap();
+        std::fs::set_permissions(remote.join("sub"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &local, delete_opts());
+        std::fs::set_permissions(remote.join("sub"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(res.is_err(), "a failed remote delete exited 0: {res:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Round 3, item 3 RED (pull): a failed local delete exits 0 today.
+    #[test]
+    fn pull_delete_failure_fails_the_run() {
+        fake_ssh_on_path();
+        let base = scratch("pull-del");
+        let local = base.join("local");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(remote.clone()).unwrap();
+        std::fs::create_dir_all(local.join("sub")).unwrap();
+        std::fs::write(remote.join("keep.txt"), b"same").unwrap();
+        std::fs::write(local.join("sub/stale.txt"), b"old").unwrap();
+        std::fs::set_permissions(local.join("sub"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+        std::fs::set_permissions(local.join("sub"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(res.is_err(), "a failed local delete exited 0: {res:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod r93_push_mkdir {
+    use super::tests::fake_ssh_on_path;
+    use std::path::PathBuf;
+
+    /// Review finding 7 (3dcc68e, lane B 4): a push creates remote directories with
+    /// `mkdir -p`, which follows a symlink on the remote path. A remote `sub -> outside`
+    /// would create and later write outside the remote tree. The create must refuse
+    /// and leave nothing behind outside.
+    #[tokio::test]
+    async fn push_mkdir_refuses_a_remote_symlink_ancestor_and_creates_nothing_outside() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-pmkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, remote.join("sub")).unwrap();
+
+        let res = crate::transfer::create_remote_dirs(
+            "fakehost",
+            &remote.display().to_string(),
+            &[PathBuf::from("sub/deep")],
+        )
+        .await;
+
+        assert!(res.is_err(), "a remote symlink ancestor exited 0");
+        assert!(
+            !outside.join("deep").exists(),
+            "created a dir through the symlink"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 }

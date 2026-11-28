@@ -13,6 +13,15 @@ use copia::async_sync::AsyncCopiaSync;
 use copia::trace_output::CopiaTraceLayer;
 
 /// Represents a file location - either local or remote via SSH
+/// `--jobs` must be at least 1: a zero-permit semaphore never admits a transfer.
+fn parse_jobs(raw: &str) -> Result<usize, String> {
+    match raw.parse::<usize>() {
+        Ok(0) => Err("--jobs must be at least 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(format!("--jobs expects a positive integer: {e}")),
+    }
+}
+
 #[derive(Debug, Clone)]
 enum FileLocation {
     Local(PathBuf),
@@ -29,9 +38,15 @@ impl FileLocation {
             // If it's a single letter, it might be a Windows drive
             if before_colon.len() > 1 && !before_colon.contains('/') && !before_colon.contains('\\')
             {
+                // An empty root is the remote CWD. Written as `.`, because the
+                // `"{root}/{rel}"` joins would otherwise name the filesystem root.
+                let path = match &s[colon_pos + 1..] {
+                    "" => ".".to_string(),
+                    p => p.to_string(),
+                };
                 return Self::Remote {
                     host: before_colon.to_string(),
-                    path: s[colon_pos + 1..].to_string(),
+                    path,
                 };
             }
         }
@@ -94,8 +109,8 @@ enum Commands {
         #[arg(short, long)]
         recursive: bool,
 
-        /// Number of parallel transfer jobs
-        #[arg(short, long, default_value = "4")]
+        /// Number of parallel transfer jobs (at least 1)
+        #[arg(short, long, default_value = "4", value_parser = parse_jobs)]
         jobs: usize,
 
         /// Show verbose output
@@ -434,4 +449,23 @@ pub(crate) fn validate_block_size(size: usize) -> Result<(), String> {
         return Err(format!("Block size must be 512-65536, got {size}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod r93_file_location {
+    use super::FileLocation;
+
+    /// Review finding 6 (3dcc68e, lane B 3): `host:` has an empty remote root. The
+    /// listing resolves it to the remote CWD, but `"{root}/{rel}"` then names `/rel`
+    /// and writes or deletes at the filesystem root. The root must be `.`.
+    #[test]
+    fn an_empty_remote_root_is_the_current_directory_not_the_filesystem_root() {
+        match FileLocation::parse("host:") {
+            FileLocation::Remote { path, .. } => {
+                assert_eq!(path, ".", "empty remote root would join to /rel");
+                assert_eq!(format!("{path}/a.txt"), "./a.txt");
+            }
+            FileLocation::Local(_) => panic!("host: must parse as remote"),
+        }
+    }
 }
