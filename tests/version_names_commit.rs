@@ -5,8 +5,22 @@
 
 use std::process::Command;
 
-/// The 7-char commit of the checkout this test runs in, or `unknown` without git.
+/// A usable hex SHA trimmed, lowercased and cut to 7 chars, as build.rs normalizes it.
+fn normalize(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    (t.len() >= 7 && t.chars().all(|c| c.is_ascii_hexdigit())).then(|| t[..7].to_ascii_lowercase())
+}
+
+/// The 7-char commit the build embeds: `COPIA_GIT_SHA` when usable (same precedence as
+/// build.rs), else the checkout's HEAD, else `unknown` without git.
 fn expected_sha() -> String {
+    if let Some(s) = std::env::var("COPIA_GIT_SHA")
+        .ok()
+        .as_deref()
+        .and_then(normalize)
+    {
+        return s;
+    }
     let out = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -55,4 +69,34 @@ fn version_names_the_build_commit() {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "commit must be lowercase hex: {line:?}"
     );
+}
+
+/// The expected commit follows `COPIA_GIT_SHA` when it is set, as build.rs does, and
+/// the checkout's HEAD otherwise. Run with `COPIA_GIT_SHA` set to a 40-char sha that
+/// differs from HEAD: the build embeds that sha, so the expected value must be it too.
+#[test]
+fn expected_sha_honors_copia_git_sha() {
+    match std::env::var("COPIA_GIT_SHA") {
+        Ok(env_sha) => {
+            let want: String = env_sha
+                .trim()
+                .to_ascii_lowercase()
+                .chars()
+                .take(7)
+                .collect();
+            assert_eq!(
+                expected_sha(),
+                want,
+                "expected sha must follow COPIA_GIT_SHA"
+            );
+        }
+        Err(_) => {
+            let head = expected_sha();
+            assert_eq!(
+                head.len(),
+                7,
+                "without COPIA_GIT_SHA the expected sha is HEAD"
+            );
+        }
+    }
 }
