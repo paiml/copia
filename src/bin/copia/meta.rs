@@ -197,10 +197,11 @@ pub(crate) fn remote_listing_command(absent_guard: &str, remote_root: &str) -> S
 /// and is an omission. A root with a `.` or `..` component is never classified:
 /// `x/.` on an unreadable or non-directory `x` fails `-e` for another reason.
 fn absent_root_guard(remote_root: &str) -> String {
-    // The length is judged on the path as sent. Trailing slashes count toward
-    // PATH_MAX for the kernel, so a root padded past it is refused even when its
-    // trimmed form is short. Normalizing first would have hidden that.
-    if remote_root.len() >= 4096 {
+    // The length is judged on the path as sent, which is the `cd` operand: a relative
+    // root gains a "./" prefix. Trailing slashes count toward PATH_MAX for the kernel,
+    // so a root padded past it is refused even when its trimmed form is short.
+    // Normalizing first would have hidden that.
+    if sent_root(remote_root).len() >= 4096 {
         return String::new();
     }
     let trimmed = remote_root.trim_end_matches('/');
@@ -242,10 +243,16 @@ fn absent_root_guard(remote_root: &str) -> String {
 /// directory), so a relative root is always written with a `./` prefix. The prefix
 /// also keeps `CDPATH` out of the lookup.
 fn cd_operand(remote_root: &str) -> String {
+    posix_quote(&sent_root(remote_root))
+}
+
+/// The unquoted path copia sends to `cd` for a remote root. Its length is what
+/// the kernel's PATH_MAX judges, so the absent-root guard measures this value.
+fn sent_root(remote_root: &str) -> String {
     if remote_root.starts_with('/') {
-        posix_quote(remote_root)
+        remote_root.to_owned()
     } else {
-        posix_quote(&format!("./{remote_root}"))
+        format!("./{remote_root}")
     }
 }
 
@@ -1018,5 +1025,58 @@ mod r93_deep_guard {
             .unwrap();
         assert_eq!(status.code(), Some(0), "the guard did not report absence");
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding (2) on 39e7293: the PATH_MAX check ran on the raw root, but a
+    /// relative root is sent to `cd` as "./" + root. A raw root of 4094 or 4095
+    /// bytes sends a 4096 or 4097 byte operand, which the kernel refuses with
+    /// ENAMETOOLONG, yet the guard still classified it absent. Components stay
+    /// within NAME_MAX (200 bytes each).
+    #[test]
+    fn a_relative_root_whose_sent_operand_is_over_path_max_is_never_absent() {
+        for raw_len in [4094usize, 4095] {
+            let mut root = vec!["x".repeat(200); 20].join("/");
+            root.push('/');
+            root.push_str(&"y".repeat(raw_len - root.len()));
+            assert_eq!(root.len(), raw_len);
+            assert!(
+                absent_root_guard(&root).is_empty(),
+                "a {raw_len}-byte root (sent as {} bytes) was classified absent",
+                raw_len + 2
+            );
+        }
+    }
+
+    /// Review finding (3) on 39e7293: the inline guard grows by about 115 bytes per
+    /// level, so a deep root's guard can reach the shell as an oversize argument.
+    /// A root whose guard would exceed the cap must fall back to omission: the
+    /// listing runs without a guard, `cd` fails on the absent root, and the listing
+    /// exits non-zero. It must not be classified absent and must not crash.
+    #[cfg(unix)]
+    #[test]
+    fn a_depth_1000_absent_root_is_an_omission_not_absent() {
+        use super::{absent_root_guard, remote_listing_command};
+        let root = vec!["d"; 1000].join("/");
+        let guard = absent_root_guard(&root);
+        assert!(guard.is_empty(), "a {}-byte guard was built", guard.len());
+        let command = remote_listing_command(&guard, &root);
+        assert!(
+            command.len() < 128 * 1024,
+            "the listing is {} bytes",
+            command.len()
+        );
+        let dir = std::env::temp_dir().join(format!("copia-93-depth1000-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            !out.status.success() && out.stdout.is_empty(),
+            "an absent depth-1000 root listed or was read as absent: {out:?}"
+        );
     }
 }
