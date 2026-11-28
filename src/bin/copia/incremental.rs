@@ -167,20 +167,17 @@ async fn discover_both(
                 ));
                 false
             });
-            // A symlink whose target is not a regular file cannot be carried. It
-            // is checked here, not left to the transfer: the quick check can skip
-            // an entry whose size and mtime match, and then no transfer fails.
+            // A symlink cannot be carried, whatever its target: copia sends bytes,
+            // and a link's target is not the link. It is checked here, not left to
+            // the transfer, because the quick check can skip an entry whose size
+            // and mtime match, and then no transfer runs to fail. The transfer
+            // refuses a link too, as a second line of defence.
             local.retain(|rel, _| {
                 let full = local_root.join(rel);
-                let is_link =
-                    std::fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink());
-                if !is_link || std::fs::metadata(&full).is_ok_and(|m| m.is_file()) {
+                if !std::fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
                     return true;
                 }
-                omitted.push(format!(
-                    "cannot carry symlink {} (target is not a regular file)",
-                    full.display()
-                ));
+                omitted.push(format!("cannot carry symlink {}", full.display()));
                 false
             });
             let remote = discover_remote_with_meta(host, remote_root, true, omitted).await;
@@ -476,6 +473,16 @@ fn is_absent(path: &Path) -> bool {
     // any platform. The old code trimmed only UTF-8 names, so a non-UTF-8 link
     // with a trailing slash was lstat-ed through the link and read as absent.
     let normal: PathBuf = path.components().collect();
+    // A DANGLING link on the way is not absence. `lstat("dangling/child")` fails
+    // with ENOENT because the link's target is missing, not because `child` is.
+    let dangling_ancestor = normal.ancestors().skip(1).any(|a| {
+        !a.as_os_str().is_empty()
+            && std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::metadata(a).is_err()
+    });
+    if dangling_ancestor {
+        return false;
+    }
     matches!(
         std::fs::symlink_metadata(&normal),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound
@@ -1578,5 +1585,161 @@ mod r93_incremental {
         assert_eq!(veto_line(&["x".to_owned()], 0), None);
         let line = veto_line(&["x".to_owned()], 3).expect("an omission with deletes must veto");
         assert!(line.starts_with("VETOED: --delete skipped 3"), "{line}");
+    }
+
+    /// Finding 2 RED: a local source that cannot be read must fail BEFORE the
+    /// remote target is opened. `cat >` truncates on start, so the remote file
+    /// was emptied by a push whose local open had already failed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_refuses_an_unreadable_local_source_without_touching_the_remote() {
+        use std::os::unix::fs::PermissionsExt;
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-eacces-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("remote")).unwrap();
+        let local = base.join("secret.txt");
+        std::fs::write(&local, b"new").unwrap();
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let remote_file = base.join("remote/secret.txt");
+        std::fs::write(&remote_file, b"remote-original").unwrap();
+
+        let res =
+            transfer_file_to_remote(&local, "shim.invalid", &remote_file.to_string_lossy(), None)
+                .await;
+        // The remote write is detached once spawned; give a spawned `cat >` time
+        // to truncate before the remote file is read.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(res.is_err(), "an unreadable source was sent: {res:?}");
+        assert_eq!(
+            std::fs::read(&remote_file).unwrap(),
+            b"remote-original",
+            "the remote file was truncated by a push that never read its source"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 3 (push) RED: a symlink to a regular file must not be streamed as
+    /// its target's bytes. `File::open` followed the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_refuses_a_symlink_source_and_never_sends_its_target() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-link-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("remote")).unwrap();
+        std::fs::write(base.join("real.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink("real.txt", base.join("link")).unwrap();
+        let remote_file = base.join("remote/link");
+
+        let res = transfer_file_to_remote(
+            &base.join("link"),
+            "shim.invalid",
+            &remote_file.to_string_lossy(),
+            None,
+        )
+        .await;
+
+        assert!(res.is_err(), "a symlink source was sent: {res:?}");
+        assert!(
+            !remote_file.exists(),
+            "the target's bytes were written under the link's name"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 3 (push, run level) RED: a symlink to a regular file in the source
+    /// is an omission, so `--delete` is vetoed, and no bytes reach the remote.
+    #[cfg(unix)]
+    #[test]
+    fn push_omits_a_symlink_source_and_vetoes_delete() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-link-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("real.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink("real.txt", src.join("link")).unwrap();
+        std::fs::write(remote.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+
+        let err = res.expect_err("a symlink source must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            remote.join("stale.txt").exists(),
+            "--delete ran past a symlink the source could not carry"
+        );
+        assert!(
+            !remote.join("link").exists(),
+            "the symlink's target was sent under the link's name"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 3 (pull, run level) RED: a remote symlink to a regular file is an
+    /// omission. `cat` used to follow it and the link arrived as a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn remote_symlink_to_file_is_an_omission_not_carried_bytes() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-link-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink("a.txt", remote.join("link")).unwrap();
+        std::fs::write(local.join("stale.txt"), b"stale").unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+
+        let err = res.expect_err("a remote symlink to a file must fail the run");
+        assert!(err.contains("omitted"), "{err}");
+        assert!(
+            local.join("stale.txt").exists(),
+            "--delete ran past a remote symlink"
+        );
+        assert!(
+            !local.join("link").exists(),
+            "the remote link's target was written under the link's name"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 7 RED: a path UNDER a dangling symlink is not absent. Its ancestor
+    /// is a link that exists, and `lstat` reports ENOENT only through the dangle.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_under_a_dangling_symlink_is_not_absent() {
+        let base = std::env::temp_dir().join(format!("copia-93-dangle-anc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink("nowhere", base.join("dangling")).unwrap();
+        assert!(
+            !is_absent(&base.join("dangling/child")),
+            "a path under a dangling symlink was read as absent"
+        );
+        assert!(is_absent(&base.join("missing/child")));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 6, local side: ENAMETOOLONG is not NotFound, so a local path with an
+    /// over-long component is never classified absent. (Already true; kept as a
+    /// regression guard.)
+    #[cfg(unix)]
+    #[test]
+    fn an_enametoolong_local_path_is_not_absent() {
+        let base = std::env::temp_dir().join(format!("copia-93-long-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let long = base.join("a".repeat(300));
+        assert!(!is_absent(&long), "ENAMETOOLONG was read as absent");
+        std::fs::remove_dir_all(&base).ok();
     }
 }

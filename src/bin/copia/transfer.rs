@@ -197,9 +197,18 @@ pub async fn transfer_file_to_remote(
 ) -> Result<u64, String> {
     use tokio::io::AsyncReadExt;
 
-    let metadata = tokio::fs::metadata(local_path)
+    // `symlink_metadata`, not `metadata`: the latter FOLLOWS a link, so a symlink
+    // to a regular file passed the regular-file test and its target's bytes were
+    // sent under the link's name. A link is refused, loudly.
+    let metadata = tokio::fs::symlink_metadata(local_path)
         .await
         .map_err(|e| format!("{}: {e}", local_path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "cannot carry symlink {}: copia sends bytes, not links",
+            local_path.display()
+        ));
+    }
     // Refuse before `ssh` spawns or the file is opened: `File::open` on a FIFO,
     // socket or device blocks (or is meaningless), and copia cannot carry it.
     if !metadata.is_file() {
@@ -210,23 +219,16 @@ pub async fn transfer_file_to_remote(
     }
     let file_size = metadata.len();
 
-    // Use $'...' quoting with backslash escapes for paths with special chars.
-    let escaped = remote_path.replace('\\', "\\\\").replace('\'', "\\'");
-    let tmp_escaped = format!("{escaped}.copia-tmp");
-    // The staging name must be absent or a regular file. `cat >` on a FIFO (or a
-    // symlink to one) blocks until a reader appears, so a leftover one hangs the
-    // push. Refuse it on the remote, loudly, before anything is written.
-    let tmp_q = posix_quote(&format!("{remote_path}.copia-tmp"));
-    let staging_check = format!(
-        "{{ [ ! -e {tmp_q} ] || {{ [ -f {tmp_q} ] && [ ! -L {tmp_q} ]; }}; }} || \
-         {{ echo 'copia: staging path is not a regular file' >&2; exit 1; }}; "
-    );
-    let touch = mtime.map_or(String::new(), |t| format!(" && touch -d @{t} $'{escaped}'"));
+    // Open the source BEFORE `ssh` runs. `cat >` truncates the remote target as
+    // soon as it starts, so a source that cannot be read (EACCES) must fail here,
+    // while the remote file is still untouched.
+    let mut file = tokio::fs::File::open(local_path)
+        .await
+        .map_err(|e| format!("open {}: {e}", local_path.display()))?;
+
     let mut child = tokio::process::Command::new("ssh")
         .arg(host)
-        .arg(format!(
-            "{staging_check}cat > $'{tmp_escaped}' && mv -f $'{tmp_escaped}' $'{escaped}'{touch}"
-        ))
+        .arg(push_command(remote_path, mtime))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -239,9 +241,6 @@ pub async fn transfer_file_to_remote(
         .ok_or_else(|| "Failed to open SSH stdin".to_string())?;
 
     // Stream file in chunks instead of reading all into memory
-    let mut file = tokio::fs::File::open(local_path)
-        .await
-        .map_err(|e| format!("open {}: {e}", local_path.display()))?;
     let mut buf = vec![0u8; 256 * 1024]; // 256KB chunks
     loop {
         let n = file
@@ -267,6 +266,39 @@ pub async fn transfer_file_to_remote(
     }
 
     Ok(file_size)
+}
+
+/// The remote POSIX shell command that streams stdin into `remote_path`
+/// atomically: `cat` into a `.copia-tmp` sibling, then `mv` over the target.
+///
+/// Plain POSIX quoting only (`'...'` with `'\''`), so it runs under dash as well
+/// as bash. `--` ends the options of `mv` and `touch`, so a path that begins with
+/// `-` is a path.
+pub(crate) fn push_command(remote_path: &str, mtime: Option<i64>) -> String {
+    let tmp_q = posix_quote(&format!("{remote_path}.copia-tmp"));
+    let dst_q = posix_quote(remote_path);
+    // The staging name must be absent, or a regular file that is not a link.
+    // `-e` FOLLOWS links, so a dangling link passes `! -e` and `cat >` would then
+    // write through it. Each case is tested on its own, with `-L` checked first.
+    let staging_check = format!(
+        "{{ [ ! -e {tmp_q} ] && [ ! -L {tmp_q} ]; }} || \
+         {{ [ -f {tmp_q} ] && [ ! -L {tmp_q} ]; }} || \
+         {{ echo 'copia: staging path is not a regular file' >&2; exit 1; }}; "
+    );
+    let touch = mtime.map_or(String::new(), |t| format!(" && touch -d @{t} -- {dst_q}"));
+    format!("{staging_check}cat > {tmp_q} && mv -f -- {tmp_q} {dst_q}{touch}")
+}
+
+/// The remote POSIX shell command that prints `remote_path`'s bytes.
+///
+/// A symlink is refused, never followed. The listing already omits links, but a
+/// path can be replaced by a link between that listing and this read, and `cat`
+/// would then print the target's bytes under the link's name.
+pub(crate) fn pull_command(remote_path: &str) -> String {
+    let q = posix_quote(remote_path);
+    format!(
+        "{{ [ ! -L {q} ] || {{ echo 'copia: source is a symlink' >&2; exit 1; }}; }} && cat -- {q}"
+    )
 }
 
 /// Calculate transfer speed in bytes per second.
@@ -311,6 +343,140 @@ pub fn format_bytes(bytes: u64) -> String {
         }
     }
     format!("{bytes} B")
+}
+
+/// Review regressions for copia #50 round 5: the remote commands must run under
+/// a POSIX shell (dash), and a dangling staging link must not be written through.
+#[cfg(test)]
+#[cfg(unix)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod r93_transfer {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    /// dash where it exists (Debian and Ubuntu remotes run it as `sh`), else sh.
+    fn posix_sh() -> &'static str {
+        if Path::new("/bin/dash").exists() {
+            "/bin/dash"
+        } else {
+            "/bin/sh"
+        }
+    }
+
+    /// Run a remote command under `shell` in `cwd`, feeding `stdin`.
+    fn run_in(shell: &str, command: &str, cwd: &Path, stdin: &[u8]) -> std::process::Output {
+        let mut child = Command::new(shell)
+            .arg("-c")
+            .arg(command)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn posix sh");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(stdin)
+            .expect("write stdin");
+        child.wait_with_output().expect("wait")
+    }
+
+    /// dash: the shell that must run the remote commands on Debian/Ubuntu hosts.
+    fn run_posix(command: &str, cwd: &Path, stdin: &[u8]) -> std::process::Output {
+        run_in(posix_sh(), command, cwd, stdin)
+    }
+
+    /// bash: where the pre-fix `$'...'` form WORKS, so a test on it fails for the
+    /// defect itself and not because the shell rejected the syntax.
+    fn run_bash(command: &str, cwd: &Path, stdin: &[u8]) -> std::process::Output {
+        run_in("/bin/bash", command, cwd, stdin)
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("copia-93-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// Finding 4 RED: a name with a single quote and a newline must round-trip
+    /// under dash. `$'...'` is bash-only, so dash writes a literal `$'` path.
+    #[test]
+    fn push_and_pull_round_trip_a_quote_and_newline_name_under_dash() {
+        let base = scratch("posix-roundtrip");
+        let name = "it's\nname.txt";
+        let out = run_posix(&push_command(name, Some(1_600_000_000)), &base, b"payload");
+        assert!(
+            out.status.success(),
+            "push under dash failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(base.join(name)).unwrap(), b"payload");
+
+        let out = run_posix(&pull_command(name), &base, b"");
+        assert!(
+            out.status.success(),
+            "pull under dash failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"payload");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 1 RED: a DANGLING symlink at the staging name passes `! -e`, and
+    /// `cat >` then writes through it, creating the link's target. It must be refused.
+    #[test]
+    fn push_refuses_a_dangling_staging_symlink_without_writing_through_it() {
+        let base = scratch("dangling-stage");
+        std::os::unix::fs::symlink("nowhere", base.join("a.txt.copia-tmp")).unwrap();
+        let out = run_bash(&push_command("a.txt", None), &base, b"payload");
+        let created = base.join("nowhere").exists();
+        assert!(
+            !out.status.success(),
+            "a dangling staging symlink was accepted"
+        );
+        assert!(!created, "the write followed the staging symlink");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 3 (remote side): a symlink source must not be streamed as its
+    /// target's bytes, even when the listing raced with a replacement.
+    #[test]
+    fn pull_refuses_a_symlink_source_instead_of_printing_the_target() {
+        let base = scratch("pull-link");
+        std::fs::write(base.join("real.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink("real.txt", base.join("link")).unwrap();
+        let out = run_bash(&pull_command("link"), &base, b"");
+        assert!(
+            !out.status.success() || out.stdout.is_empty(),
+            "a symlink's target was printed: {:?}",
+            out.stdout
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 5: a leading-dash path must reach `mv`/`touch` after `--`, or it is
+    /// parsed as an option and the push fails.
+    #[test]
+    fn push_survives_a_leading_dash_path() {
+        let base = scratch("dash-path");
+        std::fs::create_dir_all(base.join("-root")).unwrap();
+        let out = run_bash(
+            &push_command("-root/a.txt", Some(1_600_000_000)),
+            &base,
+            b"payload",
+        );
+        assert!(
+            out.status.success(),
+            "a leading-dash path was parsed as an option: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(base.join("-root/a.txt")).unwrap(), b"payload");
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
 
 #[cfg(test)]

@@ -201,6 +201,12 @@ fn absent_root_guard(remote_root: &str) -> String {
     if components.iter().any(|c| *c == "." || *c == "..") {
         return String::new();
     }
+    // ENAMETOOLONG makes `-e` false exactly as ENOENT does. A root over the POSIX
+    // limits (NAME_MAX 255 per component, PATH_MAX 4096 overall) is not classified:
+    // the listing runs, fails, and is an omission rather than a first sync.
+    if trimmed.len() >= 4096 || components.iter().any(|c| c.len() > 255) {
+        return String::new();
+    }
     let base = if trimmed.starts_with('/') { "/" } else { "." };
     // Runs in a subshell: `exit 0` there means absent, `exit 1` means "not
     // classified", and only the former short-circuits the listing.
@@ -223,14 +229,12 @@ fn absent_root_guard(remote_root: &str) -> String {
     format!("( {checks}) && exit 0; ")
 }
 
-/// Whether a remote record's kind (`%y%Y`) is one copia carries: a regular file,
-/// or a symlink that resolves to a regular file (its bytes are streamed by `cat`).
-/// A symlink to a FIFO, a directory, a socket or a device, and a dangling
-/// symlink (`N`) or loop (`L`), is not carried: `cat` would block on a FIFO or
-/// fail, and that failure must not be the only thing standing between a run and
-/// `--delete`.
+/// Whether a remote record's kind (`%y%Y`) is one copia carries: a regular file
+/// and nothing else. A symlink is not carried, whatever it points at: copia
+/// streams bytes, and `cat` would print the target's bytes under the link's name.
+/// A symlink is an omission, so `--delete` is vetoed by it.
 fn remote_kind_carried(kind: &str) -> bool {
-    matches!(kind, "ff" | "lf")
+    matches!(kind, "ff")
 }
 
 /// A stable name for a remote record kind (`%y%Y`), for the omission message.
@@ -826,5 +830,35 @@ mod r93_meta {
             "{out:?}"
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 6 RED: `-e` is false on ENAMETOOLONG as well as ENOENT, so an
+    /// over-long component read as absent and a first sync was run into a root
+    /// the listing could never reach. Only ENOENT may take the early exit.
+    #[cfg(unix)]
+    #[test]
+    fn enametoolong_remote_root_is_never_read_as_absent() {
+        let base = std::env::temp_dir().join(format!("copia-93-long-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("a".repeat(300));
+        let out = run_guard(&root.to_string_lossy());
+        std::fs::remove_dir_all(&base).ok();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "REACHED",
+            "an ENAMETOOLONG root was read as absent: {out:?}"
+        );
+    }
+
+    /// Finding 3 RED: a remote symlink to a regular file is not carried. `cat`
+    /// follows the link, so the listing must make it an omission, not a transfer.
+    #[test]
+    fn remote_symlink_to_file_is_an_omission_not_planned() {
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(b"lf\t1\t1700000000.0\t./link\x00", &mut omitted);
+        assert!(m.is_empty(), "a symlink to a file was planned: {m:?}");
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("symlink-to-file"), "{omitted:?}");
     }
 }

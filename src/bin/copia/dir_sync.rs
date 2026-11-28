@@ -3,7 +3,7 @@
 //! and the parallel-transfer progress counters. The orchestration itself (quick
 //! check, planning, atomic delivery, delete, dry-run) lives in `incremental.rs`.
 
-use super::transfer::format_bytes;
+use super::transfer::{format_bytes, pull_command};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -32,10 +32,9 @@ pub async fn transfer_file_from_remote(
 ) -> Result<u64, String> {
     use tokio::io::AsyncWriteExt;
 
-    let escaped = remote_path.replace('\\', "\\\\").replace('\'', "\\'");
     let mut child = tokio::process::Command::new("ssh")
         .arg(host)
-        .arg(format!("cat $'{escaped}'"))
+        .arg(pull_command(remote_path))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
