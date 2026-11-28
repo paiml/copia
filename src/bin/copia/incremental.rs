@@ -689,12 +689,19 @@ async fn deliver_local(src: &Path, dst: &Path, mtime: Option<i64>) -> Result<u64
     }
     let tmp = tmp_path(dst);
     check_staging_slot(&tmp)?;
-    let size = tokio::fs::copy(src, &tmp)
-        .await
-        .map_err(|e| format!("copy {}: {e}", src.display()))?;
-    tokio::fs::rename(&tmp, dst)
-        .await
-        .map_err(|e| format!("rename {}: {e}", dst.display()))?;
+    // B5: a failure after the staging copy must not leave `tmp` behind, or every
+    // retry is refused at the staging check. A missing `tmp` is not an error here.
+    let size = match tokio::fs::copy(src, &tmp).await {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(format!("copy {}: {e}", src.display()));
+        }
+    };
+    if let Err(e) = tokio::fs::rename(&tmp, dst).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!("rename {}: {e}", dst.display()));
+    }
     if let Some(t) = mtime {
         let _ = set_local_mtime(dst, t);
     }
@@ -762,6 +769,33 @@ mod tests {
         assert!(
             !dst.exists(),
             "a refused entry must leave nothing behind at the destination"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// B5 RED: a rename that fails after the staging copy must leave no
+    /// `.copia-tmp`. A directory at the destination makes the rename fail (EISDIR)
+    /// after the copy has written the staging file; before the fix that file stayed
+    /// and blocked every retry at the staging check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deliver_local_leaves_no_staging_file_when_rename_fails() {
+        let base = std::env::temp_dir().join(format!("copia-dl-b5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let src = base.join("src.bin");
+        std::fs::write(&src, b"payload").unwrap();
+        let dst = base.join("delivered");
+        std::fs::create_dir(&dst).unwrap();
+
+        let res = deliver_local(&src, &dst, None).await;
+
+        assert!(res.is_err(), "a rename onto a directory must fail");
+        let tmp = tmp_path(&dst);
+        assert!(
+            !tmp.exists(),
+            "a failed delivery must not leave the staging file {}",
+            tmp.display()
         );
         let _ = std::fs::remove_dir_all(&base);
     }

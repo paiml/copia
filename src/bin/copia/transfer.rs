@@ -354,7 +354,7 @@ pub(crate) fn push_command(remote_path: &str, expected: u64, mtime: Option<i64>)
     );
     let ancestors = ancestor_guard(remote_path);
     format!(
-        "{ancestors}{staging_check}cat > {tmp_q} && {{ {verify}; }} && {{ {dst_check}; }} && mv -f -- {tmp_q} {dst_q}{touch}"
+        "{ancestors}{staging_check}cat > {tmp_q}; rc=$?; if [ $rc -ne 0 ]; then rm -f -- {tmp_q}; exit $rc; fi; {{ {verify}; }} && {{ {dst_check}; }} && mv -f -- {tmp_q} {dst_q}{touch}"
     )
 }
 
@@ -945,6 +945,32 @@ mod r93_round3 {
             }
         };
         assert!(!status.success(), "a FIFO source was accepted");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// B5 RED: a failed `cat` must not leave the staging file. Measured: `cat`
+    /// exit 1 left a 4096-byte `.copia-tmp`, and the retry's staging check then
+    /// refused. A directory as stdin makes `cat` create the staging file, then fail
+    /// reading (EISDIR), which is the same failure with no timing dependence.
+    #[test]
+    fn push_removes_the_staging_file_when_cat_fails() {
+        let base = scratch("push-cat-fails");
+        let dir_stdin = std::fs::File::open(&base).unwrap();
+        let out = Command::new(posix_sh())
+            .arg("-c")
+            .arg(push_command("p.bin", 0, None))
+            .current_dir(&base)
+            .stdin(Stdio::from(dir_stdin))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn posix sh");
+        assert!(!out.status.success(), "a failed cat must fail the push");
+        assert!(
+            !base.join("p.bin.copia-tmp").exists(),
+            "a failed cat must not leave the staging file behind"
+        );
+        assert!(!base.join("p.bin").exists(), "nothing may be committed");
         std::fs::remove_dir_all(&base).ok();
     }
 }
