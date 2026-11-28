@@ -1,6 +1,6 @@
 //! paiml/copia#74 review fixes: the build-script SHA resolution and rerun paths.
 //! `build.rs` is included as a module so its pure functions are tested directly.
-#![allow(dead_code, clippy::all, clippy::pedantic)]
+#![allow(dead_code, clippy::all, clippy::pedantic, clippy::expect_used)]
 
 #[path = "../build.rs"]
 mod build;

@@ -32,6 +32,11 @@ fn version_names_the_build_commit() {
     let line = text.trim();
 
     // Expected shape: `copia <semver> (<7 hex chars of the commit>)`.
+    let prefix = concat!("copia ", env!("CARGO_PKG_VERSION"), " (");
+    assert!(
+        line.starts_with(prefix),
+        "version line must start with {prefix:?}: {line:?}"
+    );
     let open = line
         .find('(')
         .unwrap_or_else(|| panic!("no commit in version line: {line:?}"));
