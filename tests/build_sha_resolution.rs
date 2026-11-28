@@ -98,7 +98,7 @@ fn six_char_env_sha_falls_back_to_git() {
 
 /// Compile `build.rs` as a standalone program and run it inside `dir`, returning
 /// the `cargo:` directives it prints. This exercises `main()`, not only the helpers.
-fn build_script_output(dir: &std::path::Path) -> String {
+fn build_script_output(dir: &std::path::Path, env_sha: Option<&str>) -> String {
     let exe = dir.join("build_script_bin");
     let status = std::process::Command::new("rustc")
         .args(["--edition", "2021", "-o"])
@@ -107,11 +107,12 @@ fn build_script_output(dir: &std::path::Path) -> String {
         .status()
         .expect("run rustc on build.rs");
     assert!(status.success(), "rustc failed on build.rs");
-    let out = std::process::Command::new(&exe)
-        .current_dir(dir)
-        .env_remove("COPIA_GIT_SHA")
-        .output()
-        .expect("run build script");
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.current_dir(dir).env_remove("COPIA_GIT_SHA");
+    if let Some(sha) = env_sha {
+        cmd.env("COPIA_GIT_SHA", sha);
+    }
+    let out = cmd.output().expect("run build script");
     assert!(out.status.success(), "build script failed");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -141,7 +142,7 @@ fn packed_branch_ref_change_reruns_build_script() {
     git_in(dir, &["pack-refs", "--all"]);
     assert!(!dir.join(".git/refs/heads/main").exists());
 
-    let stdout = build_script_output(dir);
+    let stdout = build_script_output(dir, None);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(
         lines.contains(&"cargo:rerun-if-changed=.git/refs"),
@@ -157,4 +158,79 @@ fn packed_branch_ref_change_reruns_build_script() {
             .any(|l| l.starts_with("cargo:rustc-env=COPIA_GIT_SHA=")),
         "no COPIA_GIT_SHA emitted: {stdout}"
     );
+}
+
+fn init_repo_with_commit(dir: &std::path::Path) {
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    git_in(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+}
+
+/// The 7-char HEAD of the repo at `dir`, as git reports it.
+fn git_head_short(dir: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("run git rev-parse");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .chars()
+        .take(7)
+        .collect()
+}
+
+/// The SHA the build script embedded via `cargo:rustc-env=COPIA_GIT_SHA=`.
+fn embedded_sha(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("cargo:rustc-env=COPIA_GIT_SHA="))
+        .map(str::to_string)
+        .expect("build script embeds COPIA_GIT_SHA")
+}
+
+const ENV_FULL: &str = "0123456789abcdef0123456789abcdef01234567";
+const ENV_FULL_B: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+#[test]
+fn build_script_main_embeds_valid_env_sha_over_git() {
+    // Test-first: main() must read COPIA_GIT_SHA. Against a build script that
+    // ignored the env value, this would embed the checkout's HEAD instead.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    init_repo_with_commit(dir);
+    let git_sha = git_head_short(dir);
+    let stdout = build_script_output(dir, Some(ENV_FULL));
+    let embedded = embedded_sha(&stdout);
+    assert_eq!(embedded, "0123456", "env sha must win: {stdout}");
+    assert_ne!(git_sha, embedded, "test must distinguish env from git");
+}
+
+#[test]
+fn build_script_main_falls_back_to_git_for_six_char_env() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    init_repo_with_commit(dir);
+    let stdout = build_script_output(dir, Some("abc123"));
+    assert_eq!(embedded_sha(&stdout), git_head_short(dir), "{stdout}");
+}
+
+#[test]
+fn build_script_emits_env_rerun_line_and_changing_env_changes_sha() {
+    // Changing COPIA_GIT_SHA must both trigger a rerun (the rerun-if-env-changed
+    // line) and change the embedded version (the env lookup in main()).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    init_repo_with_commit(dir);
+    let first = build_script_output(dir, Some(ENV_FULL));
+    let second = build_script_output(dir, Some(ENV_FULL_B));
+    for stdout in [&first, &second] {
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l == "cargo:rerun-if-env-changed=COPIA_GIT_SHA"),
+            "rerun-if-env-changed line missing: {stdout}"
+        );
+    }
+    assert_eq!(embedded_sha(&first), "0123456");
+    assert_eq!(embedded_sha(&second), "fedcba9");
 }
