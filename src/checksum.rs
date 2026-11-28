@@ -74,20 +74,22 @@ impl RollingChecksum {
     #[cfg_attr(feature = "contracts", ensures(ret.b < Self::MOD, "b < MOD"))]
     #[cfg_attr(feature = "contracts", ensures(ret.count == data.len(), "count == input len"))]
     pub fn new(data: &[u8]) -> Self {
-        let mut a: u32 = 0;
-        let mut b: u32 = 0;
+        // #44: accumulate in u64. With u32 the weighted sum b wraps once block_size >= 16 KiB,
+        // so this digest stops matching FastRollingChecksum and the delta matches nothing.
+        let mut a: u64 = 0;
+        let mut b: u64 = 0;
         let len = data.len();
 
         for (i, &byte) in data.iter().enumerate() {
-            a = a.wrapping_add(u32::from(byte));
+            a = a.wrapping_add(u64::from(byte));
             // Weight is (len - i) so first byte has highest weight
-            // Truncation is intentional: checksum uses 32-bit arithmetic
-            b = b.wrapping_add((len - i) as u32 * u32::from(byte));
+            b = b.wrapping_add((len - i) as u64 * u64::from(byte));
         }
 
+        // Reduce in u64, then narrow: the result is < MOD, which fits in u32.
         let result = Self {
-            a: a % Self::MOD,
-            b: b % Self::MOD,
+            a: (a % u64::from(Self::MOD)) as u32,
+            b: (b % u64::from(Self::MOD)) as u32,
             count: len,
         };
         debug_assert!(result.a < Self::MOD, "a must be < MOD after init");
@@ -136,19 +138,23 @@ impl RollingChecksum {
     #[cfg_attr(feature = "contracts", ensures(self.a < Self::MOD, "a < MOD after roll"))]
     #[cfg_attr(feature = "contracts", ensures(self.b < Self::MOD, "b < MOD after roll"))]
     pub fn roll(&mut self, old_byte: u8, new_byte: u8) {
-        let old = u32::from(old_byte);
-        let new = u32::from(new_byte);
+        // Modular subtraction is done by adding MOD before subtracting, so no
+        // intermediate ever goes negative. A wrapping subtraction would yield
+        // 2^N - x, and 2^N mod MOD != 0, so the result would silently diverge
+        // from a fresh `new()`. Operands are reduced mod MOD before multiplying,
+        // so every term is < 2 * MOD and no u64 intermediate can wrap.
+        let old = u64::from(old_byte);
+        let new = u64::from(new_byte);
+        let m = u64::from(Self::MOD);
 
         // Update a: remove old, add new
-        self.a = (self.a.wrapping_sub(old).wrapping_add(new)) % Self::MOD;
+        let a = (u64::from(self.a) + m - old + new) % m;
+        self.a = a as u32;
 
         // Update b: remove old's contribution (it was weighted by count), add new a
-        // Truncation is intentional: checksum uses 32-bit arithmetic
-        self.b = (self
-            .b
-            .wrapping_sub(self.count as u32 * old)
-            .wrapping_add(self.a))
-            % Self::MOD;
+        let count_mod = (self.count as u64) % m;
+        let removed = count_mod * old % m;
+        self.b = ((u64::from(self.b) + m - removed + u64::from(self.a)) % m) as u32;
 
         debug_assert!(self.a < Self::MOD, "a must be < MOD after roll");
         debug_assert!(self.b < Self::MOD, "b must be < MOD after roll");
@@ -348,6 +354,38 @@ impl Default for RollingChecksum {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #44: the signature side (`RollingChecksum`) and the delta side
+    /// (`FastRollingChecksum`) must produce the same weak hash for every block size,
+    /// or the matcher never finds a block. The strict u32 accumulator wrapped from 16 KiB.
+    #[test]
+    fn strict_and_fast_rolling_checksums_agree_for_all_block_sizes() {
+        for &bs in &[512usize, 1024, 4096, 8192, 16384, 32768, 65536] {
+            let data: Vec<u8> = (0..bs).map(|i| (i * 31 % 251) as u8).collect();
+            assert_eq!(
+                RollingChecksum::new(&data).digest(),
+                FastRollingChecksum::new(&data).digest(),
+                "strict/fast weak-hash disagreement at block_size {bs}"
+            );
+        }
+    }
+
+    /// #90: rolling the window must match a fresh `new()` at every position.
+    /// The old `roll()` used `wrapping_sub` before the modulo; a negative
+    /// intermediate wrapped to 2^32 - x, and 2^32 mod 65521 != 0, so the digest
+    /// diverged (reproduced at 512 B, and at 16 KiB in #44).
+    #[test]
+    fn roll_matches_fresh_new_across_block_sizes() {
+        for &bs in &[512usize, 1024, 4096, 16384, 32768] {
+            let data: Vec<u8> = (0..bs + 64).map(|i| (i * 131 % 256) as u8).collect();
+            let mut rolling = RollingChecksum::new(&data[..bs]);
+            for start in 0..64 {
+                rolling.roll(data[start], data[start + bs]);
+                let fresh = RollingChecksum::new(&data[start + 1..start + 1 + bs]);
+                assert_eq!(rolling.digest(), fresh.digest(), "bs {bs} start {start}");
+            }
+        }
+    }
 
     // ==========================================================================
     // UNIT TESTS - Basic functionality

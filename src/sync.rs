@@ -455,6 +455,31 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// #44: an identical source and basis must match block-for-block at every block size.
+    /// Before the fix, block sizes of 16 KiB and up matched nothing and the delta was all literal.
+    #[test]
+    fn identity_delta_uses_copy_ops_at_every_block_size() {
+        let data: Vec<u8> = (0..1usize << 20).map(|i| (i * 31 % 251) as u8).collect();
+        for &bs in &[4096usize, 8192, 16384, 32768, 65536] {
+            let sync = SyncBuilder::new()
+                .block_size(bs)
+                .strong_hash_len(32)
+                .build();
+            let sig = sync.signature(Cursor::new(&data)).unwrap();
+            let delta = sync.delta(Cursor::new(&data), &sig).unwrap();
+            let copy_ops = delta.ops.iter().filter(|o| o.is_copy()).count();
+            assert!(
+                copy_ops > 0,
+                "block_size {bs}: identity input produced no copy ops"
+            );
+            assert_eq!(
+                delta.bytes_literal(),
+                0,
+                "block_size {bs}: identity input left literals"
+            );
+        }
+    }
+
     // ==========================================================================
     // SYNC BUILDER TESTS
     // ==========================================================================
