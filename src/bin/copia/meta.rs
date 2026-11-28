@@ -218,25 +218,25 @@ fn absent_root_guard(remote_root: &str) -> String {
         return String::new();
     }
     let base = if trimmed.starts_with('/') { "/" } else { "." };
-    // Walks the components with `cd`, so each name is written once and the guard is
-    // linear in the depth. Runs in a subshell: `exit 0` there means absent, `exit 1`
-    // means "not classified", and only the former short-circuits the listing.
-    let mut checks = format!("cd -- {} || exit 1; ", posix_quote(base));
-    for component in components {
-        let q = posix_quote(&format!("./{component}"));
-        checks.push_str(&format!(
-            "[ -e {q} ] || [ -L {q} ] || exit 0; [ -d {q} ] && [ -x {q} ] || exit 1; cd -- {q} || exit 1; "
-        ));
-    }
-    checks.push_str("exit 1; ");
-    // The guard travels as one ssh argument, and one argument is capped at about
-    // 128 KiB (MAX_ARG_STRLEN). Each level costs about 130 bytes, so 96 KiB keeps
-    // every root a depth of several hundred deep classifiable with margin. Past this
-    // bound the root is not classified, which is the safe side: an omission.
+    // One loop over the quoted components, so each level costs its name plus a few
+    // bytes, not a copy of the checks. The name is expanded inside double quotes and
+    // never re-read as shell text. Runs in a subshell: `exit 0` there means absent,
+    // `exit 1` means "not classified", and only the former short-circuits the listing.
+    // Every component is tested only after `cd` confirmed its parent is a searchable
+    // directory, so `-e` can fail only with ENOENT.
+    let names: Vec<String> = components.iter().map(|c| posix_quote(c)).collect();
+    let checks = format!(
+        "cd -- {} || exit 1; for c in {}; do [ -e \"./$c\" ] || [ -L \"./$c\" ] || exit 0; [ -d \"./$c\" ] && [ -x \"./$c\" ] || exit 1; cd -- \"./$c\" || exit 1; done; exit 1",
+        posix_quote(base),
+        names.join(" ")
+    );
+    // The guard travels as one ssh argument, capped at about 128 KiB (MAX_ARG_STRLEN).
+    // The kernel's PATH_MAX (checked above) bounds the names, so this cap is never the
+    // binding one. It stays as a backstop: past it the root is not classified.
     if checks.len() > 96 * 1024 {
         return String::new();
     }
-    format!("( {checks}) && exit 0; ")
+    format!("( {checks} ) && exit 0; ")
 }
 
 /// The `cd` operand for a remote root. A bare `-` is POSIX `cd -` (the previous
@@ -1006,7 +1006,9 @@ mod r93_deep_guard {
     /// depth 200 (well inside PATH_MAX and one argument) must still be absent.
     #[test]
     fn a_valid_absent_root_at_depth_200_is_classified_absent() {
-        let base = std::env::temp_dir().join(format!("copia-93-deep-{}", std::process::id()));
+        // Its own directory name: the multi-level test uses `copia-93-deep-<pid>`, and
+        // the two race on one tree (measured 8 failures in 15 runs before this).
+        let base = std::env::temp_dir().join(format!("copia-93-deep200-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let mut root = base.clone();
         for _ in 0..200 {
@@ -1047,24 +1049,27 @@ mod r93_deep_guard {
         }
     }
 
-    /// Review finding (3) on 39e7293: the inline guard grows by about 115 bytes per
-    /// level, so a deep root's guard can reach the shell as an oversize argument.
-    /// A root whose guard would exceed the cap must fall back to omission: the
-    /// listing runs without a guard, `cd` fails on the absent root, and the listing
-    /// exits non-zero. It must not be classified absent and must not crash.
+    /// Review finding (3) on 3dcc68e, lane A: the inline guard spends about 130 bytes
+    /// per level, so a valid absent root deeper than about 750 levels lost its guard
+    /// and its first sync failed as an omission. Every level is now one entry of a
+    /// single quoted loop, so a depth-1000 absent root (2000 bytes, inside PATH_MAX)
+    /// must still be classified absent and its guard must stay well under one argument.
     #[cfg(unix)]
     #[test]
-    fn a_depth_1000_absent_root_is_an_omission_not_absent() {
+    fn a_depth_1000_absent_root_is_classified_absent() {
         use super::{absent_root_guard, remote_listing_command};
         let root = vec!["d"; 1000].join("/");
         let guard = absent_root_guard(&root);
-        assert!(guard.is_empty(), "a {}-byte guard was built", guard.len());
-        let command = remote_listing_command(&guard, &root);
         assert!(
-            command.len() < 128 * 1024,
-            "the listing is {} bytes",
-            command.len()
+            !guard.is_empty(),
+            "a depth-1000 absent root was not classified"
         );
+        assert!(
+            guard.len() < 32 * 1024,
+            "the guard is {} bytes",
+            guard.len()
+        );
+        let command = remote_listing_command(&guard, &root);
         let dir = std::env::temp_dir().join(format!("copia-93-depth1000-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = std::process::Command::new("/bin/sh")
@@ -1075,8 +1080,8 @@ mod r93_deep_guard {
             .unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert!(
-            !out.status.success() && out.stdout.is_empty(),
-            "an absent depth-1000 root listed or was read as absent: {out:?}"
+            out.status.success() && out.stdout.is_empty(),
+            "an absent depth-1000 root was not read as absent: {out:?}"
         );
     }
 }
