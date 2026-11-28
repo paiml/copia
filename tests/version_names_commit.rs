@@ -1,8 +1,25 @@
 //! paiml/copia#74: `copia --version` must name the build's commit, so a fleet host can
 //! tell which build it runs. RED on main: the version string carries no commit.
 #![cfg(feature = "cli")]
+#![allow(clippy::expect_used, clippy::panic)]
 
 use std::process::Command;
+
+/// The 7-char commit of the checkout this test runs in, or `unknown` without git.
+fn expected_sha() -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .chars()
+            .take(7)
+            .collect(),
+        _ => "unknown".to_string(),
+    }
+}
 
 #[test]
 fn version_names_the_build_commit() {
@@ -22,6 +39,11 @@ fn version_names_the_build_commit() {
     let sha = rest
         .strip_suffix(')')
         .unwrap_or_else(|| panic!("commit not closed in version line: {line:?}"));
+    assert_eq!(
+        sha,
+        expected_sha(),
+        "--version must name the checkout's HEAD: {line:?}"
+    );
     assert_eq!(sha.len(), 7, "commit must be 7 hex chars: {line:?}");
     assert!(
         sha.chars()

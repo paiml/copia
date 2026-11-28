@@ -25,7 +25,10 @@ pub fn resolve_sha(env: Option<&str>, git: Option<&str>) -> String {
 }
 
 /// Files whose change moves the checked-out commit: HEAD, the ref HEAD points at
-/// (when attached), and packed-refs. `git_path` maps a git path name to its location.
+/// (when attached), the refs directory, and packed-refs. The refs directory is
+/// watched because a branch packed by `git pack-refs` has no loose ref file, and
+/// the next commit creates one without touching HEAD or packed-refs.
+/// `git_path` maps a git path name to its location.
 pub fn rerun_paths(
     head_ref: Option<&str>,
     git_path: impl Fn(&str) -> Option<String>,
@@ -34,6 +37,7 @@ pub fn rerun_paths(
     if let Some(r) = head_ref {
         names.push(r.to_string());
     }
+    names.push("refs".to_string());
     names.push("packed-refs".to_string());
     names.iter().filter_map(|n| git_path(n)).collect()
 }

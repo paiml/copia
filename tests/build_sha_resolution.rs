@@ -89,3 +89,72 @@ fn tarball_without_git_watches_nothing() {
     let git = resolver(&[]);
     assert!(rerun_paths(None, git).is_empty());
 }
+
+#[test]
+fn six_char_env_sha_falls_back_to_git() {
+    // A short hex value is not a commit: it must not be printed as one.
+    assert_eq!(resolve_sha(Some("abc123"), Some("1234567")), "1234567");
+}
+
+/// Compile `build.rs` as a standalone program and run it inside `dir`, returning
+/// the `cargo:` directives it prints. This exercises `main()`, not only the helpers.
+fn build_script_output(dir: &std::path::Path) -> String {
+    let exe = dir.join("build_script_bin");
+    let status = std::process::Command::new("rustc")
+        .args(["--edition", "2021", "-o"])
+        .arg(&exe)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"))
+        .status()
+        .expect("run rustc on build.rs");
+    assert!(status.success(), "rustc failed on build.rs");
+    let out = std::process::Command::new(&exe)
+        .current_dir(dir)
+        .env_remove("COPIA_GIT_SHA")
+        .output()
+        .expect("run build script");
+    assert!(out.status.success(), "build script failed");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+#[test]
+fn packed_branch_ref_change_reruns_build_script() {
+    // After `git pack-refs --all` the branch has no loose ref file. A later commit
+    // creates one without touching HEAD or packed-refs, so the build script must
+    // watch the refs directory or Cargo never reruns it and --version goes stale.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    git_in(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    git_in(dir, &["pack-refs", "--all"]);
+    assert!(!dir.join(".git/refs/heads/main").exists());
+
+    let stdout = build_script_output(dir);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines.contains(&"cargo:rerun-if-changed=.git/refs"),
+        "refs directory not watched: {stdout}"
+    );
+    assert!(
+        lines.contains(&"cargo:rerun-if-changed=.git/packed-refs"),
+        "packed-refs not watched: {stdout}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("cargo:rustc-env=COPIA_GIT_SHA=")),
+        "no COPIA_GIT_SHA emitted: {stdout}"
+    );
+}
