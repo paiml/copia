@@ -43,7 +43,7 @@ roadmap:
 - id: PMAT-086
   github_issue: 86
   item_type: task
-  title: readme-shape-falsifier.sh + readme-shape-lab.yml (LAB only)
+  title: readme-shape-falsifier.sh (readme-shape-lab.yml LAB workflow is not in this PR; tracked under #86)
   status: planned
   priority: medium
   assigned_to: null
@@ -51,7 +51,7 @@ roadmap:
   updated: 2026-11-13T14:38:47Z
   spec: null
   acceptance_criteria:
-  - Add falsifier and LAB-only CI workflow
+  - Add the falsifier script (this PR); add the LAB-only CI workflow in a follow-up
   phases: []
   subtasks: []
   estimated_effort: null
