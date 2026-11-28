@@ -14,11 +14,37 @@ pub fn create_local_dirs(
     local_root: &Path,
     dirs: &[PathBuf],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Every directory is checked BEFORE the first one is created. `create_dir_all`
+    // follows a symlink, so a destination `sub -> /elsewhere` would create and
+    // later write outside the tree. Refusing up front leaves nothing half-built.
+    for dir in dirs {
+        if let Some(link) = symlink_on_path(local_root, dir) {
+            return Err(format!(
+                "{} is a symlink on the destination path; refusing to write through it",
+                link.display()
+            )
+            .into());
+        }
+    }
     std::fs::create_dir_all(local_root)?;
     for dir in dirs {
         std::fs::create_dir_all(local_root.join(dir))?;
     }
     Ok(())
+}
+
+/// The first symlink on `root/rel`, checking every component of `rel` (a directory
+/// itself is written into, so its last component counts too). `None` when the path
+/// below `root` is made of real directories or does not exist yet.
+pub(crate) fn symlink_on_path(root: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        if std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Some(cur);
+        }
+    }
+    None
 }
 
 /// Stream `ssh host "cat remote_path"` straight to `local_path` — never buffers

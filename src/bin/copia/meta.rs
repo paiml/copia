@@ -108,6 +108,10 @@ pub fn discover_local_with_meta(root: &Path, omitted: &mut Vec<String>) -> MetaM
                     omitted.push(format!("cannot carry {} {}", kind_tag(ft), full.display()));
                     continue;
                 }
+                if is_staging_name(&rel) {
+                    omitted.push(format!("staging-named entry {}", full.display()));
+                    continue;
+                }
                 out.insert(
                     rel,
                     FileMeta {
@@ -224,9 +228,11 @@ fn absent_root_guard(remote_root: &str) -> String {
         ));
     }
     checks.push_str("exit 1; ");
-    // A deep root can still exceed a single argument (about 128 KiB). Past this
+    // The guard travels as one ssh argument, and one argument is capped at about
+    // 128 KiB (MAX_ARG_STRLEN). Each level costs about 130 bytes, so 96 KiB keeps
+    // every root a depth of several hundred deep classifiable with margin. Past this
     // bound the root is not classified, which is the safe side: an omission.
-    if checks.len() > 16 * 1024 {
+    if checks.len() > 96 * 1024 {
         return String::new();
     }
     format!("( {checks}) && exit 0; ")
@@ -308,6 +314,9 @@ pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> Met
             continue;
         }
         match parse_remote_record(entry) {
+            Ok((rel, _)) if is_staging_name(&rel) => {
+                omitted.push(format!("staging-named remote entry {}", rel.display()));
+            }
             Ok((rel, meta)) => {
                 out.insert(rel, meta);
             }
@@ -315,6 +324,13 @@ pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> Met
         }
     }
     out
+}
+
+/// A name ending in the staging suffix. Its transfer stages into `<name>.copia-tmp`,
+/// so a source entry with this name would be written by two transfers at once.
+fn is_staging_name(rel: &Path) -> bool {
+    rel.file_name()
+        .is_some_and(|n| n.to_string_lossy().ends_with(".copia-tmp"))
 }
 
 /// Parse one `kind\tsize\tmtime\t./path` record. Every failure is returned as
@@ -933,6 +949,74 @@ mod r93_round3 {
             !stdout.contains("./outside"),
             "the root \"-\" listed $OLDPWD: {stdout:?}"
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod r93_staging_collision {
+    use super::*;
+
+    /// Review finding 5 (3dcc68e, lane B 2): a source entry named `<x>.copia-tmp`
+    /// is the staging path of `<x>`. Both planned in one run, the two transfers
+    /// write the same file and the other's data is lost while the run exits 0. Such
+    /// an entry is an omission (which also vetoes `--delete`), never planned.
+    #[test]
+    fn a_source_entry_named_like_a_staging_file_is_an_omission_not_planned() {
+        let base = std::env::temp_dir().join(format!("copia-93-stage-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.txt"), b"big").unwrap();
+        std::fs::write(base.join("a.txt.copia-tmp"), b"small").unwrap();
+        let mut omitted = Vec::new();
+        let map = discover_local_with_meta(&base, &mut omitted);
+        assert!(map.contains_key(Path::new("a.txt")));
+        assert!(
+            !map.contains_key(Path::new("a.txt.copia-tmp")),
+            "a staging-named entry was planned"
+        );
+        assert!(omitted.iter().any(|o| o.contains("a.txt.copia-tmp")));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The same rule for a remote listing record.
+    #[test]
+    fn a_remote_entry_named_like_a_staging_file_is_an_omission() {
+        let stdout = b"ff\t3\t1700000000.0\t./a.txt.copia-tmp\0";
+        let mut omitted = Vec::new();
+        let map = parse_remote_meta_output(stdout, &mut omitted);
+        assert!(map.is_empty(), "a remote staging-named entry was planned");
+        assert_eq!(omitted.len(), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod r93_deep_guard {
+    use super::absent_root_guard;
+
+    /// Review finding 3 (3dcc68e, lane A 3C): the guard is dropped above a 16 KiB
+    /// inline bound, and each level costs about 130 bytes, so a valid absent root
+    /// around depth 160 was never classified and its first sync failed. A root of
+    /// depth 200 (well inside PATH_MAX and one argument) must still be absent.
+    #[test]
+    fn a_valid_absent_root_at_depth_200_is_classified_absent() {
+        let base = std::env::temp_dir().join(format!("copia-93-deep-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut root = base.clone();
+        for _ in 0..200 {
+            root.push("d");
+        }
+        let root_s = root.display().to_string();
+        let guard = absent_root_guard(&root_s);
+        assert!(
+            !guard.is_empty(),
+            "a depth-200 absent root was not classified"
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{guard}exit 7"))
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "the guard did not report absence");
         std::fs::remove_dir_all(&base).ok();
     }
 }

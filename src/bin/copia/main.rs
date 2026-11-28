@@ -29,9 +29,15 @@ impl FileLocation {
             // If it's a single letter, it might be a Windows drive
             if before_colon.len() > 1 && !before_colon.contains('/') && !before_colon.contains('\\')
             {
+                // An empty root is the remote CWD. Written as `.`, because the
+                // `"{root}/{rel}"` joins would otherwise name the filesystem root.
+                let path = match &s[colon_pos + 1..] {
+                    "" => ".".to_string(),
+                    p => p.to_string(),
+                };
                 return Self::Remote {
                     host: before_colon.to_string(),
-                    path: s[colon_pos + 1..].to_string(),
+                    path,
                 };
             }
         }
@@ -434,4 +440,23 @@ pub(crate) fn validate_block_size(size: usize) -> Result<(), String> {
         return Err(format!("Block size must be 512-65536, got {size}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod r93_file_location {
+    use super::FileLocation;
+
+    /// Review finding 6 (3dcc68e, lane B 3): `host:` has an empty remote root. The
+    /// listing resolves it to the remote CWD, but `"{root}/{rel}"` then names `/rel`
+    /// and writes or deletes at the filesystem root. The root must be `.`.
+    #[test]
+    fn an_empty_remote_root_is_the_current_directory_not_the_filesystem_root() {
+        match FileLocation::parse("host:") {
+            FileLocation::Remote { path, .. } => {
+                assert_eq!(path, ".", "empty remote root would join to /rel");
+                assert_eq!(format!("{path}/a.txt"), "./a.txt");
+            }
+            FileLocation::Local(_) => panic!("host: must parse as remote"),
+        }
+    }
 }

@@ -131,6 +131,12 @@ pub fn collect_dirs(files: &[PathBuf]) -> Vec<PathBuf> {
 /// Create directories on a remote host via SSH.
 /// Pipes directory list through stdin to avoid shell quoting issues with
 /// special characters (apostrophes, angle brackets, etc.) in directory names.
+/// Per-directory `mkdir -p`, run by `sh` with the remote root as `$1`. Every path
+/// prefix strictly below the root is refused if it is a symlink (`mkdir -p` would
+/// follow it and create outside the tree). A refusal exits before that path is
+/// created, so nothing is written through the link.
+const MKDIR_GUARDED_SH: &str = r#"root=$1; shift; for p; do s=$p; while [ "$s" != "$root" ] && [ -n "$s" ]; do if [ -L "$s" ]; then echo "refusing to create directories through symlink $s" >&2; exit 3; fi; case $s in */*) s=${s%/*};; *) break;; esac; done; mkdir -p -- "$p" || exit 1; done"#;
+
 pub async fn create_remote_dirs(
     host: &str,
     remote_root: &str,
@@ -154,7 +160,11 @@ pub async fn create_remote_dirs(
 
     let mut child = tokio::process::Command::new("ssh")
         .arg(host)
-        .arg("xargs -0 mkdir -p --")
+        .arg(format!(
+            "xargs -0 sh -c {} sh {}",
+            posix_quote(MKDIR_GUARDED_SH),
+            posix_quote(remote_root)
+        ))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())

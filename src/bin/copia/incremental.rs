@@ -482,6 +482,11 @@ fn is_absent(path: &Path) -> bool {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return false;
     }
+    // Judged as sent: trailing slashes count toward PATH_MAX for the kernel, so a
+    // path padded past it is refused, not read as absent after normalizing.
+    if path.as_os_str().len() >= 4096 {
+        return false;
+    }
     // Rebuilt from components, which drops a trailing slash and `.` segments on
     // any platform. The old code trimmed only UTF-8 names, so a non-UTF-8 link
     // with a trailing slash was lstat-ed through the link and read as absent.
@@ -1850,6 +1855,56 @@ mod r93_incremental {
         assert!(!is_absent(&long), "ENAMETOOLONG was read as absent");
         std::fs::remove_dir_all(&base).ok();
     }
+
+    /// Review finding 1 (3dcc68e, lane A 3A): trailing slashes are trimmed before
+    /// lstat, so a path over PATH_MAX as sent collapses to a short, missing name and
+    /// is read as absent. The kernel would refuse the path with ENAMETOOLONG, so it
+    /// must never be classified absent.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_root_over_path_max_with_trailing_slashes_is_not_absent() {
+        let base = std::env::temp_dir().join(format!("copia-93-pmax-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let padded = format!("{}{}", base.join("missing").display(), "/".repeat(4200));
+        assert!(padded.len() >= 4096);
+        assert!(
+            !is_absent(Path::new(&padded)),
+            "an over-PATH_MAX root with trailing slashes was read as absent"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Review finding 4 (3dcc68e, lane A 5B / lane B 1): a destination whose
+    /// directory is a symlink out of the tree. The sync must refuse before writing
+    /// anything, so nothing lands outside the destination and the run fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_sync_refuses_a_destination_symlink_ancestor_and_writes_nothing_outside() {
+        let base = std::env::temp_dir().join(format!("copia-93-symanc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(src.join("sub/deep")).unwrap();
+        std::fs::write(src.join("sub/evil.txt"), b"PWNED").unwrap();
+        std::fs::write(src.join("sub/deep/nested.txt"), b"DEEP").unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dst.join("sub")).unwrap();
+
+        let res = run_local(&src, &dst, &delete_opts()).await;
+
+        assert!(res.is_err(), "a symlinked destination ancestor exited 0");
+        assert!(
+            !outside.join("evil.txt").exists(),
+            "wrote through the symlink"
+        );
+        assert!(
+            !outside.join("deep").exists(),
+            "created dirs through the symlink"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1936,6 +1991,42 @@ mod r93_round3 {
         std::fs::set_permissions(local.join("sub"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
         assert!(res.is_err(), "a failed local delete exited 0: {res:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod r93_push_mkdir {
+    use super::tests::fake_ssh_on_path;
+    use std::path::PathBuf;
+
+    /// Review finding 7 (3dcc68e, lane B 4): a push creates remote directories with
+    /// `mkdir -p`, which follows a symlink on the remote path. A remote `sub -> outside`
+    /// would create and later write outside the remote tree. The create must refuse
+    /// and leave nothing behind outside.
+    #[tokio::test]
+    async fn push_mkdir_refuses_a_remote_symlink_ancestor_and_creates_nothing_outside() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-pmkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, remote.join("sub")).unwrap();
+
+        let res = crate::transfer::create_remote_dirs(
+            "fakehost",
+            &remote.display().to_string(),
+            &[PathBuf::from("sub/deep")],
+        )
+        .await;
+
+        assert!(res.is_err(), "a remote symlink ancestor exited 0");
+        assert!(
+            !outside.join("deep").exists(),
+            "created a dir through the symlink"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 }
