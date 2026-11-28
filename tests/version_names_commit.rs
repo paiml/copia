@@ -11,28 +11,25 @@ fn normalize(raw: &str) -> Option<String> {
     (t.len() >= 7 && t.chars().all(|c| c.is_ascii_hexdigit())).then(|| t[..7].to_ascii_lowercase())
 }
 
-/// The 7-char commit the build embeds: `COPIA_GIT_SHA` when usable (same precedence as
-/// build.rs), else the checkout's HEAD, else `unknown` without git.
+/// Mirrors build.rs `resolve_sha`: a usable env value first, then the git HEAD, else
+/// `unknown` (the documented tarball fallback when there is neither).
+fn expected_sha_from(env: Option<&str>, head: Option<&str>) -> String {
+    env.and_then(normalize)
+        .or_else(|| head.and_then(normalize))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The commit this checkout's build embeds, read the same way build.rs reads it.
 fn expected_sha() -> String {
-    if let Some(s) = std::env::var("COPIA_GIT_SHA")
-        .ok()
-        .as_deref()
-        .and_then(normalize)
-    {
-        return s;
-    }
-    let out = Command::new("git")
+    let env = std::env::var("COPIA_GIT_SHA").ok();
+    let head = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .trim()
-            .chars()
-            .take(7)
-            .collect(),
-        _ => "unknown".to_string(),
-    }
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    expected_sha_from(env.as_deref(), head.as_deref())
 }
 
 #[test]
@@ -58,11 +55,16 @@ fn version_names_the_build_commit() {
     let sha = rest
         .strip_suffix(')')
         .unwrap_or_else(|| panic!("commit not closed in version line: {line:?}"));
+    let expected = expected_sha();
     assert_eq!(
-        sha,
-        expected_sha(),
-        "--version must name the checkout's HEAD: {line:?}"
+        sha, expected,
+        "--version must name the build's commit: {line:?}"
     );
+    // No env and no git (a source tarball): the documented fallback is `unknown`,
+    // which is not hex by design. Only a real commit gets the hex checks.
+    if expected == "unknown" {
+        return;
+    }
     assert_eq!(sha.len(), 7, "commit must be 7 hex chars: {line:?}");
     assert!(
         sha.chars()
@@ -71,32 +73,20 @@ fn version_names_the_build_commit() {
     );
 }
 
-/// The expected commit follows `COPIA_GIT_SHA` when it is set, as build.rs does, and
-/// the checkout's HEAD otherwise. Run with `COPIA_GIT_SHA` set to a 40-char sha that
-/// differs from HEAD: the build embeds that sha, so the expected value must be it too.
+/// The expected commit follows a usable `COPIA_GIT_SHA` as build.rs does, and falls
+/// back to HEAD for an unset, empty or non-hex value. Pure inputs, so it does not
+/// depend on the CI environment. Fails if the env value is ignored.
 #[test]
 fn expected_sha_honors_copia_git_sha() {
-    match std::env::var("COPIA_GIT_SHA") {
-        Ok(env_sha) => {
-            let want: String = env_sha
-                .trim()
-                .to_ascii_lowercase()
-                .chars()
-                .take(7)
-                .collect();
-            assert_eq!(
-                expected_sha(),
-                want,
-                "expected sha must follow COPIA_GIT_SHA"
-            );
-        }
-        Err(_) => {
-            let head = expected_sha();
-            assert_eq!(
-                head.len(),
-                7,
-                "without COPIA_GIT_SHA the expected sha is HEAD"
-            );
-        }
-    }
+    let head = "fedcba9876543210fedcba9876543210fedcba98";
+    let env_sha = "0123456789abcdef0123456789abcdef01234567";
+    assert_eq!(expected_sha_from(Some(env_sha), Some(head)), "0123456");
+    assert_eq!(
+        expected_sha_from(Some("  0123456789ABCDEF  "), Some(head)),
+        "0123456"
+    );
+    assert_eq!(expected_sha_from(Some("not-a-sha"), Some(head)), "fedcba9");
+    assert_eq!(expected_sha_from(Some(""), Some(head)), "fedcba9");
+    assert_eq!(expected_sha_from(None, Some(head)), "fedcba9");
+    assert_eq!(expected_sha_from(None, None), "unknown");
 }
