@@ -43,7 +43,7 @@ impl FileLocation {
 #[derive(Parser)]
 #[command(name = "copia")]
 #[command(author = "Pragmatic AI Labs")]
-#[command(version)]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("COPIA_GIT_SHA"), ")"))]
 #[command(about = "rsync-style file synchronization in pure Rust")]
 #[command(long_about = None)]
 struct Cli {
