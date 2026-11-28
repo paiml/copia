@@ -22,6 +22,11 @@ expect() {
     cases=$((cases + 1))
     out=$(pv-readme --check --readme "$file" --contracts contracts 2>&1)
     got=$?
+    # pv-readme's readme:section minCount grades the section count, not this heading.
+    if [ "$got" -eq 0 ] && ! grep -q '^## pv-readme Contract$' "$file"; then
+        out="no '## pv-readme Contract' heading in $file"
+        got=1
+    fi
     if [ "$got" -ne "$want" ]; then
         echo "FAIL  $label: exit $got, want $want"
         echo "$out" | head -n 5
@@ -70,9 +75,16 @@ cmp -s README.md "$work/count.md" && {
 }
 expect 1 "" "a contract count that is not the census is refused" "$work/count.md"
 
+sed '/^## pv-readme Contract$/d' README.md >"$work/nocontract.md"
+cmp -s README.md "$work/nocontract.md" && {
+    echo "NO-GO readme-shape-falsifier: the Contract-heading plant changed nothing" >&2
+    exit 2
+}
+expect 1 "## pv-readme Contract" "a README without the pv-readme Contract heading is refused" "$work/nocontract.md"
+
 echo "readme-shape-falsifier: $cases case(s) run, $failed failed"
-[ "$cases" -eq 6 ] || {
-    echo "NO-GO readme-shape-falsifier: ran $cases case(s), want 6" >&2
+[ "$cases" -eq 7 ] || {
+    echo "NO-GO readme-shape-falsifier: ran $cases case(s), want 7" >&2
     exit 2
 }
 [ "$failed" -eq 0 ]

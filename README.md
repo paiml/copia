@@ -197,9 +197,9 @@ This README carries frontmatter (`schema_version`, `kind`, `entrypoints`,
 - **Contract count**: `13` (`contracts/census.json`; `binding.yaml` is a
   bindings manifest, not a contract, and is correctly excluded from the
   census).
-- **Falsifier**: `tests/readme-shape-falsifier.sh`, 6 cases proving the
+- **Falsifier**: `tests/readme-shape-falsifier.sh`, 7 cases proving the
   check can fail (an unrun claim, a dropped `kind:`, a missing entrypoint,
-  a wrong contract count) as well as pass.
+  a missing Contract heading, a wrong contract count) as well as pass.
 - **No CI job runs this check yet**: `pv-readme` is not on the runners. Run
   `pv-readme --check` and the falsifier by hand.
 
