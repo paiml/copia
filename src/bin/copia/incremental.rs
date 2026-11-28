@@ -382,7 +382,7 @@ async fn run_remote(
 
     // The veto, enforced at the delete pass itself.
     let deleted = if omitted.is_empty() && !plan.delete.is_empty() {
-        apply_remote_deletes(dir, host, remote_root, local_root, &plan.delete).await;
+        apply_remote_deletes(dir, host, remote_root, local_root, &plan.delete).await?;
         plan.delete.len()
     } else {
         0
@@ -420,19 +420,17 @@ async fn deliver_pull(
 
 /// Delete the mirror's stale files. Pull deletes locally; push batches one
 /// `xargs rm` over SSH.
+///
+/// A failed delete is an error, never a silent success: the run exits non-zero.
 async fn apply_remote_deletes(
     dir: Dir,
     host: &str,
     remote_root: &str,
     local_root: &Path,
     dels: &[PathBuf],
-) {
+) -> Result<(), String> {
     match dir {
-        Dir::Pull => {
-            for rel in dels {
-                let _ = std::fs::remove_file(local_root.join(rel));
-            }
-        }
+        Dir::Pull => remove_local_files(local_root, dels)?,
         Dir::Push => {
             use std::fmt::Write as _;
             use tokio::io::AsyncWriteExt;
@@ -442,23 +440,38 @@ async fn apply_remote_deletes(
             for rel in dels {
                 let _ = write!(list, "{}/{}\0", remote_root, rel.display());
             }
-            if let Ok(mut child) = tokio::process::Command::new("ssh")
+            let mut child = tokio::process::Command::new("ssh")
                 .arg(host)
                 .arg("xargs -0 rm -f --")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
-            {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(list.as_bytes()).await;
-                    drop(stdin);
-                }
-                let _ = child.wait_with_output().await;
+                .map_err(|e| format!("remote delete: ssh spawn: {e}"))?;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "remote delete: no ssh stdin".to_string())?;
+            stdin
+                .write_all(list.as_bytes())
+                .await
+                .map_err(|e| format!("remote delete: write: {e}"))?;
+            drop(stdin);
+            let out = child
+                .wait_with_output()
+                .await
+                .map_err(|e| format!("remote delete: ssh wait: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "remote delete failed ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
             }
         }
     }
     eprintln!("Deleted {} stale file(s) on the destination", dels.len());
+    Ok(())
 }
 
 /// True when `path` does not exist at all. A dangling symlink exists. A trailing
@@ -489,16 +502,43 @@ fn is_absent(path: &Path) -> bool {
     )
 }
 
-/// The staging name `.copia-tmp` must be absent or a regular file. `File::create`
-/// and `copy` follow a symlink and block on a FIFO, so a leftover of either kind
-/// is refused by name instead of hanging the transfer.
+/// The staging name `.copia-tmp` must NOT exist at all. Anything there may be synced
+/// data that happens to carry the name, and `File::create` would truncate it. So the
+/// slot is refused, never overwritten: the user removes the entry and retries.
 fn check_staging_slot(tmp: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(tmp) {
-        Ok(md) if !md.file_type().is_file() => Err(format!(
-            "{}: staging path is not a regular file (fifo, symlink or other); remove it and retry",
+        Ok(_) => Err(format!(
+            "{}: staging path already exists; not overwriting it; remove it and retry",
             tmp.display()
         )),
-        _ => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "{}: cannot inspect staging path: {e}",
+            tmp.display()
+        )),
+    }
+}
+
+/// Remove local files. A file already gone is not an error; any other failure is,
+/// so a stale file that survives is reported and the run fails.
+fn remove_local_files(root: &Path, rels: &[PathBuf]) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for rel in rels {
+        let path = root.join(rel);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failures.push(format!("{}: {e}", path.display())),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to delete {} file(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ))
     }
 }
 
@@ -572,9 +612,7 @@ async fn run_local(
 
     // The veto, enforced at the delete pass itself.
     let deleted = if omitted.is_empty() && !plan.delete.is_empty() {
-        for rel in &plan.delete {
-            let _ = std::fs::remove_file(dst.join(rel));
-        }
+        remove_local_files(dst, &plan.delete)?;
         eprintln!("Deleted {} stale file(s)", plan.delete.len());
         plan.delete.len()
     } else {
@@ -1810,6 +1848,94 @@ mod r93_incremental {
         std::fs::create_dir_all(&base).unwrap();
         let long = base.join("a".repeat(300));
         assert!(!is_absent(&long), "ENAMETOOLONG was read as absent");
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod r93_round3 {
+    use super::tests::{delete_opts, fake_ssh_on_path, run_remote_with_deadline};
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("copia-r3-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// Round 3, item 5 RED: a pull reuses the staging name and overwrites a file
+    /// that is synced data. It must refuse.
+    #[tokio::test]
+    async fn pull_refuses_to_overwrite_an_existing_staging_file() {
+        fake_ssh_on_path();
+        let base = scratch("pull-stage");
+        std::fs::create_dir_all(base.join("remote")).unwrap();
+        std::fs::create_dir_all(base.join("local")).unwrap();
+        std::fs::write(base.join("remote/data.txt"), b"remote").unwrap();
+        let dst = base.join("local/data.txt");
+        let tmp = tmp_path(&dst);
+        std::fs::write(&tmp, b"synced").unwrap();
+
+        let res = deliver_pull(
+            "shim.invalid",
+            &base.join("remote/data.txt").to_string_lossy(),
+            &dst,
+            None,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a pull reused an existing staging file: {res:?}"
+        );
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"synced",
+            "the synced file was overwritten"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Round 3, item 3 RED (push): a failed remote delete exits 0 today.
+    #[test]
+    fn push_delete_failure_fails_the_run() {
+        fake_ssh_on_path();
+        let base = scratch("push-del");
+        let local = base.join("local");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(remote.join("sub")).unwrap();
+        std::fs::write(local.join("keep.txt"), b"new").unwrap();
+        std::fs::write(remote.join("sub/stale.txt"), b"old").unwrap();
+        std::fs::set_permissions(remote.join("sub"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+
+        let res = run_remote_with_deadline(Dir::Push, &remote, &local, delete_opts());
+        std::fs::set_permissions(remote.join("sub"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(res.is_err(), "a failed remote delete exited 0: {res:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Round 3, item 3 RED (pull): a failed local delete exits 0 today.
+    #[test]
+    fn pull_delete_failure_fails_the_run() {
+        fake_ssh_on_path();
+        let base = scratch("pull-del");
+        let local = base.join("local");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(remote.clone()).unwrap();
+        std::fs::create_dir_all(local.join("sub")).unwrap();
+        std::fs::write(remote.join("keep.txt"), b"same").unwrap();
+        std::fs::write(local.join("sub/stale.txt"), b"old").unwrap();
+        std::fs::set_permissions(local.join("sub"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+
+        let res = run_remote_with_deadline(Dir::Pull, &remote, &local, delete_opts());
+        std::fs::set_permissions(local.join("sub"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(res.is_err(), "a failed local delete exited 0: {res:?}");
         std::fs::remove_dir_all(&base).ok();
     }
 }

@@ -176,7 +176,7 @@ pub(crate) fn posix_quote(s: &str) -> String {
 /// then `find` under `remote_root`. `cd --` so a root that begins with `-` is a
 /// path, not an option.
 pub(crate) fn remote_listing_command(absent_guard: &str, remote_root: &str) -> String {
-    let root_q = posix_quote(remote_root);
+    let root_q = cd_operand(remote_root);
     // `! -type d`, NOT `-type f`. The previous form enumerated regular files
     // ONLY, so a symlink, FIFO, socket or device on a remote tree was invisible
     // to every plan built from this listing. Directories are handled separately;
@@ -193,6 +193,12 @@ pub(crate) fn remote_listing_command(absent_guard: &str, remote_root: &str) -> S
 /// and is an omission. A root with a `.` or `..` component is never classified:
 /// `x/.` on an unreadable or non-directory `x` fails `-e` for another reason.
 fn absent_root_guard(remote_root: &str) -> String {
+    // The length is judged on the path as sent. Trailing slashes count toward
+    // PATH_MAX for the kernel, so a root padded past it is refused even when its
+    // trimmed form is short. Normalizing first would have hidden that.
+    if remote_root.len() >= 4096 {
+        return String::new();
+    }
     let trimmed = remote_root.trim_end_matches('/');
     if trimmed.is_empty() {
         return String::new();
@@ -201,32 +207,40 @@ fn absent_root_guard(remote_root: &str) -> String {
     if components.iter().any(|c| *c == "." || *c == "..") {
         return String::new();
     }
-    // ENAMETOOLONG makes `-e` false exactly as ENOENT does. A root over the POSIX
-    // limits (NAME_MAX 255 per component, PATH_MAX 4096 overall) is not classified:
-    // the listing runs, fails, and is an omission rather than a first sync.
-    if trimmed.len() >= 4096 || components.iter().any(|c| c.len() > 255) {
+    // ENAMETOOLONG makes `-e` false exactly as ENOENT does. A component over
+    // NAME_MAX (255) is not classified: the listing runs, fails, and is an omission.
+    if components.iter().any(|c| c.len() > 255) {
         return String::new();
     }
     let base = if trimmed.starts_with('/') { "/" } else { "." };
-    // Runs in a subshell: `exit 0` there means absent, `exit 1` means "not
-    // classified", and only the former short-circuits the listing.
-    let base_q = posix_quote(base);
-    let mut checks = format!("[ -d {base_q} ] && [ -x {base_q} ] || exit 1; ");
-    let mut prefix = base.to_owned();
+    // Walks the components with `cd`, so each name is written once and the guard is
+    // linear in the depth. Runs in a subshell: `exit 0` there means absent, `exit 1`
+    // means "not classified", and only the former short-circuits the listing.
+    let mut checks = format!("cd -- {} || exit 1; ", posix_quote(base));
     for component in components {
-        let next = if prefix.ends_with('/') {
-            format!("{prefix}{component}")
-        } else {
-            format!("{prefix}/{component}")
-        };
-        let q = posix_quote(&next);
+        let q = posix_quote(&format!("./{component}"));
         checks.push_str(&format!(
-            "[ -e {q} ] || [ -L {q} ] || exit 0; [ -d {q} ] && [ -x {q} ] || exit 1; "
+            "[ -e {q} ] || [ -L {q} ] || exit 0; [ -d {q} ] && [ -x {q} ] || exit 1; cd -- {q} || exit 1; "
         ));
-        prefix = next;
     }
     checks.push_str("exit 1; ");
+    // A deep root can still exceed a single argument (about 128 KiB). Past this
+    // bound the root is not classified, which is the safe side: an omission.
+    if checks.len() > 16 * 1024 {
+        return String::new();
+    }
     format!("( {checks}) && exit 0; ")
+}
+
+/// The `cd` operand for a remote root. A bare `-` is POSIX `cd -` (the previous
+/// directory), so a relative root is always written with a `./` prefix. The prefix
+/// also keeps `CDPATH` out of the lookup.
+fn cd_operand(remote_root: &str) -> String {
+    if remote_root.starts_with('/') {
+        posix_quote(remote_root)
+    } else {
+        posix_quote(&format!("./{remote_root}"))
+    }
 }
 
 /// Whether a remote record's kind (`%y%Y`) is one copia carries: a regular file
@@ -860,5 +874,65 @@ mod r93_meta {
         assert!(m.is_empty(), "a symlink to a file was planned: {m:?}");
         assert_eq!(omitted.len(), 1, "{omitted:?}");
         assert!(omitted[0].contains("symlink-to-file"), "{omitted:?}");
+    }
+}
+
+#[cfg(test)]
+mod r93_round3 {
+    use super::*;
+
+    /// Round 3, item 6 RED: the guard repeats every prefix, so its size grows with
+    /// the square of the depth and a deep root overflows the command line (E2BIG).
+    #[test]
+    fn absent_root_guard_stays_linear_on_a_deep_root() {
+        let deep = vec!["d"; 1000].join("/");
+        let guard = absent_root_guard(&deep);
+        assert!(
+            guard.len() < 16 * 1024,
+            "the guard is {} bytes for a depth-1000 root",
+            guard.len()
+        );
+    }
+
+    /// Round 3, item 7 RED: trailing slashes pad the raw root past PATH_MAX, while
+    /// the trimmed root is short. The kernel refuses the raw path (ENAMETOOLONG),
+    /// so the guard must not read it as absent.
+    #[test]
+    fn a_root_over_path_max_with_trailing_slashes_is_never_absent() {
+        let root = format!("absent{}", "/".repeat(5000));
+        assert!(
+            absent_root_guard(&root).is_empty(),
+            "an over-PATH_MAX root was classified through its trimmed form"
+        );
+    }
+
+    /// Round 3, item 8 RED: `cd -- -` is POSIX `cd -` (the previous directory), so a
+    /// root named "-" listed $OLDPWD instead of ./-.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_root_named_dash_lists_that_directory() {
+        let base = std::env::temp_dir().join(format!("copia-r3-dash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("-")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        std::fs::write(base.join("-/inside"), b"x").unwrap();
+        std::fs::write(base.join("other/outside"), b"x").unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(remote_listing_command("", "-"))
+            .current_dir(&base)
+            .env("OLDPWD", base.join("other"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("./inside"),
+            "the root \"-\" was not listed: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains("./outside"),
+            "the root \"-\" listed $OLDPWD: {stdout:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 }

@@ -324,20 +324,54 @@ where
 pub(crate) fn push_command(remote_path: &str, expected: u64, mtime: Option<i64>) -> String {
     let tmp_q = posix_quote(&format!("{remote_path}.copia-tmp"));
     let dst_q = posix_quote(remote_path);
-    // The staging name must be absent, or a regular file that is not a link.
-    // `-e` FOLLOWS links, so a dangling link passes `! -e` and `cat >` would then
-    // write through it. Each case is tested on its own, with `-L` checked first.
+    // The staging name must not exist AT ALL. Anything there, including a regular
+    // file, may be synced data with that name, so it is refused, never overwritten.
+    // `-e` follows links, so `-L` is checked too: a dangling link passes `! -e`.
     let staging_check = format!(
         "{{ [ ! -e {tmp_q} ] && [ ! -L {tmp_q} ]; }} || \
-         {{ [ -f {tmp_q} ] && [ ! -L {tmp_q} ]; }} || \
-         {{ echo 'copia: staging path is not a regular file' >&2; exit 1; }}; "
+         {{ echo 'copia: staging path already exists; not overwriting it' >&2; exit 1; }}; "
     );
     let touch = mtime.map_or(String::new(), |t| format!(" && touch -d @{t} -- {dst_q}"));
     let verify = format!(
         "[ \"$(wc -c < {tmp_q} | tr -d ' ')\" = \"{expected}\" ] || \
          {{ rm -f -- {tmp_q}; echo 'copia: received bytes differ from the source size; not committed' >&2; exit 1; }}"
     );
-    format!("{staging_check}cat > {tmp_q} && {{ {verify}; }} && mv -f -- {tmp_q} {dst_q}{touch}")
+    // `mv` into a directory moves the staged file INTO it, and `mv` onto a symlink
+    // to a directory writes through the link. Both are refused, before the rename.
+    let dst_check = format!(
+        "[ ! -d {dst_q} ] && [ ! -L {dst_q} ] || \
+         {{ rm -f -- {tmp_q}; echo 'copia: destination is a directory or a symlink; not committed' >&2; exit 1; }}"
+    );
+    let ancestors = ancestor_guard(remote_path);
+    format!(
+        "{ancestors}{staging_check}cat > {tmp_q} && {{ {verify}; }} && {{ {dst_check}; }} && mv -f -- {tmp_q} {dst_q}{touch}"
+    )
+}
+
+/// A remote guard that refuses a path whose DIRECTORY ancestors include a symlink
+/// (or that does not resolve). Staging through a symlinked ancestor writes outside
+/// the synced tree. Each ancestor is entered with `cd` only after `-L` rules out a
+/// link, so every component appears once and the guard is linear in the path.
+fn ancestor_guard(remote_path: &str) -> String {
+    let mut parts: Vec<&str> = remote_path.split('/').filter(|c| !c.is_empty()).collect();
+    parts.pop(); // the final name is written, not entered
+    if parts.is_empty() {
+        return String::new();
+    }
+    let base = if remote_path.starts_with('/') {
+        "/"
+    } else {
+        "."
+    };
+    let mut checks = format!("cd -- {} || exit 1; ", posix_quote(base));
+    for part in parts {
+        let q = posix_quote(&format!("./{part}"));
+        checks.push_str(&format!("[ ! -L {q} ] && cd -- {q} || exit 1; "));
+    }
+    checks.push_str("exit 0; ");
+    format!(
+        "( {checks}) || {{ echo 'copia: staging path runs through a symlink or a missing directory; not written' >&2; exit 1; }}; "
+    )
 }
 
 /// The remote POSIX shell command that prints `remote_path`'s bytes.
@@ -347,8 +381,11 @@ pub(crate) fn push_command(remote_path: &str, expected: u64, mtime: Option<i64>)
 /// would then print the target's bytes under the link's name.
 pub(crate) fn pull_command(remote_path: &str) -> String {
     let q = posix_quote(remote_path);
+    // `-f` is false for a FIFO, socket or device, so those are refused by a stat
+    // alone, before `cat` could open and block on them. `-f` follows a link, so
+    // `! -L` refuses a symlink to a regular file.
     format!(
-        "{{ [ ! -L {q} ] || {{ echo 'copia: source is a symlink' >&2; exit 1; }}; }} && cat -- {q}"
+        "{{ [ -f {q} ] && [ ! -L {q} ]; }} || {{ echo 'copia: source is not a regular file' >&2; exit 1; }}; cat -- {q}"
     )
 }
 
@@ -744,5 +781,160 @@ mod transfer_tests {
             vec![PathBuf::from("a.txt"), PathBuf::from("sub/b.txt")]
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+}
+
+#[cfg(test)]
+mod r93_round3 {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn posix_sh() -> &'static str {
+        if Path::new("/bin/dash").exists() {
+            "/bin/dash"
+        } else {
+            "/bin/sh"
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("copia-r3-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn push_in(base: &Path, remote: &str, size: u64) -> std::process::Output {
+        let mut child = Command::new(posix_sh())
+            .arg("-c")
+            .arg(push_command(remote, size, None))
+            .current_dir(base)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"payload").unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn entries(dir: &Path) -> usize {
+        std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// Round 3, item 1 RED: `mv -f` into a symlink-to-directory moves the staged
+    /// file OUTSIDE the synced tree, with no veto.
+    #[cfg(unix)]
+    #[test]
+    fn push_refuses_a_symlink_destination_and_writes_nothing_outside() {
+        let base = scratch("link-dst");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("link")).unwrap();
+        let out = push_in(&base, "link", 7);
+        assert!(!out.status.success(), "a symlink destination was accepted");
+        assert_eq!(
+            entries(&outside),
+            0,
+            "a file landed outside the synced tree"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Round 3, item 1 RED: `mv -f` into a directory moves the file INTO it.
+    #[cfg(unix)]
+    #[test]
+    fn push_refuses_a_directory_destination() {
+        let base = scratch("dir-dst");
+        std::fs::create_dir_all(base.join("dir")).unwrap();
+        let out = push_in(&base, "dir", 7);
+        assert!(
+            !out.status.success(),
+            "a directory destination was accepted"
+        );
+        assert_eq!(
+            entries(&base.join("dir")),
+            0,
+            "the file was moved into the directory"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Round 3, item 2 RED: staging through an ancestor symlink writes outside.
+    #[cfg(unix)]
+    #[test]
+    fn push_refuses_a_symlink_ancestor_and_writes_nothing_outside() {
+        let base = scratch("anc-link");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("link")).unwrap();
+        let out = push_in(&base, "link/a.txt", 7);
+        assert!(!out.status.success(), "a symlink ancestor was accepted");
+        assert_eq!(
+            entries(&outside),
+            0,
+            "the staged file was written through the link"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Round 3, item 5 RED: an existing regular file at the staging name is synced
+    /// data; a push must refuse, not overwrite it.
+    #[cfg(unix)]
+    #[test]
+    fn push_refuses_to_overwrite_an_existing_staging_file() {
+        let base = scratch("stage-reuse");
+        std::fs::write(base.join("a.txt.copia-tmp"), b"synced").unwrap();
+        let out = push_in(&base, "a.txt", 7);
+        assert!(
+            !out.status.success(),
+            "an existing staging file was accepted"
+        );
+        assert_eq!(
+            std::fs::read(base.join("a.txt.copia-tmp")).unwrap(),
+            b"synced",
+            "the synced staging-named file was overwritten"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Round 3, item 4 RED: `cat` on a remote FIFO blocks until a writer appears.
+    /// The source must be refused before it is read.
+    #[cfg(unix)]
+    #[test]
+    fn pull_refuses_a_fifo_source_without_blocking() {
+        let base = scratch("fifo-src");
+        let fifo = base.join("pipe");
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let mut child = Command::new(posix_sh())
+            .arg("-c")
+            .arg(pull_command("pipe"))
+            .current_dir(&base)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let start = Instant::now();
+        let status = loop {
+            match child.try_wait().unwrap() {
+                Some(st) => break st,
+                None if start.elapsed() > Duration::from_secs(5) => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    std::fs::remove_dir_all(&base).ok();
+                    panic!("pull hung on a FIFO source instead of refusing it");
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        assert!(!status.success(), "a FIFO source was accepted");
+        std::fs::remove_dir_all(&base).ok();
     }
 }
