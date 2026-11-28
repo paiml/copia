@@ -132,7 +132,6 @@ pub async fn discover_remote_with_meta(
     absent_root_is_empty: bool,
     omitted: &mut Vec<String>,
 ) -> MetaMap {
-    let root_q = posix_quote(remote_root);
     // A destination root that does not exist is a first sync: an empty listing,
     // with nothing to delete. Only the destination passes `absent_root_is_empty`.
     // The source must still read an absent root as an omission, or a mistyped
@@ -142,24 +141,9 @@ pub async fn discover_remote_with_meta(
     } else {
         String::new()
     };
-    // Kind = %y (the entry) followed by %Y (what it resolves to), e.g. `ff`,
-    // `lf` (symlink to a file), `lN` (dangling), `lp` (symlink to a FIFO).
-    // %s size, %T@ mtime (float secs), %p path. TAB-separated, NUL-terminated.
     let output = tokio::process::Command::new("ssh")
         .arg(host)
-        .arg(format!(
-            // `! -type d`, NOT `-type f`. The previous form enumerated regular
-            // files ONLY, so a symlink, FIFO, socket or device on a remote tree
-            // was invisible to every plan built from this listing — and a
-            // destination missing one read as agreement, the same omission that
-            // made `copia verify` certify a lost FIFO locally.
-            //
-            // Directories are excluded because they are handled separately;
-            // everything else is an ENTRY and must be visible even when copia
-            // cannot carry it. `find` does not follow symlinks by default, so
-            // %s/%T@ describe the link itself rather than its target.
-            "{absent_guard}cd {root_q} && find . ! -type d -printf '%y%Y\\t%s\\t%T@\\t%p\\0'"
-        ))
+        .arg(remote_listing_command(&absent_guard, remote_root))
         .output()
         .await;
     match output {
@@ -184,29 +168,59 @@ pub async fn discover_remote_with_meta(
 
 /// Quote a path for POSIX sh (dash and bash alike). `$'...'` is bash-only: dash
 /// reads it as a literal string, which made an existing root look absent.
-fn posix_quote(s: &str) -> String {
+pub(crate) fn posix_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The full remote command that lists a tree: the optional absent-root guard,
+/// then `find` under `remote_root`. `cd --` so a root that begins with `-` is a
+/// path, not an option.
+pub(crate) fn remote_listing_command(absent_guard: &str, remote_root: &str) -> String {
+    let root_q = posix_quote(remote_root);
+    // `! -type d`, NOT `-type f`. The previous form enumerated regular files
+    // ONLY, so a symlink, FIFO, socket or device on a remote tree was invisible
+    // to every plan built from this listing. Directories are handled separately;
+    // everything else is an ENTRY and must be visible even when copia cannot
+    // carry it. `find` does not follow symlinks, so %s/%T@ describe the link.
+    // Kind = %y then %Y, e.g. `ff`, `lf` (symlink to a file), `lN` (dangling).
+    format!("{absent_guard}cd -- {root_q} && find . ! -type d -printf '%y%Y\\t%s\\t%T@\\t%p\\0'")
+}
+
 /// Shell prefix that exits 0 only for a destination root that is definitively
-/// absent: its parent is a searchable directory and nothing is at the root
-/// path. Any other stat failure (EACCES, ENOTDIR, ELOOP) falls through to the
-/// listing, which then fails and is an omission. It never takes the exit 0 path.
+/// absent. Every component is tested only after its parent is confirmed a
+/// searchable directory, so `-e` can fail only with ENOENT; an EACCES, ENOTDIR
+/// or ELOOP anywhere on the way falls through to the listing, which then fails
+/// and is an omission. A root with a `.` or `..` component is never classified:
+/// `x/.` on an unreadable or non-directory `x` fails `-e` for another reason.
 fn absent_root_guard(remote_root: &str) -> String {
-    // A trailing slash makes `-e` and `-L` fail with ENOTDIR on an existing file,
-    // which read it as absent. Test the path itself. "/" always exists.
     let trimmed = remote_root.trim_end_matches('/');
     if trimmed.is_empty() {
         return String::new();
     }
-    let remote_root = trimmed;
-    let parent = match Path::new(remote_root).parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_string_lossy().into_owned(),
-        _ if remote_root.starts_with('/') => "/".to_owned(),
-        _ => ".".to_owned(),
-    };
-    let (root, parent) = (posix_quote(remote_root), posix_quote(&parent));
-    format!("[ -d {parent} ] && [ -x {parent} ] && [ ! -e {root} ] && [ ! -L {root} ] && exit 0; ")
+    let components: Vec<&str> = trimmed.split('/').filter(|c| !c.is_empty()).collect();
+    if components.iter().any(|c| *c == "." || *c == "..") {
+        return String::new();
+    }
+    let base = if trimmed.starts_with('/') { "/" } else { "." };
+    // Runs in a subshell: `exit 0` there means absent, `exit 1` means "not
+    // classified", and only the former short-circuits the listing.
+    let base_q = posix_quote(base);
+    let mut checks = format!("[ -d {base_q} ] && [ -x {base_q} ] || exit 1; ");
+    let mut prefix = base.to_owned();
+    for component in components {
+        let next = if prefix.ends_with('/') {
+            format!("{prefix}{component}")
+        } else {
+            format!("{prefix}/{component}")
+        };
+        let q = posix_quote(&next);
+        checks.push_str(&format!(
+            "[ -e {q} ] || [ -L {q} ] || exit 0; [ -d {q} ] && [ -x {q} ] || exit 1; "
+        ));
+        prefix = next;
+    }
+    checks.push_str("exit 1; ");
+    format!("( {checks}) && exit 0; ")
 }
 
 /// Whether a remote record's kind (`%y%Y`) is one copia carries: a regular file,
@@ -251,8 +265,28 @@ fn remote_entry_name(kind: &str) -> String {
 /// because `cat` on a remote FIFO blocks forever.
 pub fn parse_remote_meta_output(stdout: &[u8], omitted: &mut Vec<String>) -> MetaMap {
     let mut out = MetaMap::new();
-    for entry in stdout.split(|&b| b == 0) {
+    if stdout.is_empty() {
+        return out;
+    }
+    // Every record ends in a NUL. Bytes after the last NUL are a record the
+    // listing never finished: an omission, never parsed. An empty record between
+    // two NULs is malformed too. Neither is dropped silently.
+    let Some(last) = stdout.iter().rposition(|&b| b == 0) else {
+        omitted.push(format!(
+            "truncated remote record (no terminating NUL): {}",
+            String::from_utf8_lossy(stdout)
+        ));
+        return out;
+    };
+    if last + 1 < stdout.len() {
+        omitted.push(format!(
+            "truncated remote record (no terminating NUL): {}",
+            String::from_utf8_lossy(&stdout[last + 1..])
+        ));
+    }
+    for entry in stdout[..last].split(|&b| b == 0) {
         if entry.is_empty() {
+            omitted.push("empty remote record (between NUL terminators)".to_owned());
             continue;
         }
         match parse_remote_record(entry) {
@@ -290,6 +324,16 @@ fn parse_remote_record(entry: &[u8]) -> Result<(PathBuf, FileMeta), String> {
     let rel = path.strip_prefix("./").unwrap_or(path);
     if rel.is_empty() || rel == "." {
         return Err(format!("malformed remote record (empty path): {s}"));
+    }
+    // The path is a name under the remote root. An absolute path, or any empty,
+    // `.` or `..` segment, would escape local_root on a pull. Refused, not carried.
+    if rel
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(format!(
+            "unsafe remote path (absolute or contains . or ..): {s}"
+        ));
     }
     if !remote_kind_carried(kind) {
         return Err(format!("cannot carry {} {rel}", remote_entry_name(kind)));
@@ -397,7 +441,8 @@ mod tests {
         );
         assert!(m.is_empty());
         // ...and each one is an omission, so a sync can never delete on its strength.
-        assert_eq!(omitted.len(), 2, "{omitted:?}");
+        // Three: the bad size, the empty record between the NULs (finding 5), and the one-field record.
+        assert_eq!(omitted.len(), 3, "{omitted:?}");
     }
 
     /// Review finding A: a FIFO on a remote tree must name its kind and become an
@@ -661,5 +706,125 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+// Review regressions for copia #50 round 4 (findings 1, 3, 4, 5).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod r93_meta {
+    use super::*;
+
+    /// Finding 1 (CRITICAL): a remote path that escapes the root is refused.
+    #[test]
+    fn remote_paths_that_escape_the_root_are_refused() {
+        let cases: [&[u8]; 5] = [
+            b"ff\t1\t1700000000.0\t/etc/passwd\x00",
+            b"ff\t1\t1700000000.0\t./../x\x00",
+            b"ff\t1\t1700000000.0\t./a/../../x\x00",
+            b"ff\t1\t1700000000.0\t./a/./b\x00",
+            b"ff\t1\t1700000000.0\t.//x\x00",
+        ];
+        for raw in cases {
+            let mut omitted = Vec::new();
+            let m = parse_remote_meta_output(raw, &mut omitted);
+            assert!(m.is_empty(), "{raw:?} was planned: {m:?}");
+            assert_eq!(omitted.len(), 1, "{raw:?} was not refused: {omitted:?}");
+            assert!(omitted[0].contains("unsafe"), "{omitted:?}");
+        }
+    }
+
+    /// Finding 5 (MEDIUM): a truncated trailing record and an empty NUL record are
+    /// omissions, never silently dropped.
+    #[test]
+    fn truncated_and_empty_records_are_omissions() {
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(b"ff\t1\t1700000000.0\t./a", &mut omitted);
+        assert!(m.is_empty(), "{m:?}");
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("truncated"), "{omitted:?}");
+
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(
+            b"ff\t1\t1700000000.0\t./a\x00ff\t1\t1700000000.0\t./b",
+            &mut omitted,
+        );
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m.contains_key(&PathBuf::from("a")));
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("truncated"), "{omitted:?}");
+
+        let mut omitted = Vec::new();
+        let m = parse_remote_meta_output(b"\x00ff\t1\t1700000000.0\t./b\x00", &mut omitted);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        assert!(omitted[0].contains("empty"), "{omitted:?}");
+    }
+
+    #[cfg(unix)]
+    fn run_guard(root: &str) -> std::process::Output {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{}echo REACHED", absent_root_guard(root)))
+            .output()
+            .unwrap()
+    }
+
+    /// Finding 3 (HIGH): a root ending in `/.`, or a dangling link, an unsearchable
+    /// dir or a regular file under it, must never take the absent exit. Only a true
+    /// ENOENT may. Each case must fall through to the listing.
+    #[cfg(unix)]
+    #[test]
+    fn dot_suffixed_roots_are_never_read_as_absent() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let base = std::env::temp_dir().join(format!("copia-93-dot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let child = base.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o000)).unwrap();
+        symlink("nowhere", base.join("dangling")).unwrap();
+        std::fs::write(base.join("file"), b"x").unwrap();
+        let roots = [
+            format!("{}/.", child.display()),
+            format!("{}/./", child.display()),
+            format!("{}/dangling/.", base.display()),
+            format!("{}/file/.", base.display()),
+        ];
+        let results: Vec<_> = roots.iter().map(|r| (r.clone(), run_guard(r))).collect();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&base).ok();
+        for (root, out) in results {
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "REACHED",
+                "{root} was read as absent: {out:?}"
+            );
+        }
+    }
+
+    /// Finding 4 (MEDIUM-HIGH): a multi-level absent destination is a first sync.
+    /// A missing level under an existing directory is absent; a file in the middle is not.
+    #[cfg(unix)]
+    #[test]
+    fn multi_level_absent_root_takes_the_early_exit() {
+        let base = std::env::temp_dir().join(format!("copia-93-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("present")).unwrap();
+        let root = base.join("present/missing-a/missing-b/remote");
+        let out = run_guard(&root.to_string_lossy());
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "absent deep root fell through: {out:?}"
+        );
+
+        std::fs::write(base.join("present/file"), b"x").unwrap();
+        let out = run_guard(&base.join("present/file/x/y").to_string_lossy());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "REACHED",
+            "{out:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 }

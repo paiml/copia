@@ -1,6 +1,7 @@
 //! Low-level transfer primitives + helpers shared by the sync orchestration.
 //! Split out of `dir_sync` to keep each module within the size budget.
 
+use super::meta::posix_quote;
 use std::path::{Path, PathBuf};
 use tracing::instrument;
 
@@ -138,11 +139,12 @@ pub async fn create_remote_dirs(
     use std::fmt::Write;
     use tokio::io::AsyncWriteExt;
 
-    // Build a newline-delimited list of full paths
-    let mut dir_list = format!("{remote_root}\n");
+    // NUL-terminated list of full paths. A newline is a legal file-name byte, so
+    // a newline-delimited list split one directory into two wrong ones.
+    let mut dir_list = format!("{remote_root}\0");
     for dir in dirs {
-        // GH-23: writeln! to String is infallible in practice, but log if it fails
-        if writeln!(dir_list, "{}/{}", remote_root, dir.display()).is_err() {
+        // GH-23: write! to String is infallible in practice, but log if it fails
+        if write!(dir_list, "{}/{}\0", remote_root, dir.display()).is_err() {
             eprintln!(
                 "Warning: failed to format directory path: {}",
                 dir.display()
@@ -150,10 +152,9 @@ pub async fn create_remote_dirs(
         }
     }
 
-    // Pipe directory list via stdin, read line-by-line and mkdir each
     let mut child = tokio::process::Command::new("ssh")
         .arg(host)
-        .arg("xargs -d '\\n' mkdir -p")
+        .arg("xargs -0 mkdir -p --")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -212,11 +213,19 @@ pub async fn transfer_file_to_remote(
     // Use $'...' quoting with backslash escapes for paths with special chars.
     let escaped = remote_path.replace('\\', "\\\\").replace('\'', "\\'");
     let tmp_escaped = format!("{escaped}.copia-tmp");
+    // The staging name must be absent or a regular file. `cat >` on a FIFO (or a
+    // symlink to one) blocks until a reader appears, so a leftover one hangs the
+    // push. Refuse it on the remote, loudly, before anything is written.
+    let tmp_q = posix_quote(&format!("{remote_path}.copia-tmp"));
+    let staging_check = format!(
+        "{{ [ ! -e {tmp_q} ] || {{ [ -f {tmp_q} ] && [ ! -L {tmp_q} ]; }}; }} || \
+         {{ echo 'copia: staging path is not a regular file' >&2; exit 1; }}; "
+    );
     let touch = mtime.map_or(String::new(), |t| format!(" && touch -d @{t} $'{escaped}'"));
     let mut child = tokio::process::Command::new("ssh")
         .arg(host)
         .arg(format!(
-            "cat > $'{tmp_escaped}' && mv -f $'{tmp_escaped}' $'{escaped}'{touch}"
+            "{staging_check}cat > $'{tmp_escaped}' && mv -f $'{tmp_escaped}' $'{escaped}'{touch}"
         ))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())

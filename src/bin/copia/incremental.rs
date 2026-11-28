@@ -16,7 +16,7 @@ use super::transfer::{
     transfer_speed,
 };
 use super::FileLocation;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -255,13 +255,21 @@ fn print_omissions(omitted: &[String]) {
     }
 }
 
+/// The veto line for `--delete`, or `None` when nothing is vetoed. A run with no
+/// omissions vetoes nothing, and a run with nothing to delete has nothing to veto.
+fn veto_line(omitted: &[String], delete_count: usize) -> Option<String> {
+    if omitted.is_empty() || delete_count == 0 {
+        return None;
+    }
+    Some(format!(
+        "VETOED: --delete skipped {delete_count} destination file(s) because the source is incomplete"
+    ))
+}
+
 fn veto_notice(omitted: &[String], plan: &SyncPlan) {
     print_omissions(omitted);
-    if !plan.delete.is_empty() {
-        eprintln!(
-            "VETOED: --delete skipped {} destination file(s) because the source is incomplete",
-            plan.delete.len()
-        );
+    if let Some(line) = veto_line(omitted, plan.delete.len()) {
+        eprintln!("{line}");
     }
 }
 
@@ -402,6 +410,7 @@ async fn deliver_pull(
     mtime: Option<i64>,
 ) -> Result<u64, String> {
     let tmp = tmp_path(local_dest);
+    check_staging_slot(&tmp)?;
     let size = transfer_file_from_remote(host, remote_file, &tmp).await?;
     tokio::fs::rename(&tmp, local_dest)
         .await
@@ -430,13 +439,15 @@ async fn apply_remote_deletes(
         Dir::Push => {
             use std::fmt::Write as _;
             use tokio::io::AsyncWriteExt;
+            // NUL-terminated: a newline is a legal file-name byte, and a
+            // newline-delimited list deleted the wrong names.
             let mut list = String::new();
             for rel in dels {
-                let _ = writeln!(list, "{}/{}", remote_root, rel.display());
+                let _ = write!(list, "{}/{}\0", remote_root, rel.display());
             }
             if let Ok(mut child) = tokio::process::Command::new("ssh")
                 .arg(host)
-                .arg("xargs -d '\\n' rm -f --")
+                .arg("xargs -0 rm -f --")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
@@ -457,15 +468,31 @@ async fn apply_remote_deletes(
 /// slash is trimmed first: `lstat("link/")` follows the link, so a dangling one
 /// would read as absent.
 fn is_absent(path: &Path) -> bool {
-    let trimmed = path
-        .to_str()
-        .map(|s| s.trim_end_matches('/'))
-        .filter(|s| !s.is_empty());
-    let target = trimmed.map_or(path, Path::new);
+    // `..` is not resolved lexically, so a path through it is never read as absent.
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    // Rebuilt from components, which drops a trailing slash and `.` segments on
+    // any platform. The old code trimmed only UTF-8 names, so a non-UTF-8 link
+    // with a trailing slash was lstat-ed through the link and read as absent.
+    let normal: PathBuf = path.components().collect();
     matches!(
-        std::fs::symlink_metadata(target),
+        std::fs::symlink_metadata(&normal),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound
     )
+}
+
+/// The staging name `.copia-tmp` must be absent or a regular file. `File::create`
+/// and `copy` follow a symlink and block on a FIFO, so a leftover of either kind
+/// is refused by name instead of hanging the transfer.
+fn check_staging_slot(tmp: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(tmp) {
+        Ok(md) if !md.file_type().is_file() => Err(format!(
+            "{}: staging path is not a regular file (fifo, symlink or other); remove it and retry",
+            tmp.display()
+        )),
+        _ => Ok(()),
+    }
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -611,6 +638,7 @@ async fn deliver_local(src: &Path, dst: &Path, mtime: Option<i64>) -> Result<u64
         }
     }
     let tmp = tmp_path(dst);
+    check_staging_slot(&tmp)?;
     let size = tokio::fs::copy(src, &tmp)
         .await
         .map_err(|e| format!("copy {}: {e}", src.display()))?;
@@ -866,7 +894,7 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    fn delete_opts() -> SyncOptions {
+    pub(super) fn delete_opts() -> SyncOptions {
         SyncOptions {
             jobs: 2,
             verbose: false,
@@ -879,7 +907,7 @@ mod tests {
     /// Put an `ssh` shim first on PATH. It runs its command under bash on this
     /// machine, so `run_remote` can be driven against a temp tree.
     #[cfg(unix)]
-    fn fake_ssh_on_path() {
+    pub(super) fn fake_ssh_on_path() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             use std::os::unix::fs::PermissionsExt;
@@ -899,7 +927,7 @@ mod tests {
     /// Run `run_remote` on its own thread with a deadline. A FIFO that reaches
     /// `cat` blocks forever, so a regression must fail instead of hanging the suite.
     #[cfg(unix)]
-    fn run_remote_with_deadline(
+    pub(super) fn run_remote_with_deadline(
         dir: Dir,
         remote_root: &Path,
         local_root: &Path,
@@ -1357,5 +1385,198 @@ mod tests {
             !omitted.is_empty(),
             "an unfinished transfer did not veto the delete"
         );
+    }
+}
+
+// Review regressions for copia #50 round 4 (findings 2, 4, 6, 7, lane-2 FIFO).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod r93_incremental {
+    use super::tests::{delete_opts, fake_ssh_on_path, run_remote_with_deadline};
+    use super::*;
+
+    /// Finding 2 (HIGH): a remote file whose name holds a newline is deleted by its
+    /// own name. A newline-delimited xargs split it into two wrong names.
+    #[cfg(unix)]
+    #[test]
+    fn remote_delete_removes_a_file_whose_name_contains_a_newline() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-nl-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(remote.join("stale\nname.txt"), b"stale").unwrap();
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+        assert!(res.is_ok(), "{res:?}");
+        assert!(
+            !remote.join("stale\nname.txt").exists(),
+            "the newline-named stale file survived --delete"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 2 (HIGH): a remote directory whose name holds a newline is created
+    /// under its own name. The dir name ends in a newline so a split never creates a
+    /// stray directory outside the test tree.
+    #[cfg(unix)]
+    #[test]
+    fn push_creates_a_directory_whose_name_contains_a_newline() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-nl-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("remote");
+        std::fs::create_dir_all(src.join("ab\n")).unwrap();
+        std::fs::write(src.join("ab\n/f.txt"), b"f").unwrap();
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(std::fs::read(remote.join("ab\n/f.txt")).unwrap(), b"f");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 4 (MEDIUM-HIGH): a push to a multi-level absent root is a first sync.
+    #[cfg(unix)]
+    #[test]
+    fn push_to_a_multi_level_absent_remote_root_is_a_first_sync() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-deep-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let remote = base.join("a/b/remote");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        let res = run_remote_with_deadline(Dir::Push, &remote, &src, delete_opts());
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(std::fs::read(remote.join("a.txt")).unwrap(), b"a");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Lane-2 (LOW-MEDIUM): a leading-dash remote root is a path, not an option, to
+    /// `cd`. The root is relative and lives in the test's working directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_listing_accepts_a_root_that_begins_with_a_dash() {
+        fake_ssh_on_path();
+        let root = format!("-copia-93-dash-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(format!("{root}/f.txt"), b"x").unwrap();
+        let mut omitted = Vec::new();
+        let m = discover_remote_with_meta("shim.invalid", &root, false, &mut omitted).await;
+        std::fs::remove_dir_all(&root).ok();
+        assert!(omitted.is_empty(), "{omitted:?}");
+        assert!(m.contains_key(&PathBuf::from("f.txt")), "{m:?}");
+    }
+
+    /// Lane-2 (LOW): a non-UTF-8 dangling link with a trailing slash is not absent.
+    #[cfg(unix)]
+    #[test]
+    fn is_absent_does_not_read_a_non_utf8_dangling_link_as_absent() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = std::env::temp_dir().join(format!("copia-93-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"link\xff");
+        std::os::unix::fs::symlink("nowhere", base.join(name)).unwrap();
+        let mut with_slash = base.join(name).into_os_string();
+        with_slash.push("/");
+        assert!(
+            !is_absent(Path::new(&with_slash)),
+            "dangling link read as absent"
+        );
+        assert!(!is_absent(&base.join(name)));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Lane-2 (hang): a pre-existing `.copia-tmp` FIFO at the local pull destination
+    /// is refused by name. `File::create` on it would block with no reader.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_refuses_a_fifo_at_the_staging_name() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-pull-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote");
+        let local = base.join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(remote.join("a.txt"), b"a").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(local.join("a.txt.copia-tmp"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(made, "mkfifo failed");
+        let dst = local.join("a.txt");
+        let res = deliver_pull(
+            "shim.invalid",
+            &remote.join("a.txt").to_string_lossy(),
+            &dst,
+            None,
+        )
+        .await;
+        assert!(res.is_err(), "a FIFO staging path was used: {res:?}");
+        assert!(!dst.exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Lane-2 (hang): the same refusal on a local-to-local delivery.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_delivery_refuses_a_fifo_at_the_staging_name() {
+        let base = std::env::temp_dir().join(format!("copia-93-local-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let src = base.join("s");
+        std::fs::write(&src, b"payload").unwrap();
+        let dst = base.join("d");
+        let made = std::process::Command::new("mkfifo")
+            .arg(tmp_path(&dst))
+            .status()
+            .unwrap()
+            .success();
+        assert!(made, "mkfifo failed");
+        let res = deliver_local(&src, &dst, None).await;
+        assert!(res.is_err(), "a FIFO staging path was used: {res:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Lane-2 (hang): a push whose remote staging name is a FIFO is refused on the
+    /// remote, before `cat` can block on it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_refuses_a_fifo_at_the_remote_staging_name() {
+        fake_ssh_on_path();
+        let base = std::env::temp_dir().join(format!("copia-93-push-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("remote")).unwrap();
+        let local = base.join("a.txt");
+        std::fs::write(&local, b"a").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(base.join("remote/a.txt.copia-tmp"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(made, "mkfifo failed");
+        let remote_file = base.join("remote/a.txt").to_string_lossy().into_owned();
+        let res = transfer_file_to_remote(&local, "shim.invalid", &remote_file, None).await;
+        assert!(res.is_err(), "a FIFO staging path was written to: {res:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Finding 6 (MEDIUM): VETOED is printed only when omissions veto deletes.
+    #[test]
+    fn veto_line_is_printed_only_when_something_is_vetoed() {
+        assert_eq!(
+            veto_line(&[], 3),
+            None,
+            "a healthy --delete run printed VETOED"
+        );
+        assert_eq!(veto_line(&["x".to_owned()], 0), None);
+        let line = veto_line(&["x".to_owned()], 3).expect("an omission with deletes must veto");
+        assert!(line.starts_with("VETOED: --delete skipped 3"), "{line}");
     }
 }
