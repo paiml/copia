@@ -13,6 +13,15 @@ use copia::async_sync::AsyncCopiaSync;
 use copia::trace_output::CopiaTraceLayer;
 
 /// Represents a file location - either local or remote via SSH
+/// `--jobs` must be at least 1: a zero-permit semaphore never admits a transfer.
+fn parse_jobs(raw: &str) -> Result<usize, String> {
+    match raw.parse::<usize>() {
+        Ok(0) => Err("--jobs must be at least 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(format!("--jobs expects a positive integer: {e}")),
+    }
+}
+
 #[derive(Debug, Clone)]
 enum FileLocation {
     Local(PathBuf),
@@ -100,8 +109,8 @@ enum Commands {
         #[arg(short, long)]
         recursive: bool,
 
-        /// Number of parallel transfer jobs
-        #[arg(short, long, default_value = "4")]
+        /// Number of parallel transfer jobs (at least 1)
+        #[arg(short, long, default_value = "4", value_parser = parse_jobs)]
         jobs: usize,
 
         /// Show verbose output
